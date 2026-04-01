@@ -91,6 +91,19 @@ export class SlotSyncService {
         const doctor = await this.prisma.vismedDoctor.findUnique({
             where: whereClause,
             include: {
+                specialties: {
+                    include: {
+                        specialty: {
+                            include: {
+                                mappings: {
+                                    where: { isActive: true },
+                                    include: { doctoraliaService: true },
+                                    take: 1,
+                                }
+                            }
+                        }
+                    }
+                },
                 unifiedMappings: {
                     where: { isActive: true },
                     include: {
@@ -173,8 +186,15 @@ export class SlotSyncService {
             }
 
             if (addressServices.length === 0) {
-                this.logger.warn(`Doctor ${doctor.name} address ${addrId}: no services found on Doctoralia, skipping slot sync`);
-                continue;
+                this.logger.log(`Doctor ${doctor.name} address ${addrId}: no services found, attempting auto-provision from specialty mappings...`);
+                const provisioned = await this.provisionAddressServices(doctor, client, dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, syncRunId);
+                if (provisioned.length > 0) {
+                    addressServices = provisioned;
+                    this.logger.log(`Doctor ${doctor.name} address ${addrId}: provisioned ${provisioned.length} service(s) from specialty mappings`);
+                } else {
+                    this.logger.warn(`Doctor ${doctor.name} address ${addrId}: no specialty→service mappings available, skipping slot sync`);
+                    continue;
+                }
             }
 
             const addressServiceIds = addressServices.map((s: any) => Number(s.id));
@@ -270,6 +290,134 @@ export class SlotSyncService {
         }
 
         return { total: mappedDoctors.length, synced, errors };
+    }
+
+    private async provisionAddressServices(
+        doctor: any,
+        client: DocplannerClient,
+        facilityId: string,
+        doctorId: string,
+        addressId: string,
+        syncRunId?: string,
+    ): Promise<any[]> {
+        const provisionedServices: any[] = [];
+
+        const doctorSpecialties = doctor.specialties || [];
+        const serviceIdsToAdd: { doctoraliaServiceId: string; name: string }[] = [];
+
+        for (const ps of doctorSpecialties) {
+            const specialty = ps.specialty;
+            if (!specialty?.mappings?.length) continue;
+            const mapping = specialty.mappings[0];
+            if (!mapping?.doctoraliaService) continue;
+
+            const docSvc = mapping.doctoraliaService;
+            const alreadyAdded = serviceIdsToAdd.some(s => s.doctoraliaServiceId === docSvc.doctoraliaServiceId);
+            if (!alreadyAdded) {
+                serviceIdsToAdd.push({
+                    doctoraliaServiceId: docSvc.doctoraliaServiceId,
+                    name: docSvc.name,
+                });
+            }
+        }
+
+        if (serviceIdsToAdd.length === 0) {
+            this.logger.warn(`Doctor ${doctor.name}: no specialty→service mappings found for auto-provisioning`);
+            return [];
+        }
+
+        this.logger.log(`Doctor ${doctor.name}: will provision ${serviceIdsToAdd.length} service(s): ${serviceIdsToAdd.map(s => `${s.name} (${s.doctoraliaServiceId})`).join(', ')}`);
+
+        for (const svc of serviceIdsToAdd) {
+            const candidateIds = [svc.doctoraliaServiceId];
+
+            const normalizedLookup = (svc as any).normalizedName
+                || svc.name.trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+            const alternativeServices = await this.prisma.doctoraliaService.findMany({
+                where: { normalizedName: normalizedLookup },
+                select: { doctoraliaServiceId: true },
+            });
+            for (const alt of alternativeServices) {
+                if (!candidateIds.includes(alt.doctoraliaServiceId)) {
+                    candidateIds.push(alt.doctoraliaServiceId);
+                }
+            }
+
+            const validCandidateIds = candidateIds.filter(id => {
+                const num = Number(id);
+                return Number.isFinite(num) && num > 0;
+            });
+            validCandidateIds.sort((a, b) => Number(a) - Number(b));
+
+            if (validCandidateIds.length === 0) {
+                this.logger.error(`Doctor ${doctor.name}: no valid numeric service_ids for "${svc.name}" on address ${addressId}`);
+                continue;
+            }
+
+            let provisioned = false;
+            for (const candidateId of validCandidateIds) {
+                try {
+                    const result = await client.addAddressService(facilityId, doctorId, addressId, {
+                        service_id: Number(candidateId),
+                        is_price_from: false,
+                        price: 0,
+                    });
+
+                    let newAddressServiceId: number | null = null;
+
+                    if (result?._location) {
+                        const match = String(result._location).match(/\/services\/(\d+)/);
+                        if (match) newAddressServiceId = Number(match[1]);
+                    }
+                    if (result?.id) {
+                        newAddressServiceId = Number(result.id);
+                    }
+
+                    if (newAddressServiceId) {
+                        provisionedServices.push({ id: newAddressServiceId, service_id: Number(candidateId), name: svc.name });
+                    } else {
+                        const svcRes = await client.getServices(facilityId, doctorId, addressId);
+                        const items = svcRes._items || [];
+                        const found = items.find((s: any) => String(s.service_id) === String(candidateId));
+                        if (found) {
+                            provisionedServices.push(found);
+                        } else if (items.length > 0) {
+                            provisionedServices.push(...items.filter((i: any) => !provisionedServices.some((p: any) => p.id === i.id)));
+                        }
+                    }
+
+                    this.logger.log(`Doctor ${doctor.name}: provisioned service "${svc.name}" (service_id: ${candidateId}) on address ${addressId}`);
+                    if (syncRunId) {
+                        await this.logEvent(syncRunId, 'SERVICE_PROVISION', 'created', `Serviço "${svc.name}" (service_id: ${candidateId}) adicionado ao endereço ${addressId} do médico ${doctor.name}`);
+                    }
+                    provisioned = true;
+                    break;
+                } catch (error: any) {
+                    const statusMatch = error.message?.match(/(\d{3})/);
+                    const status = statusMatch ? Number(statusMatch[1]) : 0;
+                    const isRetryable = status === 404 || status === 422 || status === 0;
+                    this.logger.warn(`Doctor ${doctor.name}: service_id ${candidateId} failed for "${svc.name}" on address ${addressId} (status ${status}): ${error.message}`);
+                    if (!isRetryable) {
+                        this.logger.error(`Doctor ${doctor.name}: non-retryable error (${status}) for "${svc.name}", stopping candidate attempts`);
+                        break;
+                    }
+                }
+            }
+
+            if (!provisioned) {
+                this.logger.error(`Doctor ${doctor.name}: all candidate service_ids failed for "${svc.name}" on address ${addressId}. Tried: ${candidateIds.join(', ')}`);
+                if (syncRunId) {
+                    await this.logEvent(syncRunId, 'SERVICE_PROVISION', 'error', `Falha ao adicionar serviço "${svc.name}" ao endereço ${addressId}: nenhum service_id válido. Tentados: ${candidateIds.join(', ')}`);
+                }
+            }
+        }
+
+        if (provisionedServices.length === 0) {
+            const svcRes = await client.getServices(facilityId, doctorId, addressId);
+            return svcRes._items || [];
+        }
+
+        return provisionedServices;
     }
 
     private async logEvent(syncRunId: string, entityType: string, action: string, message: string) {

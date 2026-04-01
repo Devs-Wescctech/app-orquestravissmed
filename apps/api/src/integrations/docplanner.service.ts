@@ -91,6 +91,16 @@ export class DocplannerClient {
                 return null;
             }
 
+            if (response.status === 201) {
+                const location = response.headers.get('Location') || response.headers.get('location');
+                let body = null;
+                const text = await response.text();
+                if (text && text.trim()) {
+                    try { body = JSON.parse(text); } catch {}
+                }
+                return { ...(body || {}), _location: location, _status: 201 };
+            }
+
             return await response.json();
         } finally {
             clearTimeout(timeout);
