@@ -44,7 +44,16 @@ npm (workspace monorepo).
 ## Integrations
 - **VisMed API**: Uses `idEmpresaGestora` (stored as `clientId` in `IntegrationConnection` with provider `vismed`). Default base URL: `https://app.vissmed.com.br/api-vissmed-4/api/v1.0`. The service auto-prepends `https://` and the API path if only a domain is stored.
 - **Doctoralia/Docplanner**: OAuth2 client credentials flow. Credentials stored in `IntegrationConnection` with provider `doctoralia` (fields: `clientId`, `clientSecret`, `domain`). Domain must include `www` prefix (e.g., `www.doctoralia.com.br`).
-- **Redis/BullMQ**: Used for sync job queues. Redis errors in logs are expected and non-fatal (no Redis available in Replit).
+- **Redis/BullMQ**: Used for sync job queues. When Redis is unavailable (default in Replit), the `SyncService` falls back to running sync logic directly inline. Redis errors in logs are expected and non-fatal.
+
+## Sync Architecture
+The `SyncService` orchestrates two sync pipelines:
+1. **VisMed sync** (`vismed-full`): Pulls units, specialties, and professionals from the VisMed API. Creates `VismedUnit`, `VismedSpecialty`, `VismedDoctor` records and `Mapping` entries.
+2. **Doctoralia sync** (`full`): Pulls facilities, doctors, services from Docplanner API. Creates `DoctoraliaDoctor`, `DoctoraliaService`, `DoctoraliaAddressService` records and `Mapping` entries. Also runs push sync back to Doctoralia.
+3. **Global sync** (`/sync/:clinicId/global`): Triggers both pipelines in sequence.
+4. **Matching Engine**: After sync, auto-matches VisMed specialties to Doctoralia services and VisMed doctors to Doctoralia doctors using string similarity.
+
+Both pipelines attempt BullMQ queue dispatch first, then fall back to direct inline execution if Redis is unavailable.
 
 ## Default Credentials
 - Email: `admin@vismed.com`
