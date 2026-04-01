@@ -1,0 +1,371 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  name      String
+  password  String
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  roles     UserClinicRole[]
+  auditLogs AuditLog[]
+}
+
+model Clinic {
+  id        String   @id @default(uuid())
+  name      String
+  cnpj      String?
+  email     String?
+  phone     String?
+  timezone  String   @default("America/Sao_Paulo")
+  
+  // Custom Address Fields for Push to Docplanner
+  addressStreet       String?
+  addressNumber       String?
+  addressComplement   String?
+  addressNeighborhood String?
+  addressCity         String?
+  addressState        String?
+  addressZipCode      String?
+
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users       UserClinicRole[]
+  integrations IntegrationConnection[]
+  mappings     Mapping[]
+  syncRuns     SyncRun[]
+  appointments Appointment[]
+}
+
+enum Role {
+  SUPER_ADMIN
+  CLINIC_ADMIN
+  OPERATOR
+  READONLY
+}
+
+model UserClinicRole {
+  id       String  @id @default(uuid())
+  user     User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId   String
+  clinic   Clinic  @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  clinicId String
+  role     Role    @default(READONLY)
+
+  @@unique([userId, clinicId])
+}
+
+model IntegrationConnection {
+  id           String   @id @default(uuid())
+  clinic       Clinic   @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  clinicId     String
+  provider     String   @default("doctoralia")
+  domain       String?
+  clientId     String?
+  clientSecret String? // SHOULD BE ENCRYPTED OR IN SECRET MANAGER, but for this MVP will be here
+  status       String   @default("disconnected") // connected, disconnected, error
+  lastTestAt   DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+enum MappingEntityType {
+  DOCTOR
+  LOCATION
+  SERVICE
+  INSURANCE
+  FACILITY
+}
+
+enum MappingStatus {
+  LINKED
+  UNLINKED
+  CONFLICT
+  ORPHAN
+}
+
+model Mapping {
+  id          String            @id @default(uuid())
+  clinic      Clinic            @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  clinicId    String
+  entityType  MappingEntityType
+  vismedId    String? // ID in VisMed system (e.g. Doctor ID)
+  externalId  String? // ID in Docplanner
+  status      MappingStatus     @default(UNLINKED)
+  conflictData Json? // Store conflicting fields comparison here
+  lastSyncAt  DateTime?
+  lastError   String?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  @@unique([clinicId, entityType, externalId])
+  @@unique([clinicId, entityType, vismedId])
+}
+
+model VismedUnit {
+  id             String         @id @default(uuid())
+  vismedId       Int            @unique // idunidade na API VisMed
+  codUnidade     Int?           
+  name           String         // nomeunidade
+  cnpj           String?
+  cityName       String?        // nomecidade
+  isActive       Boolean        @default(true) // inferido da API
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  doctors        VismedDoctor[]
+}
+
+model VismedDoctor {
+  id             String         @id @default(uuid())
+  vismedId       Int            @unique // idprofissional na API VisMed
+  name           String         // nomecompleto
+  formalName     String?        // nomeformal
+  cpf            String?        
+  documentNumber String?        // numerodocumento (CRM etc)
+  documentType   String?        // siglaprofissionaltipodocumento
+  gender         String?        // sexo
+  isActive       Boolean        @default(true) // ativo: "1" ou "0"
+  unitId         String?        // idunidadevinculada -> VismedUnit 
+  unit           VismedUnit?    @relation(fields: [unitId], references: [id], onDelete: SetNull)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  specialties VismedProfessionalSpecialty[]
+  unifiedMappings ProfessionalUnifiedMapping[]
+}
+
+model VismedSpecialty {
+  id             String         @id @default(uuid())
+  vismedId       Int            @unique // idcategoriaservico
+  name           String         // nomecategoriaservico
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  normalizedName String?
+  doctors VismedProfessionalSpecialty[]
+  mappings SpecialtyServiceMapping[]
+}
+
+model Doctor {
+  id             String   @id @default(uuid())
+  name           String
+  specialty      String?
+  crm            String?
+  phone          String?
+  email          String?
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  appointments   Appointment[]
+}
+
+enum AppointmentStatus {
+  SCHEDULED
+  CONFIRMED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+model Appointment {
+  id          String            @id @default(uuid())
+  clinic      Clinic            @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  clinicId    String
+  doctor      Doctor            @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  doctorId    String
+  patientName String
+  date        DateTime
+  startTime   String            // HH:mm format
+  endTime     String            // HH:mm format
+  status      AppointmentStatus @default(SCHEDULED)
+  notes       String?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+}
+
+model Service {
+  id             String   @id @default(uuid())
+  name           String
+  duration       Int? // in minutes
+  price          Float?
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+model Insurance {
+  id             String   @id @default(uuid())
+  name           String
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+model Location {
+  id             String   @id @default(uuid())
+  name           String
+  address        String?
+  city           String?
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+model SyncRun {
+  id          String   @id @default(uuid())
+  clinic      Clinic   @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  clinicId    String
+  type        String   // full, doctors, services, etc.
+  status      String   // running, completed, failed
+  startedAt   DateTime @default(now())
+  endedAt     DateTime?
+  totalRecords Int     @default(0)
+  metrics     Json?
+  
+  events      SyncEvent[]
+}
+
+model SyncEvent {
+  id          String   @id @default(uuid())
+  syncRun     SyncRun  @relation(fields: [syncRunId], references: [id], onDelete: Cascade)
+  syncRunId   String
+  entityType  String
+  action      String   // created, updated, conflict, error
+  externalId  String?
+  message     String?
+  timestamp   DateTime @default(now())
+}
+
+model AuditLog {
+  id          String   @id @default(uuid())
+  user        User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  userId      String?
+  action      String
+  entity      String
+  entityId    String?
+  details     Json?
+  timestamp   DateTime @default(now())
+}
+
+model VismedProfessionalSpecialty {
+  id                String          @id @default(uuid())
+  vismedDoctorId    String
+  vismedSpecialtyId String
+  createdAt         DateTime        @default(now())
+
+  doctor            VismedDoctor    @relation(fields: [vismedDoctorId], references: [id], onDelete: Cascade)
+  specialty         VismedSpecialty @relation(fields: [vismedSpecialtyId], references: [id], onDelete: Cascade)
+
+  @@unique([vismedDoctorId, vismedSpecialtyId])
+}
+
+model DoctoraliaDoctor {
+  id                   String   @id @default(uuid())
+  doctoraliaDoctorId   String   @unique
+  doctoraliaFacilityId String
+  name                 String
+  syncedAt             DateTime @default(now())
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  addressServices      DoctoraliaAddressService[]
+  unifiedMappings      ProfessionalUnifiedMapping[]
+}
+
+model DoctoraliaService {
+  id                   String   @id @default(uuid())
+  doctoraliaServiceId  String   @unique
+  name                 String
+  normalizedName       String?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  addressServices      DoctoraliaAddressService[]
+  mappings             SpecialtyServiceMapping[]
+}
+
+model DoctoraliaAddressService {
+  id                            String   @id @default(uuid())
+  doctoraliaAddressServiceId    String   @unique
+  doctoraliaAddressId           String
+  doctorId                      String
+  serviceId                     String
+  price                         Float?
+  isPriceFrom                   Boolean  @default(false)
+  isVisible                     Boolean  @default(true)
+  description                   String?
+  defaultDuration               Int?
+  syncedAt                      DateTime @default(now())
+  createdAt                     DateTime @default(now())
+  updatedAt                     DateTime @updatedAt
+
+  doctor                        DoctoraliaDoctor  @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  service                       DoctoraliaService @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+}
+
+enum MatchType {
+  EXACT
+  APPROXIMATE
+  SYNONYM
+  MANUAL
+}
+
+model SpecialtyServiceMapping {
+  id                   String   @id @default(uuid())
+  vismedSpecialtyId    String
+  doctoraliaServiceId  String
+  matchType            MatchType
+  confidenceScore      Float
+  requiresReview       Boolean  @default(false)
+  reviewedAt           DateTime?
+  reviewedBy           String?
+  isActive             Boolean  @default(true)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  vismedSpecialty      VismedSpecialty    @relation(fields: [vismedSpecialtyId], references: [id], onDelete: Cascade)
+  doctoraliaService    DoctoraliaService  @relation(fields: [doctoraliaServiceId], references: [id], onDelete: Cascade)
+
+  unifiedMappings      ProfessionalUnifiedMapping[]
+
+  @@unique([vismedSpecialtyId, doctoraliaServiceId])
+}
+
+model MappingSynonym {
+  id        String   @id @default(uuid())
+  termA     String
+  termB     String
+  createdBy String?
+  createdAt DateTime @default(now())
+
+  @@unique([termA, termB])
+}
+
+model ProfessionalUnifiedMapping {
+  id                         String   @id @default(uuid())
+  vismedDoctorId             String
+  doctoraliaDoctorId         String
+  specialtyServiceMappingId  String?
+  isActive                   Boolean  @default(true)
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+
+  vismedDoctor               VismedDoctor            @relation(fields: [vismedDoctorId], references: [id], onDelete: Cascade)
+  doctoraliaDoctor           DoctoraliaDoctor        @relation(fields: [doctoraliaDoctorId], references: [id], onDelete: Cascade)
+  mapping                    SpecialtyServiceMapping? @relation(fields: [specialtyServiceMappingId], references: [id], onDelete: Cascade)
+
+  @@unique([vismedDoctorId, doctoraliaDoctorId])
+}

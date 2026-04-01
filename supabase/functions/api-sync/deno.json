@@ -1,0 +1,5 @@
+{
+  "tasks": {
+    "edge-runtime": "deno run -A --watch=src/ --config=deno.jsonc src/main.ts"
+  }
+}

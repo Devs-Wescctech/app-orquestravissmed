@@ -1,0 +1,1 @@
+const { PrismaClient } = require('./packages/database/node_modules/@prisma/client'); const prisma = new PrismaClient(); async function run() { const ints = await prisma.integrationConnection.findMany(); console.log(JSON.stringify(ints, null, 2)); } run().finally(() => prisma.$disconnect());
