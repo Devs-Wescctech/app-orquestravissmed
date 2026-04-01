@@ -10,18 +10,20 @@ export default function SelectClinicPage() {
     const router = useRouter();
     const user = useAuthStore((s) => s.user);
     const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
+    const hasHydrated = useAuthStore((s) => s._hasHydrated);
     const { setActiveClinic, setClinics } = useClinicStore();
     const [clinicsList, setClinicsList] = useState<any[]>([]);
     const [isLoading, setIsLoading] = useState(true);
     const [search, setSearch] = useState('');
 
     useEffect(() => {
+        if (!hasHydrated) return;
         if (!isAuthenticated) {
             router.push('/login');
             return;
         }
         fetchClinics();
-    }, [isAuthenticated]);
+    }, [hasHydrated, isAuthenticated]);
 
     const fetchClinics = async () => {
         try {

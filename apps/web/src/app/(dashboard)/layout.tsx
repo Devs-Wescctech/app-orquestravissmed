@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useState } from 'react';
+import { useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { Sidebar } from '@/components/layout/Sidebar';
 import { Topbar } from '@/components/layout/Topbar';
@@ -14,15 +14,11 @@ export default function DashboardLayout({
 }) {
     const router = useRouter();
     const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
+    const hasHydrated = useAuthStore((s) => s._hasHydrated);
     const activeClinic = useClinicStore((s) => s.activeClinic);
-    const [mounted, setMounted] = useState(false);
 
     useEffect(() => {
-        setMounted(true);
-    }, []);
-
-    useEffect(() => {
-        if (!mounted) return;
+        if (!hasHydrated) return;
 
         if (!isAuthenticated) {
             router.push('/login');
@@ -31,9 +27,9 @@ export default function DashboardLayout({
         if (!activeClinic) {
             router.push('/select-clinic');
         }
-    }, [mounted, isAuthenticated, activeClinic, router]);
+    }, [hasHydrated, isAuthenticated, activeClinic, router]);
 
-    if (!mounted) {
+    if (!hasHydrated) {
         return (
             <div className="flex h-screen w-full bg-[#F8FAFC] items-center justify-center">
                 <Loader2 className="h-8 w-8 animate-spin text-primary" />

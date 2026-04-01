@@ -47,6 +47,9 @@ npm (workspace monorepo).
 
 ## Key Files
 - `apps/web/src/lib/api.ts` — HTTP client (fetches `/api/*` via Next.js proxy)
+- `apps/web/src/lib/store.ts` — Zustand auth store with persist + hydration tracking (`_hasHydrated`)
+- `apps/web/src/lib/clinic-store.ts` — Zustand clinic selection store with persist
+- `apps/web/src/components/client-providers.tsx` — Client-side providers (Toaster) wrapper for RootLayout
 - `apps/web/src/middleware.ts` — Auth middleware (cookie-based token check)
 - `apps/web/next.config.js` — Next.js config with API proxy rewrites
 - `apps/api/src/main.ts` — NestJS entry point
