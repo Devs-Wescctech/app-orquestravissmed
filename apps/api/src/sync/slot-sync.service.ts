@@ -347,7 +347,6 @@ export class SlotSyncService {
                 const num = Number(id);
                 return Number.isFinite(num) && num > 0;
             });
-            validCandidateIds.sort((a, b) => Number(a) - Number(b));
 
             if (validCandidateIds.length === 0) {
                 this.logger.error(`Doctor ${doctor.name}: no valid numeric service_ids for "${svc.name}" on address ${addressId}`);
@@ -393,8 +392,10 @@ export class SlotSyncService {
                     provisioned = true;
                     break;
                 } catch (error: any) {
-                    const statusMatch = error.message?.match(/(\d{3})/);
-                    const status = statusMatch ? Number(statusMatch[1]) : 0;
+                    const status = error.status ?? error.response?.status ?? (() => {
+                        const m = error.message?.match(/(\d{3})/);
+                        return m ? Number(m[1]) : 0;
+                    })();
                     const isRetryable = status === 404 || status === 422 || status === 0;
                     this.logger.warn(`Doctor ${doctor.name}: service_id ${candidateId} failed for "${svc.name}" on address ${addressId} (status ${status}): ${error.message}`);
                     if (!isRetryable) {

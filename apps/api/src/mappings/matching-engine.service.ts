@@ -136,6 +136,38 @@ export class MatchingEngineService {
         this.logger.log(`Mapped Vismed Specialty ${vismedSpecialtyId} to Doctoralia Service ${doctoraliaServiceId} (${matchType} - Score: ${confidenceScore})`);
     }
 
+    private static readonly INSURANCE_NOISE_WORDS = new Set([
+        'convenio', 'plano', 'saude', 'seguro', 'cartao', 'clinica', 'particular',
+        'orcamento', 'faturar', 'vista', 'parcelado', 'pagamento', 'avista',
+        'r$', 'de', 'do', 'da', 'dos', 'das', 'e', 'em', 'a', 'o', 'para', 'com',
+    ]);
+
+    private static readonly NON_INSURANCE_PATTERNS = [
+        /orcamento/i,
+        /r\$\s*\d/i,
+        /a\s+vista/i,
+        /parcelad/i,
+        /faturar/i,
+        /particular/i,
+        /cartao\s+clinica/i,
+    ];
+
+    private extractInsuranceCoreTokens(name: string): string[] {
+        const norm = this.normalizeString(name);
+        const cleaned = norm
+            .replace(/[-–—]/g, ' ')
+            .replace(/[^\w\s]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+        return cleaned.split(' ')
+            .filter(w => w.length >= 3 && !MatchingEngineService.INSURANCE_NOISE_WORDS.has(w));
+    }
+
+    private isLikelyNonInsurance(name: string): boolean {
+        const norm = this.normalizeString(name);
+        return MatchingEngineService.NON_INSURANCE_PATTERNS.some(p => p.test(norm));
+    }
+
     async runMatchingForInsurance(vismedInsuranceId: string): Promise<boolean> {
         const insurance = await this.prisma.vismedInsurance.findUnique({
             where: { id: vismedInsuranceId }
@@ -152,6 +184,11 @@ export class MatchingEngineService {
             }
         });
         if (existingMapping) return true;
+
+        if (this.isLikelyNonInsurance(insurance.name)) {
+            this.logger.log(`Insurance "${insurance.name}" classified as non-insurance (payment/internal), skipping match`);
+            return false;
+        }
 
         const dProviders = await this.prisma.doctoraliaInsuranceProvider.findMany();
         if (dProviders.length === 0) return false;
@@ -172,6 +209,51 @@ export class MatchingEngineService {
             await this.linkInsuranceMapping(vismedInsuranceId, containsMatch);
             this.logger.log(`Insurance contains match: "${insurance.name}" → "${containsMatch.name}"`);
             return true;
+        }
+
+        const coreTokens = this.extractInsuranceCoreTokens(insurance.name);
+        if (coreTokens.length > 0) {
+            let bestTokenMatch: any = null;
+            let bestTokenScore = 0;
+
+            for (const p of dProviders) {
+                const providerTokens = this.extractInsuranceCoreTokens(p.name);
+                if (providerTokens.length === 0) continue;
+
+                const MIN_SUBSTRING_LEN = 4;
+                const matchingTokens = coreTokens.filter(t =>
+                    providerTokens.some(pt =>
+                        pt === t ||
+                        (t.length >= MIN_SUBSTRING_LEN && pt.includes(t)) ||
+                        (pt.length >= MIN_SUBSTRING_LEN && t.includes(pt))
+                    )
+                );
+                const tokenScore = matchingTokens.length / Math.max(coreTokens.length, 1);
+
+                const diceScore = stringSimilarity.compareTwoStrings(
+                    coreTokens.join(' '),
+                    providerTokens.join(' ')
+                );
+
+                const combinedScore = (tokenScore * 0.6) + (diceScore * 0.4);
+
+                if (combinedScore > bestTokenScore) {
+                    bestTokenScore = combinedScore;
+                    bestTokenMatch = p;
+                }
+            }
+
+            if (bestTokenMatch && bestTokenScore >= 0.75) {
+                await this.linkInsuranceMapping(vismedInsuranceId, bestTokenMatch);
+                this.logger.log(`Insurance token match: "${insurance.name}" → "${bestTokenMatch.name}" (score: ${bestTokenScore.toFixed(2)})`);
+                return true;
+            }
+
+            if (bestTokenMatch && bestTokenScore >= 0.55) {
+                await this.pendingReviewInsuranceMapping(vismedInsuranceId, bestTokenMatch, bestTokenScore);
+                this.logger.log(`Insurance token pending review: "${insurance.name}" → "${bestTokenMatch.name}" (score: ${bestTokenScore.toFixed(2)})`);
+                return true;
+            }
         }
 
         let bestMatch = null;

@@ -211,6 +211,7 @@ export class DocplannerClient {
 
     async enableCalendar(facilityId: string, doctorId: string, addressId: string): Promise<any> {
         const addr = await this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}`);
+        this.logger.log(`enableCalendar: address ${addressId}, sending booking_type=integration`);
         return this.request('PATCH', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}`, {
             booking_type: 'integration',
             insurance_support: addr.insurance_support || 'private',
@@ -219,6 +220,7 @@ export class DocplannerClient {
 
     async disableCalendar(facilityId: string, doctorId: string, addressId: string): Promise<any> {
         const addr = await this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}`);
+        this.logger.log(`disableCalendar: address ${addressId}, sending booking_type=none`);
         return this.request('PATCH', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}`, {
             booking_type: 'none',
             insurance_support: addr.insurance_support || 'private',
