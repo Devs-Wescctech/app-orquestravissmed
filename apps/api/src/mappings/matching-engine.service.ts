@@ -87,7 +87,6 @@ export class MatchingEngineService {
             }
         }
 
-        // Layer 2: Fuzzy Match (lowered threshold from 0.85 to 0.60 for broader coverage)
         let bestMatch = null;
         let bestScore = 0;
 
@@ -100,8 +99,7 @@ export class MatchingEngineService {
         }
 
         if (bestMatch && bestScore >= 0.60) {
-            // High confidence (>= 0.85) auto-approved, lower needs review
-            const needsReview = bestScore < 0.85;
+            const needsReview = bestScore < 0.70;
             await this.createMapping(specialty.id, bestMatch.id, 'APPROXIMATE', bestScore, needsReview);
             return true;
         }
@@ -186,9 +184,14 @@ export class MatchingEngineService {
             }
         }
 
-        if (bestMatch && bestScore >= 0.80) {
-            await this.linkInsuranceMapping(vismedInsuranceId, bestMatch);
-            this.logger.log(`Insurance fuzzy match: "${insurance.name}" → "${bestMatch.name}" (score: ${bestScore.toFixed(2)})`);
+        if (bestMatch && bestScore >= 0.60) {
+            if (bestScore >= 0.70) {
+                await this.linkInsuranceMapping(vismedInsuranceId, bestMatch);
+                this.logger.log(`Insurance fuzzy match: "${insurance.name}" → "${bestMatch.name}" (score: ${bestScore.toFixed(2)})`);
+            } else {
+                await this.pendingReviewInsuranceMapping(vismedInsuranceId, bestMatch, bestScore);
+                this.logger.log(`Insurance pending review: "${insurance.name}" → "${bestMatch.name}" (score: ${bestScore.toFixed(2)} < 0.70)`);
+            }
             return true;
         }
 
@@ -211,6 +214,39 @@ export class MatchingEngineService {
                         externalId: String(doctoraliaProvider.doctoraliaId),
                         status: 'LINKED',
                         conflictData: { doctoraliaProviderId: doctoraliaProvider.doctoraliaId, doctoraliaProviderName: doctoraliaProvider.name }
+                    }
+                });
+            } catch (e: any) {
+                if (e.code === 'P2002') {
+                    this.logger.debug(`Insurance mapping already exists for externalId ${doctoraliaProvider.doctoraliaId}, skipping duplicate.`);
+                } else {
+                    throw e;
+                }
+            }
+        }
+    }
+
+    private async pendingReviewInsuranceMapping(vismedInsuranceId: string, doctoraliaProvider: any, score: number) {
+        const mappings = await this.prisma.mapping.findMany({
+            where: {
+                entityType: 'INSURANCE',
+                vismedId: vismedInsuranceId,
+            }
+        });
+        for (const m of mappings) {
+            if (m.status === 'LINKED') continue;
+            try {
+                await this.prisma.mapping.update({
+                    where: { id: m.id },
+                    data: {
+                        externalId: String(doctoraliaProvider.doctoraliaId),
+                        status: 'PENDING_REVIEW',
+                        conflictData: {
+                            doctoraliaProviderId: doctoraliaProvider.doctoraliaId,
+                            doctoraliaProviderName: doctoraliaProvider.name,
+                            matchScore: score,
+                            requiresManualApproval: true
+                        }
                     }
                 });
             } catch (e: any) {

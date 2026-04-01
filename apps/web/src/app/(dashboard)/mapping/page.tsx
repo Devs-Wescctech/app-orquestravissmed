@@ -198,6 +198,33 @@ export default function MappingHub() {
         }
     };
 
+    const handleApproveInsurance = async (mappingId: string) => {
+        setIsResolving(true);
+        try {
+            await api.post('/mappings/insurance/approve', { mappingId });
+            toast.success('Convênio aprovado com sucesso.');
+            fetchData();
+        } catch (err: any) {
+            toast.error(`Falha ao aprovar convênio: ${err.message}`);
+        } finally {
+            setIsResolving(false);
+        }
+    };
+
+    const handleRejectInsurance = async (mappingId: string) => {
+        if (!confirm('Rejeitar este match de convênio?')) return;
+        setIsResolving(true);
+        try {
+            await api.post('/mappings/insurance/reject', { mappingId });
+            toast.success('Convênio rejeitado.');
+            fetchData();
+        } catch (err: any) {
+            toast.error(`Falha ao rejeitar convênio: ${err.message}`);
+        } finally {
+            setIsResolving(false);
+        }
+    };
+
 
 
     // ------------------------------------------------------------------
@@ -446,11 +473,12 @@ export default function MappingHub() {
             {/* ── ESPECIALIDADES (Motor IA) ──────────────────────────── */}
             {activeTab === 'Especialidades' && (
                 <div className="space-y-8 animate-in fade-in slide-in-from-top-4 duration-500">
-                    <div className="grid grid-cols-1 md:grid-cols-5 gap-8">
+                    <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-6">
                         {[
                             { label: 'Espec. VisMed', value: specStats?.totalVismedSpecialties ?? '—', icon: <FileText className="h-6 w-6" />, color: 'from-indigo-500 to-indigo-700' },
                             { label: 'Serviços Doctoralia', value: specStats?.totalDoctoraliaServices ?? '—', icon: <Activity className="h-6 w-6" />, color: 'from-blue-500 to-blue-700' },
-                            { label: 'Cruzados (Match)', value: specMetrics.confirmed, icon: <CheckCircle2 className="h-6 w-6" />, color: 'from-primary to-emerald-600' },
+                            { label: 'Aprovados', value: specStats?.totalAutoApproved ?? '—', icon: <CheckCircle2 className="h-6 w-6" />, color: 'from-primary to-emerald-600' },
+                            { label: 'Pendentes Revisão', value: specStats?.totalPendingReview ?? '—', icon: <AlertTriangle className="h-6 w-6" />, color: 'from-amber-400 to-amber-600' },
                             { label: 'Sem Match', value: specStats?.totalUnmatched ?? '—', icon: <Link2Off className="h-6 w-6" />, color: 'from-orange-400 to-rose-500' },
                             { label: 'Cobertura', value: specStats ? `${specStats.coveragePercent}%` : '—', icon: <Stethoscope className="h-6 w-6" />, color: 'from-slate-700 to-slate-900' },
                         ].map(m => (
@@ -542,11 +570,12 @@ export default function MappingHub() {
             {/* ── CONVÊNIOS ─────────────────────────────────────────── */}
             {activeTab === 'Convênios' && (
                 <div className="space-y-8 animate-in fade-in slide-in-from-top-4 duration-500">
-                    <div className="grid grid-cols-1 md:grid-cols-4 gap-8">
+                    <div className="grid grid-cols-1 md:grid-cols-5 gap-8">
                         {[
                             { label: 'Total Mapeados', value: legacyMappings.length, icon: <FileText className="h-6 w-6" />, color: 'from-slate-500 to-slate-700' },
                             { label: 'Vinculados', value: legacyMappings.filter(m => m.status === 'LINKED').length, icon: <CheckCircle2 className="h-6 w-6" />, color: 'from-primary to-emerald-600' },
-                            { label: 'Pendentes', value: legacyMappings.filter(m => m.status === 'UNLINKED').length, icon: <Link2Off className="h-6 w-6" />, color: 'from-orange-400 to-rose-500' },
+                            { label: 'Aguardando Revisão', value: legacyMappings.filter(m => m.status === 'PENDING_REVIEW').length, icon: <AlertTriangle className="h-6 w-6" />, color: 'from-amber-400 to-amber-600' },
+                            { label: 'Sem Vínculo', value: legacyMappings.filter(m => m.status === 'UNLINKED').length, icon: <Link2Off className="h-6 w-6" />, color: 'from-orange-400 to-rose-500' },
                             { label: 'Conflitos', value: legacyMappings.filter(m => m.status === 'CONFLICT').length, icon: <AlertTriangle className="h-6 w-6" />, color: 'from-rose-500 to-red-600' },
                         ].map(m => (
                             <div key={m.label} className="bg-white/70 backdrop-blur-xl rounded-[32px] p-8 shadow-sm border border-slate-100/60 flex items-center justify-between transition-all hover:shadow-xl hover:-translate-y-1 group">
@@ -620,9 +649,37 @@ export default function MappingHub() {
                                                             <CheckCircle2 className="h-4 w-4" /> Vinculado
                                                         </span>
                                                     )}
+                                                    {m.status === 'PENDING_REVIEW' && (
+                                                        <div className="flex flex-col items-center gap-2">
+                                                            <span className="inline-flex items-center gap-1.5 px-4 py-2 rounded-2xl text-[10px] font-black uppercase tracking-widest bg-amber-50 text-amber-700 border border-amber-200 shadow-sm">
+                                                                <AlertTriangle className="h-4 w-4" /> Aguardando Revisão
+                                                            </span>
+                                                            {m.conflictData?.matchScore && (
+                                                                <span className="text-[9px] font-bold text-amber-600">
+                                                                    Score: {(m.conflictData.matchScore * 100).toFixed(0)}%
+                                                                </span>
+                                                            )}
+                                                            <div className="flex gap-2">
+                                                                <button
+                                                                    onClick={(e) => { e.stopPropagation(); handleApproveInsurance(m.id); }}
+                                                                    disabled={isResolving}
+                                                                    className="px-3 py-1.5 bg-emerald-500 text-white text-[9px] font-black uppercase tracking-widest rounded-xl hover:bg-emerald-600 transition-all active:scale-95 disabled:opacity-50"
+                                                                >
+                                                                    Aprovar
+                                                                </button>
+                                                                <button
+                                                                    onClick={(e) => { e.stopPropagation(); handleRejectInsurance(m.id); }}
+                                                                    disabled={isResolving}
+                                                                    className="px-3 py-1.5 bg-rose-500 text-white text-[9px] font-black uppercase tracking-widest rounded-xl hover:bg-rose-600 transition-all active:scale-95 disabled:opacity-50"
+                                                                >
+                                                                    Rejeitar
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                    )}
                                                     {m.status === 'UNLINKED' && (
                                                         <span className="inline-flex items-center gap-1.5 px-4 py-2 rounded-2xl text-[10px] font-black uppercase tracking-widest bg-slate-50 text-slate-400 border border-slate-200 opacity-60">
-                                                            <Link2Off className="h-4 w-4" /> Pendente
+                                                            <Link2Off className="h-4 w-4" /> Sem Vínculo
                                                         </span>
                                                     )}
                                                     {m.status === 'CONFLICT' && (

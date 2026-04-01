@@ -62,7 +62,8 @@ Both pipelines attempt BullMQ queue dispatch first, then fall back to direct inl
 ## Mapping Module
 - **Specialty deduplication**: `getProfessionalMappings` deduplicates specialties per doctor by `normalizedName` to avoid visual duplicates (e.g., "Clinico Geral" vs "Clínico Geral").
 - **Insurance enrichment**: `findAll` for INSURANCE mappings now returns `doctoraliaCounterpart` with name/doctoraliaId from `DoctoraliaInsuranceProvider`.
-- **Specialty stats**: `GET /mappings/specialties/stats` returns totalVismedSpecialties, totalDoctoraliaServices, totalMatched, totalUnmatched, coveragePercent.
+- **Specialty stats**: `GET /mappings/specialties/stats` returns totalVismedSpecialties, totalDoctoraliaServices, totalMatched, totalAutoApproved, totalPendingReview, totalUnmatched, coveragePercent.
+- **Manual approval threshold**: Matches (specialties and insurance/convênios) with score < 70% require manual approval. Specialties get `requiresReview=true`, insurance gets `PENDING_REVIEW` status. Approve/reject via `POST /mappings/insurance/approve` and `/reject` (clinic-scoped).
 - **Orphan cleanup safety**: `cleanupOrphans` in sync.processor.ts skips orphaning when activeIds is empty (for ALL entity types, not just DOCTOR).
 
 ## Key Files

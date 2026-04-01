@@ -308,18 +308,23 @@ export class MappingsService {
     }
 
     async getSpecialtyStats() {
-        const [totalVismed, totalDoctoralia, totalMatched, totalUnmatched] = await Promise.all([
+        const [totalVismed, totalDoctoralia, totalMatched, totalPendingReview, totalUnmatched] = await Promise.all([
             this.prisma.vismedSpecialty.count(),
             this.prisma.doctoraliaService.count(),
-            this.prisma.specialtyServiceMapping.count({ where: { isActive: true } }),
+            this.prisma.specialtyServiceMapping.count({ where: { isActive: true, requiresReview: false } }),
+            this.prisma.specialtyServiceMapping.count({ where: { isActive: true, requiresReview: true } }),
             this.prisma.vismedSpecialty.count({ where: { mappings: { none: { isActive: true } } } }),
         ]);
+        const autoApproved = totalMatched;
+        const totalMatchedAll = totalMatched + totalPendingReview;
         return {
             totalVismedSpecialties: totalVismed,
             totalDoctoraliaServices: totalDoctoralia,
-            totalMatched,
+            totalMatched: totalMatchedAll,
+            totalAutoApproved: autoApproved,
+            totalPendingReview,
             totalUnmatched,
-            coveragePercent: totalVismed > 0 ? Math.round((totalMatched / totalVismed) * 100) : 0,
+            coveragePercent: totalVismed > 0 ? Math.round((totalMatchedAll / totalVismed) * 100) : 0,
         };
     }
 
@@ -418,5 +423,59 @@ export class MappingsService {
             });
         }
         return mapping;
+    }
+
+    async approveInsuranceMatch(mappingId: string, clinicId: string, userId?: string) {
+        const mapping = await this.prisma.mapping.findFirst({
+            where: { id: mappingId, clinicId, entityType: 'INSURANCE', status: 'PENDING_REVIEW' }
+        });
+        if (!mapping) {
+            throw new Error('Mapeamento de convênio não encontrado ou não está pendente de revisão.');
+        }
+
+        const updated = await this.prisma.mapping.update({
+            where: { id: mappingId },
+            data: { status: 'LINKED' }
+        });
+
+        if (userId) {
+            await this.prisma.auditLog.create({
+                data: {
+                    userId,
+                    action: 'APPROVE_INSURANCE_MATCH',
+                    entity: 'MAPPING',
+                    entityId: mappingId,
+                    details: { previousState: 'PENDING_REVIEW', newState: 'LINKED' } as any,
+                }
+            });
+        }
+        return updated;
+    }
+
+    async rejectInsuranceMatch(mappingId: string, clinicId: string, userId?: string) {
+        const mapping = await this.prisma.mapping.findFirst({
+            where: { id: mappingId, clinicId, entityType: 'INSURANCE', status: 'PENDING_REVIEW' }
+        });
+        if (!mapping) {
+            throw new Error('Mapeamento de convênio não encontrado ou não está pendente de revisão.');
+        }
+
+        const updated = await this.prisma.mapping.update({
+            where: { id: mappingId },
+            data: { status: 'UNLINKED', externalId: null }
+        });
+
+        if (userId) {
+            await this.prisma.auditLog.create({
+                data: {
+                    userId,
+                    action: 'REJECT_INSURANCE_MATCH',
+                    entity: 'MAPPING',
+                    entityId: mappingId,
+                    details: { reason: 'MANUAL_REJECTION' } as any,
+                }
+            });
+        }
+        return updated;
     }
 }

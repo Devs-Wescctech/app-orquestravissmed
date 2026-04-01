@@ -93,6 +93,7 @@ enum MappingStatus {
   UNLINKED
   CONFLICT
   ORPHAN
+  PENDING_REVIEW
 }
 
 model Mapping {

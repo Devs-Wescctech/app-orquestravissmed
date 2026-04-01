@@ -82,4 +82,22 @@ export class MappingsController {
     ) {
         return this.mappingsService.createManualSpecialtyMatch(body.vismedSpecialtyId, body.doctoraliaServiceId, req.user.id);
     }
+
+    @Post('insurance/approve')
+    approveInsuranceMatch(
+        @Request() req: any,
+        @Body() body: { mappingId: string; }
+    ) {
+        const clinicId = req.user.roles[0]?.clinicId;
+        return this.mappingsService.approveInsuranceMatch(body.mappingId, clinicId, req.user.id);
+    }
+
+    @Post('insurance/reject')
+    rejectInsuranceMatch(
+        @Request() req: any,
+        @Body() body: { mappingId: string; }
+    ) {
+        const clinicId = req.user.roles[0]?.clinicId;
+        return this.mappingsService.rejectInsuranceMatch(body.mappingId, clinicId, req.user.id);
+    }
 }
