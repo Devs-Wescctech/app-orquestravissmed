@@ -27,7 +27,12 @@ import { AppointmentsModule } from './appointments/appointments.module';
       connection: {
         host: process.env.REDIS_HOST || 'localhost',
         port: parseInt(process.env.REDIS_PORT || '6379'),
-        password: process.env.REDIS_PASSWORD || 'vismed_redis_sec',
+        password: process.env.REDIS_PASSWORD || undefined,
+        maxRetriesPerRequest: null,
+        retryStrategy: () => null,
+        reconnectOnError: () => false,
+        enableOfflineQueue: false,
+        lazyConnect: true,
       },
     }),
     SyncModule,

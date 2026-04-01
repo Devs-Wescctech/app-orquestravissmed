@@ -1,9 +1,8 @@
-
 "use client";
 
 import React, { useState, useEffect } from 'react';
 import { Search, Info, Database, Hash } from "lucide-react";
-import { callEdgeFunction } from "@/lib/supabase";
+import { api } from "@/lib/api";
 
 interface DoctoraliaService {
   id: string;
@@ -20,12 +19,10 @@ export default function ServicesCatalogPage() {
   const fetchServices = async (q: string) => {
     setLoading(true);
     try {
-      const data = await callEdgeFunction('api-mappings', {
-        method: 'GET',
-        path: '/catalog/search',
+      const res = await api.get('/mappings/catalog/search', {
         params: { q, limit: '100' }
       });
-      setServices(data || []);
+      setServices(res.data || []);
     } catch (e) {
       console.error(e);
     } finally {
@@ -42,7 +39,6 @@ export default function ServicesCatalogPage() {
 
   return (
     <div className="p-6 space-y-8 max-w-7xl mx-auto animate-in fade-in duration-500">
-      {/* Header section */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold tracking-tight text-slate-900">
@@ -63,9 +59,7 @@ export default function ServicesCatalogPage() {
         </div>
       </div>
 
-      {/* Search and Results Section */}
       <div className="bg-white rounded-2xl shadow-xl shadow-slate-200/50 border border-slate-100 overflow-hidden">
-        {/* Search Bar */}
         <div className="p-6 border-b border-slate-50 bg-slate-50/50">
           <div className="relative group">
             <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400 group-focus-within:text-emerald-500 transition-colors" />
@@ -79,7 +73,6 @@ export default function ServicesCatalogPage() {
           </div>
         </div>
 
-        {/* Results area */}
         <div className="min-h-[500px] bg-white">
           {loading ? (
             <div className="flex flex-col items-center justify-center py-32 space-y-4">
@@ -131,7 +124,6 @@ export default function ServicesCatalogPage() {
         </div>
       </div>
 
-      {/* Footer Info */}
       <div className="flex items-center justify-center gap-2 text-xs text-slate-400 uppercase tracking-widest font-bold">
         <span className="w-12 h-px bg-slate-200"></span>
         vissmed health systems integration

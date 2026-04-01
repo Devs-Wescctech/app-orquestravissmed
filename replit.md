@@ -4,28 +4,51 @@
 A monorepo for the VisMed platform — a medical scheduling and integration dashboard.
 
 ## Architecture
-- **apps/web** — Next.js 14 frontend (main app, runs on port 5000)
-- **apps/api** — NestJS backend with Prisma + BullMQ (legacy, not started by default)
-- **supabase/** — Supabase Edge Functions that serve as the production API backend
+- **apps/web** — Next.js 14 frontend (port 5000, proxies API calls to backend)
+- **apps/api** — NestJS backend with Prisma ORM + PostgreSQL (port 3000)
 
 ## How It Runs
-The web frontend communicates directly with Supabase Edge Functions (not the local NestJS API). All API calls from the frontend go to Supabase hosted infrastructure.
+The workflow starts both services together:
+1. NestJS API on port 3000 (backend)
+2. Next.js frontend on port 5000 (serves UI, proxies `/api/*` to backend)
+
+The frontend uses `next.config.js` rewrites to proxy all `/api/*` requests to the NestJS backend transparently.
 
 ## Running the App
-Workflow: `Start application` → `cd apps/web && npm run dev`
-- Port: 5000 (required for Replit webview)
-- Host: 0.0.0.0 (required for Replit proxy)
+Workflow: `Start application` → `cd apps/api && node dist/src/main.js & cd apps/web && npm run dev`
+
+## Key APIs
+- `POST /api/auth/login` — JWT authentication
+- `GET /api/clinics/my` — User's clinics
+- `GET /api/doctors` — Synced doctors
+- `GET /api/appointments/*` — Calendar and bookings
+- `GET /api/mappings/*` — Data mapping management
+- `POST /api/sync/:clinicId/*` — Synchronization triggers
+
+## Database
+Replit PostgreSQL (Prisma ORM). Schema in `apps/api/prisma/schema.prisma`.
 
 ## Environment Variables
-The app uses the following (currently hardcoded with defaults in `apps/web/src/lib/supabase.ts`):
-- `NEXT_PUBLIC_SUPABASE_URL` — Supabase project URL
-- `NEXT_PUBLIC_SUPABASE_ANON_KEY` — Supabase anonymous key
+- `DATABASE_URL` — PostgreSQL connection (auto-set by Replit)
+- `JWT_SECRET` — JWT signing key
+- `VISMED_API_PORT` — API port (3000)
+- `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` — Optional, for BullMQ sync queues
 
 ## Package Manager
-npm (workspace monorepo). Install web dependencies with: `cd apps/web && npm install`
+npm (workspace monorepo).
+
+## Build Commands
+- API build: `cd apps/api && npx nest build`
+- Web dev: `cd apps/web && npm run dev`
+
+## Default Credentials
+- Email: `admin@vismed.com`
+- Password: `admin123`
 
 ## Key Files
-- `apps/web/src/lib/supabase.ts` — Supabase client and Edge Function caller
-- `apps/web/src/lib/api.ts` — Axios-compatible wrapper routing calls to Edge Functions
+- `apps/web/src/lib/api.ts` — HTTP client (fetches `/api/*` via Next.js proxy)
 - `apps/web/src/middleware.ts` — Auth middleware (cookie-based token check)
-- `apps/web/next.config.mjs` — Next.js configuration
+- `apps/web/next.config.js` — Next.js config with API proxy rewrites
+- `apps/api/src/main.ts` — NestJS entry point
+- `apps/api/src/app.module.ts` — NestJS root module
+- `apps/api/prisma/schema.prisma` — Database schema

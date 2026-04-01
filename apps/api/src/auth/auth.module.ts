@@ -12,7 +12,7 @@ import { RolesGuard } from './roles.guard';
     UsersModule,
     PassportModule,
     JwtModule.register({
-      secret: process.env.JWT_SECRET || 'vismed_super_secret_jwt_key',
+      secret: process.env.JWT_SECRET,
       signOptions: { expiresIn: '12h' },
     }),
   ],

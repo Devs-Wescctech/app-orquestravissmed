@@ -26,18 +26,9 @@ export default function LoginPage() {
             const response = await api.post('/auth/login', { email, password });
             const { access_token, user } = response.data;
 
-            // Store token in cookies (accessible to Next.js middleware if needed later)
             Cookies.set('vismed_auth_token', access_token, { expires: 7 });
 
-            // Update global auth state
             login(user);
-
-            // Synchronize session with Supabase client to enable RLS on direct queries
-            const { supabase } = await import('@/lib/supabase');
-            await supabase.auth.setSession({
-                access_token: access_token,
-                refresh_token: '', // We don't have this from the custom edge function yet
-            });
 
             router.push('/select-clinic');
         } catch (error: any) {
