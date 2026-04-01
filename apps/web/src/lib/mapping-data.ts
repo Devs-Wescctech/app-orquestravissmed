@@ -36,6 +36,16 @@ export async function fetchUnitMappings(clinicId: string) {
   }
 }
 
+export async function fetchSpecialtyStats() {
+  try {
+    const response = await api.get('/mappings/specialties/stats');
+    return response.data || null;
+  } catch (error) {
+    console.error('fetchSpecialtyStats error:', error);
+    return null;
+  }
+}
+
 export async function fetchLegacyMappings(clinicId: string, type: string) {
   try {
     const response = await api.get('/mappings', { 

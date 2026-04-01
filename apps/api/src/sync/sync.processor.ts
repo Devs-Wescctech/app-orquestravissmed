@@ -359,7 +359,7 @@ export class SyncProcessor extends WorkerHost {
             const key = `last_active_${type.toLowerCase()}s`;
             const activeIds = metrics[key] || [];
 
-            if (activeIds.length === 0 && type === 'DOCTOR') continue; // Safety check
+            if (activeIds.length === 0) continue;
 
             const orphaned = await this.prisma.mapping.updateMany({
                 where: {

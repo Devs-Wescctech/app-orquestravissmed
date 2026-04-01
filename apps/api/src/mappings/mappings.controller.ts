@@ -54,6 +54,11 @@ export class MappingsController {
         return this.mappingsService.getSpecialtyMatches(reviewFilter);
     }
 
+    @Get('specialties/stats')
+    getSpecialtyStats() {
+        return this.mappingsService.getSpecialtyStats();
+    }
+
     @Post('specialties/approve')
     approveSpecialtyMatch(
         @Request() req: any,

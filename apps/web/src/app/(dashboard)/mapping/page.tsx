@@ -6,7 +6,7 @@ import {
     Calendar, CalendarOff, ToggleLeft, ToggleRight, Activity
 } from 'lucide-react';
 import { api } from '@/lib/api';
-import { fetchProfessionalMappings, fetchSpecialtyMatches, fetchUnitMappings, fetchLegacyMappings } from '@/lib/mapping-data';
+import { fetchProfessionalMappings, fetchSpecialtyMatches, fetchUnitMappings, fetchLegacyMappings, fetchSpecialtyStats } from '@/lib/mapping-data';
 import { useAuthStore } from '@/lib/store';
 import { useClinic } from '@/lib/clinic-store';
 import { toast } from 'sonner';
@@ -68,6 +68,7 @@ export default function MappingHub() {
     const [units, setUnits] = useState<VismedUnit[]>([]);
     const [specialtyMatches, setSpecialtyMatches] = useState<SpecialtyMatch[]>([]);
     const [legacyMappings, setLegacyMappings] = useState<any[]>([]);
+    const [specStats, setSpecStats] = useState<any>(null);
 
     // Resolve modal (legacy Convênios tab)
     const [showResolveModal, setShowResolveModal] = useState(false);
@@ -87,8 +88,12 @@ export default function MappingHub() {
                 const data = await fetchProfessionalMappings(clinicId);
                 setProfessionals(data || []);
             } else if (activeTab === 'Especialidades') {
-                const data = await fetchSpecialtyMatches(clinicId);
+                const [data, stats] = await Promise.all([
+                    fetchSpecialtyMatches(clinicId),
+                    fetchSpecialtyStats(),
+                ]);
                 setSpecialtyMatches(data || []);
+                setSpecStats(stats);
             } else if (activeTab === 'Unidades') {
                 const data = await fetchUnitMappings(clinicId);
                 setUnits(data || []);
@@ -441,11 +446,13 @@ export default function MappingHub() {
             {/* ── ESPECIALIDADES (Motor IA) ──────────────────────────── */}
             {activeTab === 'Especialidades' && (
                 <div className="space-y-8 animate-in fade-in slide-in-from-top-4 duration-500">
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
+                    <div className="grid grid-cols-1 md:grid-cols-5 gap-8">
                         {[
-                            { label: 'Engine: Confirmados', value: specMetrics.confirmed, icon: <CheckCircle2 className="h-6 w-6" />, color: 'from-primary to-emerald-600' },
-                            { label: 'Aprovação Pendente', value: specMetrics.pending, icon: <AlertTriangle className="h-6 w-6" />, color: 'from-orange-400 to-rose-500' },
-                            { label: 'Total Cruzamentos', value: specialtyMatches.length, icon: <Stethoscope className="h-6 w-6" />, color: 'from-slate-700 to-slate-900' },
+                            { label: 'Espec. VisMed', value: specStats?.totalVismedSpecialties ?? '—', icon: <FileText className="h-6 w-6" />, color: 'from-indigo-500 to-indigo-700' },
+                            { label: 'Serviços Doctoralia', value: specStats?.totalDoctoraliaServices ?? '—', icon: <Activity className="h-6 w-6" />, color: 'from-blue-500 to-blue-700' },
+                            { label: 'Cruzados (Match)', value: specMetrics.confirmed, icon: <CheckCircle2 className="h-6 w-6" />, color: 'from-primary to-emerald-600' },
+                            { label: 'Sem Match', value: specStats?.totalUnmatched ?? '—', icon: <Link2Off className="h-6 w-6" />, color: 'from-orange-400 to-rose-500' },
+                            { label: 'Cobertura', value: specStats ? `${specStats.coveragePercent}%` : '—', icon: <Stethoscope className="h-6 w-6" />, color: 'from-slate-700 to-slate-900' },
                         ].map(m => (
                             <div key={m.label} className="bg-white/70 backdrop-blur-xl rounded-[32px] p-8 shadow-sm border border-slate-100/60 flex items-center justify-between transition-all hover:shadow-xl hover:-translate-y-1 group">
                                 <div>

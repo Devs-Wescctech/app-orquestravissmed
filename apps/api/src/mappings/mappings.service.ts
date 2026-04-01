@@ -20,9 +20,10 @@ export class MappingsService {
 
 
 
-        // Add Vismed Context for frontend render
         return Promise.all(mappings.map(async (m) => {
             let vismedData = null;
+            let doctoraliaCounterpart = null;
+
             if (m.vismedId) {
                 if (m.entityType === 'DOCTOR') {
                     vismedData = await this.prisma.vismedDoctor.findUnique({ where: { id: m.vismedId } });
@@ -34,7 +35,20 @@ export class MappingsService {
                     vismedData = await this.prisma.vismedInsurance.findUnique({ where: { id: m.vismedId } });
                 }
             }
-            return { ...m, vismedEntity: vismedData };
+
+            if (m.entityType === 'INSURANCE' && m.externalId) {
+                const dip = await this.prisma.doctoraliaInsuranceProvider.findFirst({
+                    where: { doctoraliaId: Number(m.externalId) }
+                });
+                if (dip) {
+                    doctoraliaCounterpart = {
+                        doctoraliaId: dip.doctoraliaId,
+                        name: dip.name,
+                    };
+                }
+            }
+
+            return { ...m, vismedEntity: vismedData, doctoraliaCounterpart };
         }));
     }
 
@@ -158,17 +172,27 @@ export class MappingsService {
                 gender: d.gender,
                 isActive: d.isActive,
                 unit: d.unit ? { name: d.unit.name, city: d.unit.cityName } : null,
-                specialties: d.specialties.map(ps => ({
-                    id: ps.specialty.id,
-                    name: ps.specialty.name,
-                    normalizedName: ps.specialty.normalizedName,
-                    activeMatch: ps.specialty.mappings[0] ? {
-                        matchType: (ps.specialty.mappings[0] as any).matchType,
-                        confidenceScore: (ps.specialty.mappings[0] as any).confidenceScore,
-                        requiresReview: (ps.specialty.mappings[0] as any).requiresReview,
-                        doctoraliaService: (ps.specialty.mappings[0] as any).doctoraliaService?.name
-                    } : null
-                })),
+                specialties: (() => {
+                    const seen = new Set<string>();
+                    return d.specialties
+                        .map(ps => ({
+                            id: ps.specialty.id,
+                            name: ps.specialty.name,
+                            normalizedName: ps.specialty.normalizedName,
+                            activeMatch: ps.specialty.mappings[0] ? {
+                                matchType: (ps.specialty.mappings[0] as any).matchType,
+                                confidenceScore: (ps.specialty.mappings[0] as any).confidenceScore,
+                                requiresReview: (ps.specialty.mappings[0] as any).requiresReview,
+                                doctoraliaService: (ps.specialty.mappings[0] as any).doctoraliaService?.name
+                            } : null
+                        }))
+                        .filter(s => {
+                            const key = s.normalizedName || s.name.toLowerCase();
+                            if (seen.has(key)) return false;
+                            seen.add(key);
+                            return true;
+                        });
+                })(),
                 doctoraliaCounterpart: d.unifiedMappings[0]?.doctoraliaDoctor ? {
                     name: d.unifiedMappings[0].doctoraliaDoctor.name,
                     doctoraliaDoctorId: d.unifiedMappings[0].doctoraliaDoctor.doctoraliaDoctorId,
@@ -281,6 +305,22 @@ export class MappingsService {
             },
             orderBy: { confidenceScore: 'desc' }
         });
+    }
+
+    async getSpecialtyStats() {
+        const [totalVismed, totalDoctoralia, totalMatched, totalUnmatched] = await Promise.all([
+            this.prisma.vismedSpecialty.count(),
+            this.prisma.doctoraliaService.count(),
+            this.prisma.specialtyServiceMapping.count({ where: { isActive: true } }),
+            this.prisma.vismedSpecialty.count({ where: { mappings: { none: { isActive: true } } } }),
+        ]);
+        return {
+            totalVismedSpecialties: totalVismed,
+            totalDoctoraliaServices: totalDoctoralia,
+            totalMatched,
+            totalUnmatched,
+            coveragePercent: totalVismed > 0 ? Math.round((totalMatched / totalVismed) * 100) : 0,
+        };
     }
 
     async approveSpecialtyMatch(vismedSpecialtyId: string, doctoraliaServiceId: string, userId?: string) {

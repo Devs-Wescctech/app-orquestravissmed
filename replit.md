@@ -59,6 +59,12 @@ Both pipelines attempt BullMQ queue dispatch first, then fall back to direct inl
 - Email: `admin@vismed.com`
 - Password: `admin123`
 
+## Mapping Module
+- **Specialty deduplication**: `getProfessionalMappings` deduplicates specialties per doctor by `normalizedName` to avoid visual duplicates (e.g., "Clinico Geral" vs "Clínico Geral").
+- **Insurance enrichment**: `findAll` for INSURANCE mappings now returns `doctoraliaCounterpart` with name/doctoraliaId from `DoctoraliaInsuranceProvider`.
+- **Specialty stats**: `GET /mappings/specialties/stats` returns totalVismedSpecialties, totalDoctoraliaServices, totalMatched, totalUnmatched, coveragePercent.
+- **Orphan cleanup safety**: `cleanupOrphans` in sync.processor.ts skips orphaning when activeIds is empty (for ALL entity types, not just DOCTOR).
+
 ## Key Files
 - `apps/web/src/lib/api.ts` — HTTP client (fetches `/api/*` via Next.js proxy)
 - `apps/web/src/lib/store.ts` — Zustand auth store with persist + hydration tracking (`_hasHydrated`)
