@@ -138,10 +138,94 @@ export class MatchingEngineService {
         this.logger.log(`Mapped Vismed Specialty ${vismedSpecialtyId} to Doctoralia Service ${doctoraliaServiceId} (${matchType} - Score: ${confidenceScore})`);
     }
 
+    async runMatchingForInsurance(vismedInsuranceId: string): Promise<boolean> {
+        const insurance = await this.prisma.vismedInsurance.findUnique({
+            where: { id: vismedInsuranceId }
+        });
+        if (!insurance) return false;
+
+        const normInsurance = this.normalizeString(insurance.name);
+
+        const existingMapping = await this.prisma.mapping.findFirst({
+            where: {
+                entityType: 'INSURANCE',
+                vismedId: vismedInsuranceId,
+                status: 'LINKED'
+            }
+        });
+        if (existingMapping) return true;
+
+        const dProviders = await this.prisma.doctoraliaInsuranceProvider.findMany();
+        if (dProviders.length === 0) return false;
+
+        const exactMatch = dProviders.find(p => this.normalizeString(p.name) === normInsurance);
+        if (exactMatch) {
+            await this.linkInsuranceMapping(vismedInsuranceId, exactMatch);
+            this.logger.log(`Insurance exact match: "${insurance.name}" → "${exactMatch.name}" (doctoraliaId: ${exactMatch.doctoraliaId})`);
+            return true;
+        }
+
+        const containsMatch = dProviders.find(p => {
+            const normP = this.normalizeString(p.name);
+            if (normP.length < 4 || normInsurance.length < 4) return false;
+            return normP.includes(normInsurance) || normInsurance.includes(normP);
+        });
+        if (containsMatch) {
+            await this.linkInsuranceMapping(vismedInsuranceId, containsMatch);
+            this.logger.log(`Insurance contains match: "${insurance.name}" → "${containsMatch.name}"`);
+            return true;
+        }
+
+        let bestMatch = null;
+        let bestScore = 0;
+        for (const p of dProviders) {
+            const score = stringSimilarity.compareTwoStrings(normInsurance, this.normalizeString(p.name));
+            if (score > bestScore) {
+                bestScore = score;
+                bestMatch = p;
+            }
+        }
+
+        if (bestMatch && bestScore >= 0.80) {
+            await this.linkInsuranceMapping(vismedInsuranceId, bestMatch);
+            this.logger.log(`Insurance fuzzy match: "${insurance.name}" → "${bestMatch.name}" (score: ${bestScore.toFixed(2)})`);
+            return true;
+        }
+
+        this.logger.debug(`No insurance match found for: ${insurance.name}`);
+        return false;
+    }
+
+    private async linkInsuranceMapping(vismedInsuranceId: string, doctoraliaProvider: any) {
+        const mappings = await this.prisma.mapping.findMany({
+            where: {
+                entityType: 'INSURANCE',
+                vismedId: vismedInsuranceId,
+            }
+        });
+        for (const m of mappings) {
+            try {
+                await this.prisma.mapping.update({
+                    where: { id: m.id },
+                    data: {
+                        externalId: String(doctoraliaProvider.doctoraliaId),
+                        status: 'LINKED',
+                        conflictData: { doctoraliaProviderId: doctoraliaProvider.doctoraliaId, doctoraliaProviderName: doctoraliaProvider.name }
+                    }
+                });
+            } catch (e: any) {
+                if (e.code === 'P2002') {
+                    this.logger.debug(`Insurance mapping already exists for externalId ${doctoraliaProvider.doctoraliaId}, skipping duplicate.`);
+                } else {
+                    throw e;
+                }
+            }
+        }
+    }
+
     async runMatchingForUnmatched(): Promise<number> {
         this.logger.log('Iniciando Rescan de Matching para Especialidades VisMed Órfãs...');
 
-        // Find all specialties that don't have an active mapping
         const unmatchedSpecialties = await this.prisma.vismedSpecialty.findMany({
             where: {
                 mappings: {
@@ -181,7 +265,27 @@ export class MatchingEngineService {
             this.logger.log(`Rescan Profissionais: ${newDocsCount} novos matches encontrados dentre ${unmatchedDoctors.length} órfãos.`);
         }
 
-        return newMatchesCount + newDocsCount;
+        // --- INSURANCE / CONVÊNIOS ---
+        let newInsCount = 0;
+        const unmatchedInsurances = await this.prisma.vismedInsurance.findMany();
+        const linkedInsIds = (await this.prisma.mapping.findMany({
+            where: { entityType: 'INSURANCE', status: 'LINKED' },
+            select: { vismedId: true }
+        })).map(m => m.vismedId).filter(Boolean);
+
+        const insurancesToMatch = unmatchedInsurances.filter(i => !linkedInsIds.includes(i.id));
+
+        if (insurancesToMatch.length === 0) {
+            this.logger.log('Nenhum Convênio VisMed Órfão encontrado.');
+        } else {
+            for (const ins of insurancesToMatch) {
+                const matched = await this.runMatchingForInsurance(ins.id);
+                if (matched) newInsCount++;
+            }
+            this.logger.log(`Rescan Convênios: ${newInsCount} novos matches encontrados dentre ${insurancesToMatch.length} órfãos.`);
+        }
+
+        return newMatchesCount + newDocsCount + newInsCount;
     }
 
     async runMatchingForDoctor(vismedDoctorId: string): Promise<boolean> {

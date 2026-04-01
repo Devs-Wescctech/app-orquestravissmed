@@ -125,6 +125,26 @@ export class DocplannerClient {
         }
     }
 
+    async getInsuranceProviders(): Promise<any> {
+        return this.request('GET', '/api/v3/integration/insurance-providers');
+    }
+
+    async getInsurancePlans(insuranceProviderId: string): Promise<any> {
+        return this.request('GET', `/api/v3/integration/insurance-providers/${insuranceProviderId}/insurance-plans`);
+    }
+
+    async getAddressInsuranceProviders(facilityId: string, doctorId: string, addressId: string): Promise<any> {
+        return this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/insurance-providers`);
+    }
+
+    async putAddressInsuranceProvider(facilityId: string, doctorId: string, addressId: string, insuranceProviderId: number): Promise<any> {
+        return this.request('PUT', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/insurance-providers`, { insurance_provider_id: insuranceProviderId });
+    }
+
+    async deleteAddressInsuranceProvider(facilityId: string, doctorId: string, addressId: string, insuranceProviderId: string): Promise<any> {
+        return this.request('DELETE', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/insurance-providers/${insuranceProviderId}`);
+    }
+
     async getFacilityServices(facilityId: string): Promise<any> {
         return this.request('GET', `/api/v3/integration/facilities/${facilityId}/services`);
     }

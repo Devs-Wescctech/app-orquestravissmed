@@ -207,20 +207,50 @@ export class SyncProcessor extends WorkerHost {
                 await this.logEvent(syncRunId, 'SERVICE_CATALOG', 'error', `Failed to import service catalog: ${catalogError.message}`);
             }
 
+            // 4. Insurance Providers (Global Dictionary) — before matching so convênios can match
+            this.logger.log('Importando dicionário global de Insurance Providers da Doctoralia...');
+            await this.updateSyncStatus(syncRunId, 'syncing_insurance_providers');
+            try {
+                const insProvidersRes = await client.getInsuranceProviders();
+                const insProviders = insProvidersRes._items || [];
+                this.logger.log(`Insurance Providers: ${insProviders.length} encontrados no dicionário global.`);
+                await this.logEvent(syncRunId, 'INSURANCE', 'fetch_success', `Dicionário global: ${insProviders.length} insurance providers encontrados.`);
+
+                let savedCount = 0;
+                for (const ip of insProviders) {
+                    const ipId = ip.insurance_provider_id || ip.id;
+                    const ipName = ip.name || ip.insurance_provider_name;
+                    if (!ipId || !ipName) continue;
+                    try {
+                        const normName = (ipName || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+                        await this.prisma.doctoraliaInsuranceProvider.upsert({
+                            where: { doctoraliaId: Number(ipId) },
+                            create: { doctoraliaId: Number(ipId), name: ipName, normalizedName: normName },
+                            update: { name: ipName, normalizedName: normName }
+                        });
+                        savedCount++;
+                    } catch (itemErr: any) {
+                        this.logger.debug(`Falha ao salvar insurance provider ${ipId}: ${itemErr?.message}`);
+                    }
+                    if (savedCount % 100 === 0) {
+                        this.logger.log(`Insurance Providers: ${savedCount}/${insProviders.length} salvos...`);
+                    }
+                }
+                totalProcessed += savedCount;
+                this.logger.log(`Insurance Providers: ${savedCount} salvos no dicionário local.`);
+            } catch (insErr: any) {
+                this.logger.warn(`Falha ao importar insurance providers: ${insErr?.message}`);
+                await this.logEvent(syncRunId, 'INSURANCE', 'fetch_error', `Erro: ${insErr?.message}`);
+            }
+
             this.logger.log('Sincronização de Entidades Padrão concluídas. Acionando Rescan de Matching...');
             await this.updateSyncStatus(syncRunId, 'running_matching_engine');
             await this.matchingEngine.runMatchingForUnmatched();
 
-            // 4. Reverse Sync: Push To Doctoralia
+            // 5. Reverse Sync: Push To Doctoralia
             this.logger.log('Iniciando envio Bidirecional para a Doctoralia...');
             await this.updateSyncStatus(syncRunId, 'push_to_doctoralia');
             await this.pushSync.pushToDoctoralia(clinicId, syncRunId, client);
-
-            // 5. Insurances
-            const insRes = await client.getInsurances(facilityId);
-            const insList = insRes._items || [];
-            totalProcessed += insList.length;
-            await this.syncEntity(clinicId, syncRunId, client, 'INSURANCE', async () => ({ _items: insList }));
 
             // 6. Cleanup Orphans
             await this.cleanupOrphans(clinicId, syncRunId);
@@ -302,7 +332,7 @@ export class SyncProcessor extends WorkerHost {
         const syncRun = await this.prisma.syncRun.findUnique({ where: { id: syncRunId } });
         const metrics = syncRun?.metrics as any || {};
 
-        const entityTypes: MappingEntityType[] = ['DOCTOR', 'SERVICE', 'INSURANCE'];
+        const entityTypes: MappingEntityType[] = ['DOCTOR', 'SERVICE'];
 
         for (const type of entityTypes) {
             const key = `last_active_${type.toLowerCase()}s`;

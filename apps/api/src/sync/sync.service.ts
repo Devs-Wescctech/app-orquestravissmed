@@ -416,6 +416,41 @@ export class SyncService {
                 this.logger.warn(`Falha ao importar catálogo: ${catalogError.message}`);
             }
 
+            this.logger.log('Importando dicionário global de Insurance Providers da Doctoralia...');
+            await this.updateSyncStatus(syncRunId, 'syncing_insurance_providers');
+            try {
+                const insProvidersRes = await client.getInsuranceProviders();
+                const insProviders = insProvidersRes._items || [];
+                this.logger.log(`Insurance Providers: ${insProviders.length} encontrados no dicionário global.`);
+                await this.logEvent(syncRunId, 'INSURANCE', 'fetch_success', `Dicionário global: ${insProviders.length} insurance providers encontrados.`);
+
+                let savedCount = 0;
+                for (const ip of insProviders) {
+                    const ipId = ip.insurance_provider_id || ip.id;
+                    const ipName = ip.name || ip.insurance_provider_name;
+                    if (!ipId || !ipName) continue;
+                    try {
+                        const normName = (ipName || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+                        await this.prisma.doctoraliaInsuranceProvider.upsert({
+                            where: { doctoraliaId: Number(ipId) },
+                            create: { doctoraliaId: Number(ipId), name: ipName, normalizedName: normName },
+                            update: { name: ipName, normalizedName: normName }
+                        });
+                        savedCount++;
+                    } catch (itemErr: any) {
+                        this.logger.debug(`Falha ao salvar insurance provider ${ipId}: ${itemErr?.message}`);
+                    }
+                    if (savedCount % 100 === 0) {
+                        this.logger.log(`Insurance Providers: ${savedCount}/${insProviders.length} salvos...`);
+                    }
+                }
+                totalProcessed += savedCount;
+                this.logger.log(`Insurance Providers: ${savedCount} salvos no dicionário local.`);
+            } catch (insErr: any) {
+                this.logger.warn(`Falha ao importar insurance providers: ${insErr.message}`);
+                await this.logEvent(syncRunId, 'INSURANCE', 'fetch_error', `Erro: ${insErr.message}`);
+            }
+
             await this.updateSyncStatus(syncRunId, 'running_matching_engine');
             await this.matchingEngine.runMatchingForUnmatched();
 
@@ -423,17 +458,7 @@ export class SyncService {
             await this.updateSyncStatus(syncRunId, 'push_to_doctoralia');
             await this.pushSync.pushToDoctoralia(clinicId, syncRunId, client);
 
-            const activeInsuranceIds: string[] = [];
-            const insRes = await client.getInsurances(facilityId);
-            const insList = insRes._items || [];
-            totalProcessed += insList.length;
-            for (const ins of insList) {
-                const insId = String(ins.id);
-                activeInsuranceIds.push(insId);
-                await this.saveGenericMapping(clinicId, 'INSURANCE', insId, ins, syncRunId);
-            }
-
-            await this.cleanupOrphans(clinicId, syncRunId, activeDoctorIds, activeServiceIds, activeInsuranceIds);
+            await this.cleanupOrphans(clinicId, syncRunId, activeDoctorIds, activeServiceIds);
             await this.completeSyncRun(syncRunId, totalProcessed);
             this.logger.log(`[DIRECT] Doctoralia sync completed: ${totalProcessed} records.`);
         } catch (e) {
@@ -463,12 +488,11 @@ export class SyncService {
         });
     }
 
-    private async cleanupOrphans(clinicId: string, syncRunId: string, activeDoctorIds: string[], activeServiceIds: string[], activeInsuranceIds: string[] = []) {
+    private async cleanupOrphans(clinicId: string, syncRunId: string, activeDoctorIds: string[], activeServiceIds: string[]) {
         await this.logEvent(syncRunId, 'MAPPING', 'cleanup_started', 'Identifying orphaned records...');
         const types = [
             { type: 'DOCTOR' as const, ids: activeDoctorIds },
             { type: 'SERVICE' as const, ids: activeServiceIds },
-            { type: 'INSURANCE' as const, ids: activeInsuranceIds },
         ];
         for (const { type, ids } of types) {
             if (ids.length === 0) continue;

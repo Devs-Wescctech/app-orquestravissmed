@@ -312,6 +312,28 @@ model DoctoraliaService {
   mappings             SpecialtyServiceMapping[]
 }
 
+model DoctoraliaInsuranceProvider {
+  id                   String   @id @default(uuid())
+  doctoraliaId         Int      @unique
+  name                 String
+  normalizedName       String?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  plans                DoctoraliaInsurancePlan[]
+}
+
+model DoctoraliaInsurancePlan {
+  id                   String   @id @default(uuid())
+  doctoraliaId         Int      @unique
+  name                 String
+  providerId           String
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  provider             DoctoraliaInsuranceProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+}
+
 model DoctoraliaAddressService {
   id                            String   @id @default(uuid())
   doctoraliaAddressServiceId    String   @unique

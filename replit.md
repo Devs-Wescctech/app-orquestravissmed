@@ -49,9 +49,9 @@ npm (workspace monorepo).
 ## Sync Architecture
 The `SyncService` orchestrates two sync pipelines:
 1. **VisMed sync** (`vismed-full`): Pulls units, specialties, professionals, and insurances (convênios) from the VisMed API. Creates `VismedUnit`, `VismedSpecialty`, `VismedDoctor`, `VismedInsurance` records and `Mapping` entries.
-2. **Doctoralia sync** (`full`): Pulls facilities, doctors, services from Docplanner API. Creates `DoctoraliaDoctor`, `DoctoraliaService`, `DoctoraliaAddressService` records and `Mapping` entries. Also runs push sync back to Doctoralia.
+2. **Doctoralia sync** (`full`): Pulls facilities, doctors, services from Docplanner API. Creates `DoctoraliaDoctor`, `DoctoraliaService`, `DoctoraliaAddressService` records and `Mapping` entries. Also fetches the global insurance providers dictionary (2717+ items) into `DoctoraliaInsuranceProvider`. Runs push sync back to Doctoralia.
 3. **Global sync** (`/sync/:clinicId/global`): Triggers both pipelines in sequence.
-4. **Matching Engine**: After sync, auto-matches VisMed specialties to Doctoralia services and VisMed doctors to Doctoralia doctors using string similarity.
+4. **Matching Engine**: After sync, auto-matches VisMed specialties to Doctoralia services, VisMed doctors to Doctoralia doctors, and VisMed convênios (insurances) to Doctoralia insurance providers using exact/contains/fuzzy string similarity.
 
 Both pipelines attempt BullMQ queue dispatch first, then fall back to direct inline execution if Redis is unavailable.
 
