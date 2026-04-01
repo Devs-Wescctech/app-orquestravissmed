@@ -200,15 +200,23 @@ export class DocplannerClient {
     }
 
     async enableCalendar(facilityId: string, doctorId: string, addressId: string): Promise<any> {
-        return this.request('POST', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/calendar-status`, { status: 'enabled' });
+        const addr = await this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}`);
+        return this.request('PATCH', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}`, {
+            booking_type: 'integration',
+            insurance_support: addr.insurance_support || 'private',
+        });
     }
 
     async disableCalendar(facilityId: string, doctorId: string, addressId: string): Promise<any> {
-        return this.request('POST', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/calendar-status`, { status: 'disabled' });
+        const addr = await this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}`);
+        return this.request('PATCH', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}`, {
+            booking_type: 'none',
+            insurance_support: addr.insurance_support || 'private',
+        });
     }
 
     async getCalendar(facilityId: string, doctorId: string, addressId: string): Promise<any> {
-        return this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/calendar-status`);
+        return this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}`);
     }
 
     async getCalendarBreaks(facilityId: string, doctorId: string, addressId: string, since?: string): Promise<any> {

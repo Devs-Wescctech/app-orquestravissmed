@@ -179,7 +179,11 @@ export default function MappingHub() {
         setSyncingSlotIds(prev => new Set(prev).add(professionalId));
         try {
             const res = await api.post(`/sync/${activeClinic?.id}/slots/${professionalId}`);
-            toast.success(res.data?.message || 'Horários sincronizados com sucesso.');
+            if (res.data?.success) {
+                toast.success(res.data?.message || 'Horários sincronizados com sucesso.');
+            } else {
+                toast.error(res.data?.message || 'Falha ao sincronizar horários.');
+            }
         } catch (err: any) {
             console.error('handleSyncSlots error', err);
             toast.error(err.response?.data?.message || 'Erro ao sincronizar horários.');
@@ -337,14 +341,14 @@ export default function MappingHub() {
                     </div>
                     <div className="overflow-x-auto">
                         <table className="w-full text-sm text-left border-separate border-spacing-0">
-                            <thead className="bg-slate-50/50 text-[10px] text-slate-400 uppercase font-black tracking-[3px] border-b border-slate-100">
+                            <thead className="bg-slate-50/50 text-[10px] text-slate-400 uppercase font-black tracking-[2px] border-b border-slate-100">
                                 <tr>
-                                    <th className="px-8 py-6">Profissional (VisMed)</th>
-                                    <th className="px-6 py-6">Turnos</th>
-                                    <th className="px-6 py-6">Especialidades</th>
-                                    <th className="px-6 py-6">Vínculo Externo</th>
-                                    <th className="px-6 py-6 text-center">Calendário</th>
-                                    <th className="px-6 py-6 text-center">Horários</th>
+                                    <th className="px-6 py-5 w-[22%]">Profissional</th>
+                                    <th className="px-4 py-5 w-[14%]">Turnos</th>
+                                    <th className="px-4 py-5 w-[16%]">Especialidades</th>
+                                    <th className="px-4 py-5 w-[20%]">Vínculo Doctoralia</th>
+                                    <th className="px-4 py-5 w-[14%] text-center">Calendário</th>
+                                    <th className="px-4 py-5 w-[14%] text-center">Ações</th>
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-50">
@@ -363,23 +367,23 @@ export default function MappingHub() {
                                         </div>
                                     </td></tr>
                                 ) : professionals.map(p => (
-                                    <tr key={p.id} className="group hover:bg-emerald-50/20 transition-all duration-500">
-                                        <td className="px-10 py-6">
-                                            <div className="flex items-center gap-6">
-                                                <div className="h-14 w-14 rounded-[20px] bg-gradient-to-br from-white to-slate-50 text-slate-900 flex items-center justify-center shrink-0 font-black text-xl border-2 border-white shadow-xl group-hover:from-primary group-hover:to-emerald-600 group-hover:text-white transition-all duration-700 group-hover:scale-110">
+                                    <tr key={p.id} className="group hover:bg-emerald-50/20 transition-all duration-300 align-top">
+                                        <td className="px-6 py-5">
+                                            <div className="flex items-start gap-4">
+                                                <div className="h-11 w-11 rounded-2xl bg-gradient-to-br from-white to-slate-50 text-slate-900 flex items-center justify-center shrink-0 font-black text-lg border-2 border-white shadow-lg group-hover:from-primary group-hover:to-emerald-600 group-hover:text-white transition-all duration-500">
                                                     {(p.name || '?').charAt(0).toUpperCase()}
                                                 </div>
-                                                <div>
-                                                    <div className="font-black text-base text-slate-900 leading-none group-hover:text-primary transition-colors tracking-tight">{p.name}</div>
-                                                    <div className="flex items-center gap-3 mt-2.5">
+                                                <div className="min-w-0">
+                                                    <div className="font-black text-sm text-slate-900 leading-tight group-hover:text-primary transition-colors tracking-tight truncate">{p.name}</div>
+                                                    <div className="flex flex-wrap items-center gap-2 mt-1.5">
                                                         {p.documentNumber && (
-                                                            <span className="text-[10px] font-black text-slate-400 bg-slate-100 px-2 py-0.5 rounded-lg uppercase tracking-widest">
-                                                                {p.documentType || 'DOC'}: {p.documentNumber}
+                                                            <span className="text-[9px] font-black text-slate-400 bg-slate-100 px-1.5 py-0.5 rounded uppercase tracking-wider">
+                                                                {p.documentType || 'CRM'}: {p.documentNumber}
                                                             </span>
                                                         )}
                                                         {p.unit && (
-                                                            <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-1.5">
-                                                                <div className="h-1.5 w-1.5 rounded-full bg-primary/40"></div>
+                                                            <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1">
+                                                                <span className="h-1 w-1 rounded-full bg-primary/40 inline-block"></span>
                                                                 {p.unit.name}
                                                             </span>
                                                         )}
@@ -387,132 +391,112 @@ export default function MappingHub() {
                                                 </div>
                                             </div>
                                         </td>
-                                        <td className="px-6 py-6">
+                                        <td className="px-4 py-5">
                                             {(p.turnos?.turnoM || p.turnos?.turnoT || p.turnos?.turnoN) ? (
-                                                <div className="space-y-1.5">
+                                                <div className="inline-flex flex-col gap-1">
                                                     {p.turnos.turnoM && (
-                                                        <div className="flex items-center gap-2">
-                                                            <span className="text-[9px] font-black text-amber-600 bg-amber-50 px-2 py-0.5 rounded-md uppercase w-6 text-center">M</span>
-                                                            <span className="text-[11px] font-bold text-slate-700">{p.turnos.turnoM}</span>
+                                                        <div className="flex items-center gap-1.5">
+                                                            <span className="text-[8px] font-black text-amber-600 bg-amber-50 w-5 h-5 rounded flex items-center justify-center leading-none">M</span>
+                                                            <span className="text-[10px] font-semibold text-slate-600 tabular-nums whitespace-nowrap">{p.turnos.turnoM}</span>
                                                         </div>
                                                     )}
                                                     {p.turnos.turnoT && (
-                                                        <div className="flex items-center gap-2">
-                                                            <span className="text-[9px] font-black text-blue-600 bg-blue-50 px-2 py-0.5 rounded-md uppercase w-6 text-center">T</span>
-                                                            <span className="text-[11px] font-bold text-slate-700">{p.turnos.turnoT}</span>
+                                                        <div className="flex items-center gap-1.5">
+                                                            <span className="text-[8px] font-black text-blue-600 bg-blue-50 w-5 h-5 rounded flex items-center justify-center leading-none">T</span>
+                                                            <span className="text-[10px] font-semibold text-slate-600 tabular-nums whitespace-nowrap">{p.turnos.turnoT}</span>
                                                         </div>
                                                     )}
                                                     {p.turnos.turnoN && (
-                                                        <div className="flex items-center gap-2">
-                                                            <span className="text-[9px] font-black text-violet-600 bg-violet-50 px-2 py-0.5 rounded-md uppercase w-6 text-center">N</span>
-                                                            <span className="text-[11px] font-bold text-slate-700">{p.turnos.turnoN}</span>
+                                                        <div className="flex items-center gap-1.5">
+                                                            <span className="text-[8px] font-black text-violet-600 bg-violet-50 w-5 h-5 rounded flex items-center justify-center leading-none">N</span>
+                                                            <span className="text-[10px] font-semibold text-slate-600 tabular-nums whitespace-nowrap">{p.turnos.turnoN}</span>
                                                         </div>
                                                     )}
                                                 </div>
                                             ) : (
-                                                <span className="text-[10px] font-black text-slate-300 uppercase tracking-widest opacity-40">Sem turno</span>
+                                                <span className="text-[9px] font-bold text-slate-300 uppercase tracking-wider">Sem turno</span>
                                             )}
                                         </td>
-                                        <td className="px-6 py-6">
+                                        <td className="px-4 py-5">
                                             {p.specialties.length === 0 ? (
-                                                <span className="text-[10px] font-black text-slate-300 uppercase tracking-widest opacity-40">Sem especialidade</span>
+                                                <span className="text-[9px] font-bold text-slate-300 uppercase tracking-wider">—</span>
                                             ) : (
-                                                <div className="flex flex-wrap gap-2.5">
+                                                <div className="flex flex-wrap gap-1.5">
                                                     {p.specialties.map(s => (
-                                                        <div key={s.id} className="flex items-center gap-1.5 group/spec transition-transform hover:scale-105">
-                                                            <span className={`inline-flex items-center gap-1.5 px-4 py-2 rounded-2xl text-[10px] font-black border uppercase tracking-widest transition-all ${s.activeMatch
-                                                                ? 'border-emerald-100 bg-emerald-50 text-primary shadow-sm'
-                                                                : 'border-slate-100 bg-slate-50 text-slate-400 opacity-60'}`}>
-                                                                {s.activeMatch
-                                                                    ? <CheckCircle2 className="h-4 w-4" />
-                                                                    : <Link2Off className="h-4 w-4 opacity-40" />
-                                                                }
-                                                                {s.name}
-                                                            </span>
+                                                        <span key={s.id} className={`inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl text-[9px] font-black border uppercase tracking-wider transition-all ${s.activeMatch
+                                                            ? 'border-emerald-100 bg-emerald-50 text-primary'
+                                                            : 'border-slate-100 bg-slate-50 text-slate-400'}`}>
+                                                            {s.activeMatch
+                                                                ? <CheckCircle2 className="h-3 w-3" />
+                                                                : <Link2Off className="h-3 w-3 opacity-40" />
+                                                            }
+                                                            {s.name}
                                                             {s.activeMatch?.requiresReview && (
-                                                                <div className="relative group/warn">
-                                                                    <AlertTriangle className="h-5 w-5 text-orange-500 animate-pulse cursor-help" />
-                                                                </div>
+                                                                <AlertTriangle className="h-3 w-3 text-orange-500 ml-0.5" />
                                                             )}
-                                                        </div>
+                                                        </span>
                                                     ))}
                                                 </div>
                                             )}
                                         </td>
-                                        <td className="px-10 py-6">
+                                        <td className="px-4 py-5">
                                             {p.doctoraliaCounterpart ? (
-                                                <div className="flex items-center gap-5">
-                                                    <div className="h-12 w-12 rounded-[18px] bg-primary/5 text-primary flex items-center justify-center shrink-0 border border-primary/20 shadow-sm transition-colors group-hover:bg-primary group-hover:text-white">
-                                                        <ShieldCheck className="h-6 w-6" />
+                                                <div className="flex items-center gap-3">
+                                                    <div className="h-9 w-9 rounded-xl bg-primary/10 text-primary flex items-center justify-center shrink-0 border border-primary/20">
+                                                        <ShieldCheck className="h-4 w-4" />
                                                     </div>
-                                                    <div>
-                                                        <div className="text-[15px] font-black text-slate-900 leading-none tracking-tight">{p.doctoraliaCounterpart.name}</div>
-                                                        <div className="flex items-center gap-1.5 mt-2">
-                                                            <div className="h-2 w-2 rounded-full bg-primary"></div>
-                                                            <span className="text-[10px] font-black text-primary uppercase tracking-widest">Sincronizado</span>
+                                                    <div className="min-w-0">
+                                                        <div className="text-xs font-black text-slate-900 leading-tight truncate">{p.doctoraliaCounterpart.name}</div>
+                                                        <div className="flex items-center gap-1 mt-1">
+                                                            <span className="h-1.5 w-1.5 rounded-full bg-primary"></span>
+                                                            <span className="text-[9px] font-black text-primary uppercase tracking-wider">Vinculado</span>
                                                         </div>
                                                     </div>
                                                 </div>
                                             ) : (
-                                                <div className="flex items-center gap-4 text-slate-300 hover:text-slate-400 transition-colors">
-                                                    <div className="h-12 w-12 rounded-[18px] bg-slate-50 flex items-center justify-center border border-slate-100">
-                                                        <Link2Off className="h-6 w-6 opacity-40" />
+                                                <div className="flex items-center gap-3 text-slate-300">
+                                                    <div className="h-9 w-9 rounded-xl bg-slate-50 flex items-center justify-center border border-slate-100">
+                                                        <Link2Off className="h-4 w-4 opacity-40" />
                                                     </div>
-                                                    <span className="text-[10px] font-black uppercase tracking-[3px] opacity-60">Pendente</span>
+                                                    <span className="text-[9px] font-bold uppercase tracking-wider opacity-60">Pendente</span>
                                                 </div>
                                             )}
                                         </td>
-                                        <td className="px-10 py-6 text-center">
+                                        <td className="px-4 py-5 text-center">
                                             {p.doctoraliaCounterpart ? (
-                                                <div className="flex flex-col items-center gap-2">
-                                                    {(() => {
-                                                        const isUpdating = updatingCalendarIds.has(p.id);
-                                                        const isEnabled = p.doctoraliaCounterpart.calendarStatus === 'enabled';
-                                                        
-                                                        return (
-                                                            <button
-                                                                onClick={() => handleToggleCalendar(p.id, p.doctoraliaCounterpart!.doctoraliaDoctorId, p.doctoraliaCounterpart!.calendarStatus || 'disabled')}
-                                                                disabled={isUpdating}
-                                                                className={`
-                                                                    relative flex items-center gap-3 px-5 py-2.5 rounded-2xl text-[10px] font-black uppercase tracking-[2px] 
-                                                                    transition-all duration-500 overflow-hidden group/toggle
-                                                                    ${isEnabled 
-                                                                        ? 'bg-emerald-500 text-white shadow-[0_8px_20px_-6px_rgba(16,185,129,0.4)] hover:bg-emerald-600 hover:scale-105 active:scale-95' 
-                                                                        : 'bg-slate-100 text-slate-400 hover:bg-slate-200 hover:text-slate-600 hover:scale-105 active:scale-95'}
-                                                                    ${isUpdating ? 'opacity-80 cursor-wait' : ''}
-                                                                `}
-                                                            >
-                                                                {isUpdating ? (
-                                                                    <Loader2 className="h-4 w-4 animate-spin text-current" />
-                                                                ) : isEnabled ? (
-                                                                    <ToggleRight className="h-4 w-4 transition-transform group-hover/toggle:translate-x-0.5" />
-                                                                ) : (
-                                                                    <ToggleLeft className="h-4 w-4 transition-transform group-hover/toggle:-translate-x-0.5" />
-                                                                )}
-                                                                
-                                                                <span className="relative z-10">
-                                                                    {isUpdating ? 'Atualizando...' : isEnabled ? 'Ativo' : 'Inativo'}
-                                                                </span>
-                                                                
-                                                                {/* Liquid Effect background on hover */}
-                                                                <div className={`absolute inset-0 bg-white/10 opacity-0 group-hover/toggle:opacity-100 transition-opacity duration-300 pointer-events-none`}></div>
-                                                            </button>
-                                                        );
-                                                    })()}
-                                                    <span className="text-[9px] font-black text-slate-300 uppercase tracking-widest flex items-center gap-1">
-                                                        <Activity className="h-2.5 w-2.5" /> Real-time
-                                                    </span>
-                                                </div>
+                                                (() => {
+                                                    const isUpdating = updatingCalendarIds.has(p.id);
+                                                    const isEnabled = p.doctoraliaCounterpart.calendarStatus === 'enabled';
+                                                    return (
+                                                        <button
+                                                            onClick={() => handleToggleCalendar(p.id, p.doctoraliaCounterpart!.doctoraliaDoctorId, p.doctoraliaCounterpart!.calendarStatus || 'disabled')}
+                                                            disabled={isUpdating}
+                                                            className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl text-[9px] font-black uppercase tracking-wider transition-all duration-300 ${isEnabled
+                                                                ? 'bg-emerald-500 text-white shadow-sm hover:bg-emerald-600'
+                                                                : 'bg-slate-100 text-slate-400 hover:bg-slate-200 hover:text-slate-600'
+                                                            } ${isUpdating ? 'opacity-60 cursor-wait' : 'hover:scale-105 active:scale-95'}`}
+                                                        >
+                                                            {isUpdating ? (
+                                                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                                            ) : isEnabled ? (
+                                                                <ToggleRight className="h-3.5 w-3.5" />
+                                                            ) : (
+                                                                <ToggleLeft className="h-3.5 w-3.5" />
+                                                            )}
+                                                            {isUpdating ? '...' : isEnabled ? 'Ativo' : 'Inativo'}
+                                                        </button>
+                                                    );
+                                                })()
                                             ) : (
-                                                <span className="text-[10px] font-black text-slate-200 uppercase tracking-widest opacity-40">—</span>
+                                                <span className="text-[9px] font-bold text-slate-200 uppercase">—</span>
                                             )}
                                         </td>
-                                        <td className="px-6 py-6 text-center">
+                                        <td className="px-4 py-5 text-center">
                                             {p.doctoraliaCounterpart && (p.turnos?.turnoM || p.turnos?.turnoT || p.turnos?.turnoN) ? (
                                                 <button
                                                     onClick={() => handleSyncSlots(p.id)}
                                                     disabled={syncingSlotIds.has(p.id)}
-                                                    className="inline-flex items-center gap-2 px-4 py-2.5 rounded-2xl text-[10px] font-black uppercase tracking-[1px] bg-blue-500 text-white shadow-sm hover:bg-blue-600 hover:scale-105 active:scale-95 transition-all disabled:opacity-60 disabled:cursor-wait"
+                                                    className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-[9px] font-black uppercase tracking-wider bg-blue-500 text-white shadow-sm hover:bg-blue-600 hover:scale-105 active:scale-95 transition-all disabled:opacity-60 disabled:cursor-wait"
                                                 >
                                                     {syncingSlotIds.has(p.id) ? (
                                                         <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -522,7 +506,7 @@ export default function MappingHub() {
                                                     {syncingSlotIds.has(p.id) ? 'Enviando...' : 'Sync Slots'}
                                                 </button>
                                             ) : (
-                                                <span className="text-[10px] font-black text-slate-200 uppercase tracking-widest opacity-40">—</span>
+                                                <span className="text-[9px] font-bold text-slate-200 uppercase">—</span>
                                             )}
                                         </td>
                                     </tr>

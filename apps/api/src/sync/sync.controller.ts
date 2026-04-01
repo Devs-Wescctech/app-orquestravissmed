@@ -150,15 +150,22 @@ export class SyncController {
         const addrsRes = await client.getAddresses(dDoc.doctoraliaFacilityId, doctoraliaDoctorId);
         const addresses = addrsRes._items || [];
         const results: any[] = [];
+        let anySuccess = false;
 
         for (const addr of addresses) {
             try {
                 await client.enableCalendar(dDoc.doctoraliaFacilityId, doctoraliaDoctorId, String(addr.id));
                 results.push({ addressId: addr.id, status: 'enabled' });
+                anySuccess = true;
             } catch (e: any) {
                 results.push({ addressId: addr.id, status: 'error', message: e.message });
             }
         }
+
+        if (anySuccess) {
+            await this.updateCalendarStatusInMapping(clinicId, dDoc.id, 'enabled');
+        }
+
         return { doctoraliaDoctorId, results };
     }
 
@@ -175,15 +182,44 @@ export class SyncController {
         const addrsRes = await client.getAddresses(dDoc.doctoraliaFacilityId, doctoraliaDoctorId);
         const addresses = addrsRes._items || [];
         const results: any[] = [];
+        let anySuccess = false;
 
         for (const addr of addresses) {
             try {
                 await client.disableCalendar(dDoc.doctoraliaFacilityId, doctoraliaDoctorId, String(addr.id));
                 results.push({ addressId: addr.id, status: 'disabled' });
+                anySuccess = true;
             } catch (e: any) {
                 results.push({ addressId: addr.id, status: 'error', message: e.message });
             }
         }
+
+        if (anySuccess) {
+            await this.updateCalendarStatusInMapping(clinicId, dDoc.id, 'disabled');
+        }
+
         return { doctoraliaDoctorId, results };
+    }
+
+    private async updateCalendarStatusInMapping(clinicId: string, doctoraliaDoctorInternalId: string, status: string) {
+        try {
+            const unifiedMapping = await this.prisma.professionalUnifiedMapping.findFirst({
+                where: { doctoraliaDoctorId: doctoraliaDoctorInternalId, isActive: true },
+            });
+            if (!unifiedMapping) return;
+
+            const mapping = await this.prisma.mapping.findFirst({
+                where: { clinicId, entityType: 'DOCTOR', vismedId: unifiedMapping.vismedDoctorId },
+            });
+            if (!mapping) return;
+
+            const existing = (mapping.conflictData as any) || {};
+            await this.prisma.mapping.update({
+                where: { id: mapping.id },
+                data: { conflictData: { ...existing, calendarStatus: status } },
+            });
+        } catch (e) {
+            // non-critical
+        }
     }
 }
