@@ -10,6 +10,7 @@ import { VismedSyncProcessor } from './vismed-sync/vismed-sync.processor';
 import { VismedService } from '../integrations/vismed/vismed.service';
 import { MappingsModule } from '../mappings/mappings.module';
 import { PushSyncService } from './push-sync.service';
+import { SlotSyncService } from './slot-sync.service';
 
 @Module({
     imports: [
@@ -25,7 +26,7 @@ import { PushSyncService } from './push-sync.service';
         }),
     ],
     controllers: [SyncController],
-    providers: [SyncService, SyncProcessor, VismedSyncProcessor, VismedService, PushSyncService],
-    exports: [SyncService],
+    providers: [SyncService, SyncProcessor, VismedSyncProcessor, VismedService, PushSyncService, SlotSyncService],
+    exports: [SyncService, SlotSyncService],
 })
 export class SyncModule { }

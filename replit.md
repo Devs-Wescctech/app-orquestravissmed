@@ -66,6 +66,15 @@ Both pipelines attempt BullMQ queue dispatch first, then fall back to direct inl
 - **Manual approval threshold**: Matches (specialties and insurance/convênios) with score < 70% require manual approval. Specialties get `requiresReview=true`, insurance gets `PENDING_REVIEW` status. Approve/reject via `POST /mappings/insurance/approve` and `/reject` (clinic-scoped).
 - **Orphan cleanup safety**: `cleanupOrphans` in sync.processor.ts skips orphaning when activeIds is empty (for ALL entity types, not just DOCTOR).
 
+## Turnos (Work Shifts) Module
+- **turnoM/T/N fields** on `VismedDoctor`: Stores morning/afternoon/night shift times (e.g. `"08:00 - 12:00"`).
+- **Sync paths**: Both `sync.service.ts` (global sync) and `vismed-sync.processor.ts` (queue-based) persist turno data from VisMed API field `turno_m/t/n`.
+- **SlotSyncService** (`slot-sync.service.ts`): Converts turnoM/T/N into Doctoralia calendar slots via `replaceSlots` API. Generates slots for next 30 days per address with visible services.
+- **Calendar Breaks API**: `DocplannerClient` supports `getCalendarBreaks`, `addCalendarBreak`, `moveCalendarBreak`, `deleteCalendarBreak`.
+- **Endpoints**: `POST /sync/:clinicId/slots/:vismedDoctorId` (single), `POST /sync/:clinicId/slots` (all), `GET /sync/shifts/:vismedDoctorId`, `POST /sync/:clinicId/calendar/:doctorId/enable|disable`.
+- **Push-sync integration**: After services delta sync, automatically calls `slotSync.syncSlotsForDoctor` for doctors with turnos.
+- **Frontend**: Mapping page shows turno badges (M/T/N with times), "Sync Slots" button per professional, calendar toggle.
+
 ## Key Files
 - `apps/web/src/lib/api.ts` — HTTP client (fetches `/api/*` via Next.js proxy)
 - `apps/web/src/lib/store.ts` — Zustand auth store with persist + hydration tracking (`_hasHydrated`)

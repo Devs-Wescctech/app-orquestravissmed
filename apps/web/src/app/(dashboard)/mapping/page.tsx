@@ -18,6 +18,7 @@ interface VismedProfessional {
     id: string; vismedId: number; name: string; formalName?: string;
     documentNumber?: string; documentType?: string; gender?: string; isActive: boolean;
     unit?: { name: string; city?: string } | null;
+    turnos?: { turnoM: string | null; turnoT: string | null; turnoN: string | null };
     specialties: Array<{
         id: string; name: string; normalizedName?: string;
         activeMatch?: {
@@ -62,6 +63,7 @@ export default function MappingHub() {
     const [isLoading, setIsLoading] = useState(true);
     const [isResolving, setIsResolving] = useState(false);
     const [updatingCalendarIds, setUpdatingCalendarIds] = useState<Set<string>>(new Set());
+    const [syncingSlotIds, setSyncingSlotIds] = useState<Set<string>>(new Set());
 
     // Per-tab data
     const [professionals, setProfessionals] = useState<VismedProfessional[]>([]);
@@ -155,12 +157,10 @@ export default function MappingHub() {
         setUpdatingCalendarIds(prev => new Set(prev).add(professionalId));
         
         try {
-            await api.post('/appointments/calendar-status', {
-                clinicId: activeClinic?.id,
-                vismedDoctorId: professionalId,
-                doctoraliaDoctorId,
-                status: newStatus
-            });
+            const endpoint = newStatus === 'enabled'
+                ? `/sync/${activeClinic?.id}/calendar/${doctoraliaDoctorId}/enable`
+                : `/sync/${activeClinic?.id}/calendar/${doctoraliaDoctorId}/disable`;
+            await api.post(endpoint);
             toast.success(`Calendário ${newStatus === 'enabled' ? 'habilitado' : 'desabilitado'} com sucesso.`);
             await fetchData();
         } catch (err) {
@@ -168,6 +168,23 @@ export default function MappingHub() {
             toast.error('Erro ao atualizar status do calendário.');
         } finally {
             setUpdatingCalendarIds(prev => {
+                const next = new Set(prev);
+                next.delete(professionalId);
+                return next;
+            });
+        }
+    };
+
+    const handleSyncSlots = async (professionalId: string) => {
+        setSyncingSlotIds(prev => new Set(prev).add(professionalId));
+        try {
+            const res = await api.post(`/sync/${activeClinic?.id}/slots/${professionalId}`);
+            toast.success(res.data?.message || 'Horários sincronizados com sucesso.');
+        } catch (err: any) {
+            console.error('handleSyncSlots error', err);
+            toast.error(err.response?.data?.message || 'Erro ao sincronizar horários.');
+        } finally {
+            setSyncingSlotIds(prev => {
                 const next = new Set(prev);
                 next.delete(professionalId);
                 return next;
@@ -322,22 +339,24 @@ export default function MappingHub() {
                         <table className="w-full text-sm text-left border-separate border-spacing-0">
                             <thead className="bg-slate-50/50 text-[10px] text-slate-400 uppercase font-black tracking-[3px] border-b border-slate-100">
                                 <tr>
-                                    <th className="px-10 py-6">Profissional (VisMed)</th>
-                                    <th className="px-10 py-6">Especialidades</th>
-                                    <th className="px-10 py-6">Vínculo Externo</th>
-                                    <th className="px-10 py-6 text-center">Calendário</th>
+                                    <th className="px-8 py-6">Profissional (VisMed)</th>
+                                    <th className="px-6 py-6">Turnos</th>
+                                    <th className="px-6 py-6">Especialidades</th>
+                                    <th className="px-6 py-6">Vínculo Externo</th>
+                                    <th className="px-6 py-6 text-center">Calendário</th>
+                                    <th className="px-6 py-6 text-center">Horários</th>
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-50">
                                 {isLoading ? (
-                                    <tr><td colSpan={3} className="px-10 py-24 text-center">
+                                    <tr><td colSpan={6} className="px-10 py-24 text-center">
                                         <div className="flex flex-col items-center gap-4">
                                             <Loader2 className="h-12 w-12 animate-spin text-primary" />
                                             <span className="text-[10px] font-black text-slate-300 uppercase tracking-[4px]">Sincronizando registros...</span>
                                         </div>
                                     </td></tr>
                                 ) : professionals.length === 0 ? (
-                                    <tr><td colSpan={3} className="px-10 py-24 text-center">
+                                    <tr><td colSpan={6} className="px-10 py-24 text-center">
                                         <div className="max-w-xs mx-auto opacity-30">
                                             <User className="h-16 w-16 text-slate-200 mx-auto mb-6" />
                                             <p className="text-[10px] font-black text-slate-400 uppercase tracking-[3px] leading-tight text-center">Nenhum profissional<br />sincronizado hoje.</p>
@@ -368,7 +387,33 @@ export default function MappingHub() {
                                                 </div>
                                             </div>
                                         </td>
-                                        <td className="px-10 py-6">
+                                        <td className="px-6 py-6">
+                                            {(p.turnos?.turnoM || p.turnos?.turnoT || p.turnos?.turnoN) ? (
+                                                <div className="space-y-1.5">
+                                                    {p.turnos.turnoM && (
+                                                        <div className="flex items-center gap-2">
+                                                            <span className="text-[9px] font-black text-amber-600 bg-amber-50 px-2 py-0.5 rounded-md uppercase w-6 text-center">M</span>
+                                                            <span className="text-[11px] font-bold text-slate-700">{p.turnos.turnoM}</span>
+                                                        </div>
+                                                    )}
+                                                    {p.turnos.turnoT && (
+                                                        <div className="flex items-center gap-2">
+                                                            <span className="text-[9px] font-black text-blue-600 bg-blue-50 px-2 py-0.5 rounded-md uppercase w-6 text-center">T</span>
+                                                            <span className="text-[11px] font-bold text-slate-700">{p.turnos.turnoT}</span>
+                                                        </div>
+                                                    )}
+                                                    {p.turnos.turnoN && (
+                                                        <div className="flex items-center gap-2">
+                                                            <span className="text-[9px] font-black text-violet-600 bg-violet-50 px-2 py-0.5 rounded-md uppercase w-6 text-center">N</span>
+                                                            <span className="text-[11px] font-bold text-slate-700">{p.turnos.turnoN}</span>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            ) : (
+                                                <span className="text-[10px] font-black text-slate-300 uppercase tracking-widest opacity-40">Sem turno</span>
+                                            )}
+                                        </td>
+                                        <td className="px-6 py-6">
                                             {p.specialties.length === 0 ? (
                                                 <span className="text-[10px] font-black text-slate-300 uppercase tracking-widest opacity-40">Sem especialidade</span>
                                             ) : (
@@ -458,6 +503,24 @@ export default function MappingHub() {
                                                         <Activity className="h-2.5 w-2.5" /> Real-time
                                                     </span>
                                                 </div>
+                                            ) : (
+                                                <span className="text-[10px] font-black text-slate-200 uppercase tracking-widest opacity-40">—</span>
+                                            )}
+                                        </td>
+                                        <td className="px-6 py-6 text-center">
+                                            {p.doctoraliaCounterpart && (p.turnos?.turnoM || p.turnos?.turnoT || p.turnos?.turnoN) ? (
+                                                <button
+                                                    onClick={() => handleSyncSlots(p.id)}
+                                                    disabled={syncingSlotIds.has(p.id)}
+                                                    className="inline-flex items-center gap-2 px-4 py-2.5 rounded-2xl text-[10px] font-black uppercase tracking-[1px] bg-blue-500 text-white shadow-sm hover:bg-blue-600 hover:scale-105 active:scale-95 transition-all disabled:opacity-60 disabled:cursor-wait"
+                                                >
+                                                    {syncingSlotIds.has(p.id) ? (
+                                                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                                    ) : (
+                                                        <Calendar className="h-3.5 w-3.5" />
+                                                    )}
+                                                    {syncingSlotIds.has(p.id) ? 'Enviando...' : 'Sync Slots'}
+                                                </button>
                                             ) : (
                                                 <span className="text-[10px] font-black text-slate-200 uppercase tracking-widest opacity-40">—</span>
                                             )}

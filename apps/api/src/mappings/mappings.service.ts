@@ -172,6 +172,11 @@ export class MappingsService {
                 gender: d.gender,
                 isActive: d.isActive,
                 unit: d.unit ? { name: d.unit.name, city: d.unit.cityName } : null,
+                turnos: {
+                    turnoM: d.turnoM || null,
+                    turnoT: d.turnoT || null,
+                    turnoN: d.turnoN || null,
+                },
                 specialties: (() => {
                     const seen = new Set<string>();
                     return d.specialties

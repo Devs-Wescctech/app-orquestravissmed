@@ -184,6 +184,10 @@ export class SyncService {
                     });
                 }
 
+                const turnoM = (p.turno_m && p.turno_m.trim() !== '-' && p.turno_m.trim() !== '') ? p.turno_m.trim() : null;
+                const turnoT = (p.turno_t && p.turno_t.trim() !== '-' && p.turno_t.trim() !== '') ? p.turno_t.trim() : null;
+                const turnoN = (p.turno_n && p.turno_n.trim() !== '-' && p.turno_n.trim() !== '') ? p.turno_n.trim() : null;
+
                 const doctor = await this.prisma.vismedDoctor.upsert({
                     where: { vismedId: Number(p.idprofissional) },
                     create: {
@@ -193,6 +197,7 @@ export class SyncService {
                         documentType: p.siglaprofissionaltipodocumento,
                         gender: p.sexo, isActive: p.ativo === "1",
                         unitId: unitRecord ? unitRecord.id : null,
+                        turnoM, turnoT, turnoN,
                     },
                     update: {
                         name: p.nomecompleto, formalName: p.nomeformal,
@@ -200,6 +205,7 @@ export class SyncService {
                         documentType: p.siglaprofissionaltipodocumento,
                         gender: p.sexo, isActive: p.ativo === "1",
                         unitId: unitRecord ? unitRecord.id : null,
+                        turnoM, turnoT, turnoN,
                     }
                 });
 

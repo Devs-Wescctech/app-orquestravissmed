@@ -1,12 +1,16 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { DocplannerClient } from '../integrations/docplanner.service';
+import { SlotSyncService } from './slot-sync.service';
 
 @Injectable()
 export class PushSyncService {
     private readonly logger = new Logger(PushSyncService.name);
 
-    constructor(private prisma: PrismaService) { }
+    constructor(
+        private prisma: PrismaService,
+        private slotSync: SlotSyncService,
+    ) { }
 
     async pushToDoctoralia(clinicId: string, syncRunId: string, client: DocplannerClient): Promise<void> {
         this.logger.log(`Starting REVERSE SYNC (Push) for clinic ${clinicId}`);
@@ -17,10 +21,17 @@ export class PushSyncService {
             return;
         }
 
-        // 1. Get all actively mapped doctors for this clinic
-        // In the current schema, mappings don't have clinicId directly, but we can filter by doctors belonging to VisMed Units.
+        const clinicDoctorMappings = await this.prisma.mapping.findMany({
+            where: { clinicId, entityType: 'DOCTOR' },
+            select: { vismedId: true },
+        });
+        const clinicDoctorIds = clinicDoctorMappings.map(m => m.vismedId).filter(Boolean) as string[];
+
         const mappings = await this.prisma.professionalUnifiedMapping.findMany({
-            where: { isActive: true },
+            where: {
+                isActive: true,
+                vismedDoctorId: { in: clinicDoctorIds },
+            },
             include: {
                 vismedDoctor: {
                     include: {
@@ -105,6 +116,17 @@ export class PushSyncService {
 
                 // 3. SERVICES DELTA
                 await this.syncServicesDelta(syncRunId, client, dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, vDoc.specialties, dDoc.name);
+            }
+
+            // 4. SLOT SYNC (turnos VisMed → slots Doctoralia)
+            if (vDoc.turnoM || vDoc.turnoT || vDoc.turnoN) {
+                try {
+                    const slotResult = await this.slotSync.syncSlotsForDoctor(vDoc.id, client, syncRunId, 30);
+                    this.logger.log(`Doctor ${dDoc.name}: [SLOTS] ${slotResult.message}`);
+                } catch (error: any) {
+                    this.logger.warn(`Doctor ${dDoc.name}: [SLOTS FAILED] ${error.message}`);
+                    await this.logEvent(syncRunId, 'SLOT_SYNC', 'error', `Doctor ${dDoc.name}: Falha no sync de slots - ${error.message}`);
+                }
             }
         }
 

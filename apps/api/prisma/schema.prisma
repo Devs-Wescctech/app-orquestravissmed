@@ -140,6 +140,9 @@ model VismedDoctor {
   isActive       Boolean        @default(true) // ativo: "1" ou "0"
   unitId         String?        // idunidadevinculada -> VismedUnit 
   unit           VismedUnit?    @relation(fields: [unitId], references: [id], onDelete: SetNull)
+  turnoM         String?        // turno_m: horário manhã (ex: "08:00 - 12:00")
+  turnoT         String?        // turno_t: horário tarde (ex: "13:00 - 18:00")
+  turnoN         String?        // turno_n: horário noite (ex: "19:00 - 23:00")
   createdAt      DateTime       @default(now())
   updatedAt      DateTime       @updatedAt
 
