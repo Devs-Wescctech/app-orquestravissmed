@@ -123,11 +123,21 @@ export class SlotSyncService {
             return { success: false, message: `Médico ${doctor.name} não está vinculado à Doctoralia.`, slotsCreated: 0 };
         }
 
+        let selectedMapping = doctor.unifiedMappings[0];
+        if (clinicId && doctor.unifiedMappings.length > 1) {
+            const clinicDoctorMappings = await this.prisma.mapping.findMany({
+                where: { clinicId, entityType: 'DOCTOR' },
+                select: { vismedId: true },
+            });
+            const clinicVismedIds = new Set(clinicDoctorMappings.map(m => m.vismedId).filter(Boolean));
+            const clinicScoped = doctor.unifiedMappings.find(um => clinicVismedIds.has(um.vismedDoctorId));
+            if (clinicScoped) selectedMapping = clinicScoped;
+        }
+
         let totalSlots = 0;
         let addressesAttempted = 0;
         let addressesFailed = 0;
-        const mapping = doctor.unifiedMappings[0];
-        const dDoc = mapping.doctoraliaDoctor;
+        const dDoc = selectedMapping.doctoraliaDoctor;
 
         let doctoraliaAddresses: any[];
         try {
@@ -155,7 +165,7 @@ export class SlotSyncService {
             let addressServices: any[];
             try {
                 const svcRes = await client.getServices(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId);
-                addressServices = (svcRes._items || []).filter((s: any) => s.is_visible !== false);
+                addressServices = svcRes._items || [];
             } catch (error: any) {
                 this.logger.warn(`Failed to get services for addr ${addrId}: ${error.message}`);
                 addressesFailed++;
@@ -163,7 +173,7 @@ export class SlotSyncService {
             }
 
             if (addressServices.length === 0) {
-                this.logger.warn(`Doctor ${doctor.name} address ${addrId}: no visible services, skipping slot sync`);
+                this.logger.warn(`Doctor ${doctor.name} address ${addrId}: no services found on Doctoralia, skipping slot sync`);
                 continue;
             }
 

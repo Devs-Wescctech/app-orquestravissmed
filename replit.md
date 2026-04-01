@@ -69,11 +69,17 @@ Both pipelines attempt BullMQ queue dispatch first, then fall back to direct inl
 ## Turnos (Work Shifts) Module
 - **turnoM/T/N fields** on `VismedDoctor`: Stores morning/afternoon/night shift times (e.g. `"08:00 - 12:00"`).
 - **Sync paths**: Both `sync.service.ts` (global sync) and `vismed-sync.processor.ts` (queue-based) persist turno data from VisMed API field `turno_m/t/n`.
-- **SlotSyncService** (`slot-sync.service.ts`): Converts turnoM/T/N into Doctoralia calendar slots via `replaceSlots` API. Generates slots for next 30 days per address with visible services.
+- **SlotSyncService** (`slot-sync.service.ts`): Converts turnoM/T/N into Doctoralia calendar slots via `replaceSlots` API. Generates slots for next 30 days per address with services. Unified mapping selection is clinic-scoped when clinicId is provided.
 - **Calendar Breaks API**: `DocplannerClient` supports `getCalendarBreaks`, `addCalendarBreak`, `moveCalendarBreak`, `deleteCalendarBreak`.
 - **Endpoints**: `POST /sync/:clinicId/slots/:vismedDoctorId` (single), `POST /sync/:clinicId/slots` (all), `GET /sync/shifts/:vismedDoctorId`, `POST /sync/:clinicId/calendar/:doctorId/enable|disable`.
 - **Push-sync integration**: After services delta sync, automatically calls `slotSync.syncSlotsForDoctor` for doctors with turnos.
 - **Frontend**: Mapping page shows turno badges (M/T/N with times), "Sync Slots" button per professional, calendar toggle.
+
+## Multi-Tenant Security
+- **User-clinic validation**: All `/sync/:clinicId/*` endpoints validate that the authenticated user has a role (`UserClinicRole`) for the specified `clinicId` before proceeding. Implemented via `validateUserClinicAccess()` in `SyncController`.
+- **Doctor-clinic scoping**: `validateDoctorBelongsToClinic()` and `validateDoctoraliaDoctorBelongsToClinic()` ensure doctors belong to the clinic via `Mapping` table lookups.
+- **Professional list scoping**: `getProfessionalMappings(clinicId)` only returns doctors that have a `Mapping` entry for the given clinic (filters by `vismedId in clinicVismedDoctorIds`).
+- **Slot sync mapping scoping**: When `clinicId` is provided, `syncSlotsForDoctor` resolves the correct `ProfessionalUnifiedMapping` by filtering to vismed doctor IDs linked to the clinic.
 
 ## Key Files
 - `apps/web/src/lib/api.ts` — HTTP client (fetches `/api/*` via Next.js proxy)

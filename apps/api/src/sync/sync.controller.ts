@@ -19,6 +19,13 @@ export class SyncController {
         private slotSync: SlotSyncService,
     ) { }
 
+    private validateUserClinicAccess(user: any, clinicId: string) {
+        const userClinicIds = (user?.roles || []).map((r: any) => r.clinicId);
+        if (!userClinicIds.includes(clinicId)) {
+            throw new ForbiddenException('Você não tem acesso a esta clínica.');
+        }
+    }
+
     private async getDoctoraliaClient(clinicId: string) {
         const conn = await this.prisma.integrationConnection.findFirst({
             where: { clinicId, provider: 'doctoralia' }
@@ -61,7 +68,8 @@ export class SyncController {
 
     @ApiOperation({ summary: 'Trigger a manual sync for a clinic (Doctoralia)' })
     @Post(':clinicId/run')
-    async runSync(@Param('clinicId') clinicId: string) {
+    async runSync(@Param('clinicId') clinicId: string, @Request() req: any) {
+        this.validateUserClinicAccess(req.user, clinicId);
         return this.syncService.triggerManualSync(clinicId, 'full');
     }
 
@@ -69,8 +77,10 @@ export class SyncController {
     @Post(':clinicId/global')
     async triggerGlobalSync(
         @Param('clinicId') clinicId: string,
-        @Body('idEmpresaGestora') idEmpresa?: number
+        @Body('idEmpresaGestora') idEmpresa?: number,
+        @Request() req?: any,
     ) {
+        this.validateUserClinicAccess(req?.user, clinicId);
         return this.syncService.triggerGlobalSync(clinicId, idEmpresa);
     }
 
@@ -81,13 +91,15 @@ export class SyncController {
     }
 
     @Get(':clinicId/test-run')
-    async testRun(@Param('clinicId') clinicId: string) {
+    async testRun(@Param('clinicId') clinicId: string, @Request() req: any) {
+        this.validateUserClinicAccess(req.user, clinicId);
         return this.syncService.triggerManualSync(clinicId, 'full');
     }
 
     @ApiOperation({ summary: 'Get recent sync runs and activities' })
     @Get(':clinicId/history')
-    async getHistory(@Param('clinicId') clinicId: string) {
+    async getHistory(@Param('clinicId') clinicId: string, @Request() req: any) {
+        this.validateUserClinicAccess(req.user, clinicId);
         return this.prisma.syncRun.findMany({
             where: { clinicId },
             include: {
@@ -104,7 +116,9 @@ export class SyncController {
         @Param('clinicId') clinicId: string,
         @Param('vismedDoctorId') vismedDoctorId: string,
         @Body('daysAhead') daysAhead?: number,
+        @Request() req?: any,
     ) {
+        this.validateUserClinicAccess(req?.user, clinicId);
         await this.validateDoctorBelongsToClinic(vismedDoctorId, clinicId);
         const client = await this.getDoctoraliaClient(clinicId);
         await new Promise(resolve => setTimeout(resolve, 1000));
@@ -116,7 +130,9 @@ export class SyncController {
     async syncAllSlots(
         @Param('clinicId') clinicId: string,
         @Body('daysAhead') daysAhead?: number,
+        @Request() req?: any,
     ) {
+        this.validateUserClinicAccess(req?.user, clinicId);
         const client = await this.getDoctoraliaClient(clinicId);
         await new Promise(resolve => setTimeout(resolve, 1000));
         return this.slotSync.syncAllSlots(client, undefined, daysAhead || 30, clinicId);
@@ -127,7 +143,9 @@ export class SyncController {
     async getShifts(
         @Param('clinicId') clinicId: string,
         @Param('vismedDoctorId') vismedDoctorId: string,
+        @Request() req?: any,
     ) {
+        this.validateUserClinicAccess(req?.user, clinicId);
         await this.validateDoctorBelongsToClinic(vismedDoctorId, clinicId);
         const doctor = await this.prisma.vismedDoctor.findUnique({
             where: { id: vismedDoctorId },
@@ -142,7 +160,9 @@ export class SyncController {
     async enableCalendar(
         @Param('clinicId') clinicId: string,
         @Param('doctoraliaDoctorId') doctoraliaDoctorId: string,
+        @Request() req?: any,
     ) {
+        this.validateUserClinicAccess(req?.user, clinicId);
         const dDoc = await this.validateDoctoraliaDoctorBelongsToClinic(doctoraliaDoctorId, clinicId);
         const client = await this.getDoctoraliaClient(clinicId);
         await new Promise(resolve => setTimeout(resolve, 1000));
@@ -174,7 +194,9 @@ export class SyncController {
     async disableCalendar(
         @Param('clinicId') clinicId: string,
         @Param('doctoraliaDoctorId') doctoraliaDoctorId: string,
+        @Request() req?: any,
     ) {
+        this.validateUserClinicAccess(req?.user, clinicId);
         const dDoc = await this.validateDoctoraliaDoctorBelongsToClinic(doctoraliaDoctorId, clinicId);
         const client = await this.getDoctoraliaClient(clinicId);
         await new Promise(resolve => setTimeout(resolve, 1000));

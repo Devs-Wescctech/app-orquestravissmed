@@ -113,17 +113,21 @@ export class MappingsService {
     // ------------------------------------------------------------------------------------------
 
     async getProfessionalMappings(clinicId: string) {
-        // Get all genetic mappings for DOCTOR for this clinic first
         const genericMappings = await this.prisma.mapping.findMany({
             where: { clinicId, entityType: 'DOCTOR' }
         });
         const mappingMap = new Map<string, any>();
+        const clinicVismedDoctorIds: string[] = [];
         genericMappings.forEach(m => {
-            if (m.vismedId) mappingMap.set(m.vismedId, m);
+            if (m.vismedId) {
+                mappingMap.set(m.vismedId, m);
+                clinicVismedDoctorIds.push(m.vismedId);
+            }
             if (m.externalId) mappingMap.set(m.externalId, m);
         });
 
         const doctors = await this.prisma.vismedDoctor.findMany({
+            where: { id: { in: clinicVismedDoctorIds } },
             include: {
                 unit: true,
                 specialties: {
