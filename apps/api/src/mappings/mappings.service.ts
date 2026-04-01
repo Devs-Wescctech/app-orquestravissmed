@@ -30,6 +30,8 @@ export class MappingsService {
                     vismedData = await this.prisma.vismedSpecialty.findUnique({ where: { id: m.vismedId } });
                 } else if (m.entityType === 'LOCATION') {
                     vismedData = await this.prisma.vismedUnit.findUnique({ where: { id: m.vismedId } });
+                } else if (m.entityType === 'INSURANCE') {
+                    vismedData = await this.prisma.vismedInsurance.findUnique({ where: { id: m.vismedId } });
                 }
             }
             return { ...m, vismedEntity: vismedData };

@@ -75,4 +75,14 @@ export class VismedService {
             throw error;
         }
     }
+
+    async getConvenios(idEmpresaGestora: number, baseUrl?: string): Promise<any[]> {
+        try {
+            this.logger.log(`Buscando convênios para empresa gestora: ${idEmpresaGestora} na Base URL: ${baseUrl || 'padrão'}`);
+            return await this.requestData(`convenio-by-idempresagestora?idempresagestora=${idEmpresaGestora}`, baseUrl);
+        } catch (error) {
+            this.logger.error(`Erro ao buscar convênios VisMed: ${error.message}`);
+            throw error;
+        }
+    }
 }

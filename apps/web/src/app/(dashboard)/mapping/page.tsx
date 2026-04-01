@@ -701,86 +701,104 @@ export default function MappingHub() {
             {/* ── UNIDADES ──────────────────────────────────────────── */}
             {activeTab === 'Unidades' && (
                 <div className="space-y-8 animate-in fade-in slide-in-from-top-4 duration-500">
-                    <div className="bg-white/70 backdrop-blur-xl rounded-[32px] shadow-sm border border-slate-100/80 overflow-hidden">
-                        <div className="p-8 border-b border-slate-100/60 flex justify-between items-center bg-white/40">
-                            <h3 className="text-[12px] font-black text-slate-900 uppercase tracking-[2px]">Mapeamento de Unidades & Agendas</h3>
+                    {isLoading ? (
+                        <div className="bg-white/70 backdrop-blur-xl rounded-[32px] shadow-sm border border-slate-100/80 p-32 flex flex-col items-center gap-4">
+                            <Loader2 className="h-12 w-12 animate-spin text-primary" />
+                            <p className="text-[10px] font-black text-slate-300 uppercase tracking-[4px]">Catalogando unidades...</p>
                         </div>
-                        <div className="overflow-x-auto">
-                            <table className="w-full text-sm text-left border-separate border-spacing-0">
-                                <thead className="bg-slate-50/50 text-[10px] text-slate-400 uppercase font-black tracking-[3px] border-b border-slate-100">
-                                    <tr>
-                                        <th className="px-10 py-6">Unidade (VisMed)</th>
-                                        <th className="px-10 py-6">Médicos Vinculados</th>
-                                        <th className="px-10 py-6 text-right">Integração</th>
-                                    </tr>
-                                </thead>
-                                <tbody className="divide-y divide-slate-50">
-                                    {isLoading ? (
-                                        <tr><td colSpan={3} className="px-10 py-32 text-center">
-                                            <div className="flex flex-col items-center gap-4">
-                                                <Loader2 className="h-12 w-12 animate-spin text-primary" />
-                                                <p className="text-[10px] font-black text-slate-300 uppercase tracking-[4px]">Catalogando unidades...</p>
+                    ) : units.length === 0 ? (
+                        <div className="bg-white/70 backdrop-blur-xl rounded-[32px] shadow-sm border border-slate-100/80 p-32 text-center">
+                            <Building2 className="h-16 w-16 text-slate-200 mx-auto mb-6" />
+                            <p className="text-[10px] font-black text-slate-400 uppercase tracking-[3px]">Nenhuma unidade VisMed configurada ainda.</p>
+                        </div>
+                    ) : units.map(u => {
+                        const isLinked = !!u.doctoraliaCounterpart;
+                        return (
+                            <div key={u.id} className="bg-white/70 backdrop-blur-xl rounded-[32px] shadow-sm border border-slate-100/80 overflow-hidden hover:shadow-xl transition-all duration-500 group">
+                                <div className="grid grid-cols-1 md:grid-cols-[1fr_auto_1fr] items-stretch min-h-[180px]">
+                                    {/* LEFT — VisMed */}
+                                    <div className="p-8 flex flex-col justify-center border-r border-slate-100/60">
+                                        <div className="flex items-center gap-2 mb-4">
+                                            <div className="h-6 w-6 rounded-lg bg-slate-900 flex items-center justify-center">
+                                                <Building2 className="h-3.5 w-3.5 text-white" />
                                             </div>
-                                        </td></tr>
-                                    ) : units.length === 0 ? (
-                                        <tr><td colSpan={3} className="px-10 py-32 text-center text-slate-400 font-bold uppercase tracking-widest text-xs opacity-50">Nenhuma unidade VisMed configurada ainda.</td></tr>
-                                    ) : units.map(u => (
-                                        <tr key={u.id} className="group hover:bg-emerald-50/20 transition-all duration-700">
-                                            <td className="px-10 py-6">
-                                                <div className="flex items-center gap-6">
-                                                    <div className="h-14 w-14 rounded-[20px] bg-slate-50 text-slate-400 flex items-center justify-center border border-slate-100 group-hover:bg-primary group-hover:text-white group-hover:border-primary/20 transition-all duration-700 shadow-sm group-hover:shadow-xl group-hover:rotate-2">
-                                                        <Building2 className="h-7 w-7" />
-                                                    </div>
-                                                    <div>
-                                                        <div className="font-black text-base text-slate-900 group-hover:text-primary transition-colors tracking-tight">{u.name}</div>
-                                                        <div className="flex items-center gap-1.5 mt-2">
-                                                            <div className="h-1.5 w-1.5 rounded-full bg-primary/40"></div>
-                                                            <span className="text-[10px] font-black text-slate-400 uppercase tracking-[2px]">Core Platform</span>
-                                                        </div>
+                                            <span className="text-[9px] font-black text-slate-400 uppercase tracking-[3px]">VisMed</span>
+                                        </div>
+                                        <div className="font-black text-lg text-slate-900 tracking-tight leading-tight mb-3">{u.name}</div>
+                                        <div className="space-y-2">
+                                            {u.cityName && (
+                                                <div className="text-[10px] font-bold text-slate-500 flex items-center gap-1.5">
+                                                    <div className="h-1.5 w-1.5 rounded-full bg-slate-300"></div>
+                                                    {u.cityName}
+                                                </div>
+                                            )}
+                                            {u.cnpj && (
+                                                <span className="inline-block text-[10px] font-black text-slate-400 bg-slate-50 px-2 py-0.5 rounded-lg uppercase tracking-widest border border-slate-100">
+                                                    CNPJ: {u.cnpj}
+                                                </span>
+                                            )}
+                                            <div className="flex items-center gap-2 mt-1">
+                                                <User className="h-3.5 w-3.5 text-slate-400" />
+                                                <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">
+                                                    {u.doctorCount} Profissional(is)
+                                                </span>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    {/* CENTER — Status */}
+                                    <div className="px-10 flex flex-col items-center justify-center bg-slate-50/30">
+                                        {isLinked ? (
+                                            <div className="flex flex-col items-center gap-3">
+                                                <div className="h-16 w-16 rounded-[22px] bg-gradient-to-br from-primary to-emerald-600 flex items-center justify-center shadow-lg shadow-primary/20 group-hover:scale-110 transition-transform duration-500">
+                                                    <CheckCircle2 className="h-8 w-8 text-white" />
+                                                </div>
+                                                <span className="text-[10px] font-black text-primary uppercase tracking-[3px]">Vinculado</span>
+                                                <div className="h-1 w-12 rounded-full bg-gradient-to-r from-primary to-emerald-400"></div>
+                                            </div>
+                                        ) : (
+                                            <div className="flex flex-col items-center gap-3">
+                                                <div className="h-16 w-16 rounded-[22px] bg-slate-100 flex items-center justify-center border-2 border-dashed border-slate-200 group-hover:border-orange-300 transition-colors duration-500">
+                                                    <Link2Off className="h-8 w-8 text-slate-300" />
+                                                </div>
+                                                <span className="text-[10px] font-black text-slate-400 uppercase tracking-[3px]">Pendente</span>
+                                                <div className="h-1 w-12 rounded-full bg-slate-200"></div>
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    {/* RIGHT — Doctoralia */}
+                                    <div className="p-8 flex flex-col justify-center border-l border-slate-100/60">
+                                        <div className="flex items-center gap-2 mb-4 justify-end">
+                                            <span className="text-[9px] font-black text-slate-400 uppercase tracking-[3px]">Doctoralia</span>
+                                            <div className="h-6 w-6 rounded-lg bg-blue-500 flex items-center justify-center">
+                                                <Globe className="h-3.5 w-3.5 text-white" />
+                                            </div>
+                                        </div>
+                                        {isLinked ? (
+                                            <div className="text-right">
+                                                <div className="font-black text-lg text-slate-900 tracking-tight leading-tight mb-3">{u.doctoraliaCounterpart!.name}</div>
+                                                <div className="space-y-2">
+                                                    <span className="inline-block text-[10px] font-black text-blue-600 bg-blue-50 px-2.5 py-1 rounded-lg uppercase tracking-widest border border-blue-100">
+                                                        ID: {u.doctoraliaCounterpart!.externalId}
+                                                    </span>
+                                                    <div className="flex items-center justify-end gap-1.5 mt-1">
+                                                        <div className="h-2 w-2 rounded-full bg-primary animate-pulse"></div>
+                                                        <span className="text-[10px] font-black text-primary uppercase tracking-widest">Sincronizado</span>
                                                     </div>
                                                 </div>
-                                            </td>
-                                            <td className="px-10 py-6">
-                                                <div className="flex flex-wrap gap-2.5">
-                                                    {u.doctorCount > 0 ? (
-                                                        <div className="flex items-center gap-2 px-4 py-2 bg-emerald-50 border border-emerald-100 rounded-2xl group-hover:bg-white transition-colors">
-                                                            <User className="h-4 w-4 text-primary" />
-                                                            <span className="text-[11px] font-black text-primary uppercase tracking-widest">{u.doctorCount} Profissionais Mapeados</span>
-                                                        </div>
-                                                    ) : (
-                                                        <span className="text-[10px] font-black text-slate-300 uppercase tracking-widest italic opacity-40">Sem vínculos diretos</span>
-                                                    )}
-                                                </div>
-                                            </td>
-                                            <td className="px-10 py-6 text-right">
-                                                {u.doctoraliaCounterpart ? (
-                                                    <div className="flex items-center justify-end gap-5">
-                                                        <div className="text-right">
-                                                            <div className="text-[15px] font-black text-slate-900 leading-none tracking-tight">{u.doctoraliaCounterpart.name}</div>
-                                                            <div className="flex items-center justify-end gap-1.5 mt-2">
-                                                                <div className="h-2 w-2 rounded-full bg-primary"></div>
-                                                                <span className="text-[10px] font-black text-primary uppercase tracking-widest">Sincronizado</span>
-                                                            </div>
-                                                        </div>
-                                                        <div className="h-12 w-12 rounded-[18px] bg-primary/5 text-primary flex items-center justify-center shrink-0 border border-primary/20 shadow-sm transition-colors group-hover:bg-primary group-hover:text-white">
-                                                            <ShieldCheck className="h-6 w-6" />
-                                                        </div>
-                                                    </div>
-                                                ) : (
-                                                    <div className="flex items-center justify-end gap-4 text-slate-300 hover:text-slate-400 transition-colors">
-                                                        <span className="text-[10px] font-black uppercase tracking-[3px] opacity-60">Pendente</span>
-                                                        <div className="h-12 w-12 rounded-[18px] bg-slate-50 flex items-center justify-center border border-slate-100">
-                                                            <Link2Off className="h-6 w-6 opacity-40" />
-                                                        </div>
-                                                    </div>
-                                                )}
-                                            </td>
-                                        </tr>
-                                    ))}
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
+                                            </div>
+                                        ) : (
+                                            <div className="text-right">
+                                                <div className="font-black text-base text-slate-300 tracking-tight leading-tight mb-3">Sem vínculo externo</div>
+                                                <span className="inline-block text-[10px] font-black text-slate-300 uppercase tracking-widest opacity-50">Aguardando sincronização</span>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+                        );
+                    })}
                 </div>
             )}
 

@@ -226,6 +226,53 @@ export class VismedSyncProcessor extends WorkerHost {
                 insertedOrUpdated++;
             }
 
+            // ----------------------------------------------------
+            // PASSO D: Sincronizar Convênios (VismedInsurance)
+            // ----------------------------------------------------
+            this.logger.log('Sincronizando Convênios...');
+            await this.logEvent(currentSyncRunId, 'INSURANCE', 'fetch_started', 'Buscando convênios...');
+            try {
+                const convenios = await this.vismedClient.getConvenios(idEmpresaGestora);
+                await this.logEvent(currentSyncRunId, 'INSURANCE', 'fetch_success', `Encontrados ${convenios.length} convênios.`);
+
+                for (const c of convenios) {
+                    if (!c.idconvenio || !c.nomeconvenio) continue;
+
+                    const insurance = await this.prisma.vismedInsurance.upsert({
+                        where: { vismedId: Number(c.idconvenio) },
+                        create: {
+                            vismedId: Number(c.idconvenio),
+                            name: c.nomeconvenio,
+                            isActive: true,
+                        },
+                        update: {
+                            name: c.nomeconvenio,
+                        }
+                    });
+
+                    await this.prisma.mapping.upsert({
+                        where: {
+                            clinicId_entityType_vismedId: {
+                                clinicId,
+                                entityType: 'INSURANCE',
+                                vismedId: insurance.id,
+                            }
+                        },
+                        create: {
+                            clinicId,
+                            entityType: 'INSURANCE',
+                            vismedId: insurance.id,
+                            status: 'UNLINKED',
+                        },
+                        update: {}
+                    });
+                    insertedOrUpdated++;
+                }
+            } catch (convErr) {
+                this.logger.warn(`Falha ao sincronizar convênios: ${convErr?.message || convErr}`);
+                await this.logEvent(currentSyncRunId, 'INSURANCE', 'fetch_error', convErr?.message || 'Erro desconhecido');
+            }
+
             // Finaliza o Run com Sucesso
             await this.prisma.syncRun.update({
                 where: { id: currentSyncRunId },

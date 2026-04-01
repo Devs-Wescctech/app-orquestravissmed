@@ -158,6 +158,21 @@ model VismedSpecialty {
   mappings SpecialtyServiceMapping[]
 }
 
+model VismedInsurance {
+  id                String   @id @default(uuid())
+  vismedId          Int      @unique // idconvenio
+  name              String   // nomeconvenio
+  isActive          Boolean  @default(true)
+  idConvenioTipo    Int?
+  razaoSocial       String?
+  cnpj              String?
+  dataInicio        String?
+  dataFinal         String?
+  agendamentoOnline String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+}
+
 model Doctor {
   id             String   @id @default(uuid())
   name           String

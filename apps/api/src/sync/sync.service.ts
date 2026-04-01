@@ -90,12 +90,13 @@ export class SyncService {
     }
 
     async getVismedStats() {
-        const [units, doctors, specialties] = await Promise.all([
+        const [units, doctors, specialties, insurances] = await Promise.all([
             this.prisma.vismedUnit.count(),
             this.prisma.vismedDoctor.count(),
-            this.prisma.vismedSpecialty.count()
+            this.prisma.vismedSpecialty.count(),
+            this.prisma.vismedInsurance.count()
         ]);
-        return { units, doctors, specialties };
+        return { units, doctors, specialties, insurances };
     }
 
     private async getEmpresaGestoraForClinic(clinicId: string): Promise<number> {
@@ -237,6 +238,49 @@ export class SyncService {
                 }
                 insertedOrUpdated++;
             }
+
+            this.logger.log('Sincronizando Convênios...');
+            await this.logEvent(syncRunId, 'INSURANCE', 'fetch_started', 'Buscando convênios cadastrados...');
+            const convenios = await this.vismedClient.getConvenios(idEmpresaGestora, baseUrl);
+            await this.logEvent(syncRunId, 'INSURANCE', 'fetch_success', `Encontrados ${convenios.length} convênios.`);
+
+            for (const c of convenios) {
+                if (!c.idconvenio) continue;
+                const ins = await this.prisma.vismedInsurance.upsert({
+                    where: { vismedId: Number(c.idconvenio) },
+                    create: {
+                        vismedId: Number(c.idconvenio),
+                        name: c.nomeconvenio,
+                        isActive: c.ativo === "1",
+                        idConvenioTipo: c.idconveniotipo ? Number(c.idconveniotipo) : null,
+                        razaoSocial: c.razaosocialconveniado,
+                        cnpj: c.cnpjconveniado,
+                        dataInicio: c.datainicio,
+                        dataFinal: c.datafinal,
+                        agendamentoOnline: c.agendamentoonline,
+                    },
+                    update: {
+                        name: c.nomeconvenio,
+                        isActive: c.ativo === "1",
+                        idConvenioTipo: c.idconveniotipo ? Number(c.idconveniotipo) : null,
+                        razaoSocial: c.razaosocialconveniado,
+                        cnpj: c.cnpjconveniado,
+                        dataInicio: c.datainicio,
+                        dataFinal: c.datafinal,
+                        agendamentoOnline: c.agendamentoonline,
+                    }
+                });
+
+                await this.prisma.mapping.upsert({
+                    where: {
+                        clinicId_entityType_vismedId: { clinicId, entityType: 'INSURANCE', vismedId: ins.id }
+                    },
+                    create: { clinicId, entityType: 'INSURANCE', vismedId: ins.id, status: 'UNLINKED' },
+                    update: {}
+                });
+                insertedOrUpdated++;
+            }
+            await this.prisma.syncRun.update({ where: { id: syncRunId }, data: { totalRecords: insertedOrUpdated } });
 
             await this.prisma.syncRun.update({
                 where: { id: syncRunId },
