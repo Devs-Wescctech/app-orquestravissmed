@@ -6,19 +6,21 @@ export class VismedService {
     private readonly logger = new Logger(VismedService.name);
     private readonly defaultBaseUrl = 'https://app.vissmed.com.br/api-vissmed-4/api/v1.0';
 
+    private buildApiUrl(path: string, baseUrl?: string): string {
+        if (!baseUrl) {
+            return `${this.defaultBaseUrl}/${path}`;
+        }
+
+        let domain = baseUrl.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+        return `https://${domain}/api-vissmed-4/api/v1.0/${path}`;
+    }
+
     private requestData(path: string, baseUrl?: string): Promise<any[]> {
         return new Promise((resolve, reject) => {
-            let host = baseUrl || this.defaultBaseUrl;
-
-            // Garantir que termina com a versão da API se não estiver presente
-            if (!host.endsWith('/api/v1.0')) {
-                host = host.replace(/\/$/, '') + '/api/v1.0';
-            }
-
-            const url = `${host}/${path}`;
+            const url = this.buildApiUrl(path, baseUrl);
             this.logger.log(`[VISMED-API] GET ${url}`);
 
-            const req = https.get(url, { rejectUnauthorized: false }, (res) => {
+            const req = https.get(url, (res) => {
                 let data = '';
 
                 res.on('data', (chunk) => {

@@ -15,7 +15,7 @@ The workflow starts both services together:
 The frontend uses `next.config.js` rewrites to proxy all `/api/*` requests to the NestJS backend transparently.
 
 ## Running the App
-Workflow: `Start application` → `cd apps/api && node dist/src/main.js & cd apps/web && npm run dev`
+Workflow: `Start application` → `cd apps/api && node dist/main.js & cd apps/web && npm run dev`
 
 ## Key APIs
 - `POST /api/auth/login` — JWT authentication
@@ -38,8 +38,13 @@ Replit PostgreSQL (Prisma ORM). Schema in `apps/api/prisma/schema.prisma`.
 npm (workspace monorepo).
 
 ## Build Commands
-- API build: `cd apps/api && npx nest build`
+- API build: `cd apps/api && npx tsc` (outputs to `apps/api/dist/`)
 - Web dev: `cd apps/web && npm run dev`
+
+## Integrations
+- **VisMed API**: Uses `idEmpresaGestora` (stored as `clientId` in `IntegrationConnection` with provider `vismed`). Default base URL: `https://app.vissmed.com.br/api-vissmed-4/api/v1.0`. The service auto-prepends `https://` and the API path if only a domain is stored.
+- **Doctoralia/Docplanner**: OAuth2 client credentials flow. Credentials stored in `IntegrationConnection` with provider `doctoralia` (fields: `clientId`, `clientSecret`, `domain`). Domain must include `www` prefix (e.g., `www.doctoralia.com.br`).
+- **Redis/BullMQ**: Used for sync job queues. Redis errors in logs are expected and non-fatal (no Redis available in Replit).
 
 ## Default Credentials
 - Email: `admin@vismed.com`
