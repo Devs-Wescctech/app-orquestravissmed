@@ -389,6 +389,27 @@ export class SyncService {
                                 });
                             }
                         } catch (e) { }
+
+                        try {
+                            const insRes = await client.getAddressInsuranceProviders(facilityId, docId, addrId);
+                            const addressInsProviders = insRes._items || [];
+                            if (addressInsProviders.length > 0) {
+                                this.logger.log(`Doctor ${doc.name || doc.surname || docId}: ${addressInsProviders.length} convênio(s) no endereço ${addrId}`);
+                                for (const aip of addressInsProviders) {
+                                    const aipId = aip.insurance_provider_id || aip.id;
+                                    const aipName = aip.name || aip.insurance_provider_name;
+                                    if (!aipId || !aipName) continue;
+                                    const normName = (aipName || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+                                    await this.prisma.doctoraliaInsuranceProvider.upsert({
+                                        where: { doctoraliaId: Number(aipId) },
+                                        create: { doctoraliaId: Number(aipId), name: aipName, normalizedName: normName },
+                                        update: { name: aipName, normalizedName: normName }
+                                    });
+                                }
+                            }
+                        } catch (insAddrErr: any) {
+                            this.logger.debug(`Falha ao buscar convênios do endereço ${addrId}: ${insAddrErr?.message?.substring(0, 100)}`);
+                        }
                     }
                 } catch (e) { }
             }
