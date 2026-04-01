@@ -291,6 +291,40 @@ export class MappingsService {
     // NEW MATCHING ENGINE ENDPOINTS (SPRINT 6)
     // ------------------------------------------------------------------------------------------
 
+    async searchCatalog(q: string, limit: number = 100) {
+        const safeLimit = Math.min(Math.max(limit, 1), 500);
+        const normalizedQ = q.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+
+        if (!normalizedQ) {
+            return this.prisma.doctoraliaService.findMany({
+                take: safeLimit,
+                orderBy: { name: 'asc' },
+                select: { id: true, doctoraliaServiceId: true, name: true, normalizedName: true }
+            });
+        }
+
+        return this.prisma.doctoraliaService.findMany({
+            where: {
+                OR: [
+                    { normalizedName: { contains: normalizedQ } },
+                    { name: { contains: q, mode: 'insensitive' } },
+                ]
+            },
+            take: safeLimit,
+            orderBy: { name: 'asc' },
+            select: { id: true, doctoraliaServiceId: true, name: true, normalizedName: true }
+        });
+    }
+
+    async getCatalogStats() {
+        const [totalServices, totalMapped, totalPendingReview] = await Promise.all([
+            this.prisma.doctoraliaService.count(),
+            this.prisma.specialtyServiceMapping.count({ where: { isActive: true, requiresReview: false } }),
+            this.prisma.specialtyServiceMapping.count({ where: { isActive: true, requiresReview: true } }),
+        ]);
+        return { totalServices, totalMapped, totalPendingReview };
+    }
+
     async getSpecialtyMatches(requiresReview?: boolean) {
         const whereClause: any = { isActive: true };
         if (requiresReview !== undefined) {

@@ -48,6 +48,18 @@ export class MappingsController {
     // NEW MATCHING ENGINE ENDPOINTS (SPRINT 6)
     // ------------------------------------------------------------------------------------------
 
+    @Get('catalog/search')
+    searchCatalog(@Query('q') q?: string, @Query('limit') limit?: string) {
+        const parsed = parseInt(limit || '100', 10);
+        const safeLimit = Number.isFinite(parsed) ? parsed : 100;
+        return this.mappingsService.searchCatalog(q || '', safeLimit);
+    }
+
+    @Get('catalog/stats')
+    getCatalogStats() {
+        return this.mappingsService.getCatalogStats();
+    }
+
     @Get('specialties/matches')
     getSpecialtyMatches(@Query('requiresReview') requiresReview?: string) {
         const reviewFilter = requiresReview ? requiresReview === 'true' : undefined;
