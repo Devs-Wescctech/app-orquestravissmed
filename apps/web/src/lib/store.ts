@@ -11,10 +11,11 @@ interface User {
 
 interface AuthState {
     user: User | null;
+    token: string | null;
     isAuthenticated: boolean;
     _hasHydrated: boolean;
     setHasHydrated: (v: boolean) => void;
-    login: (user: User) => void;
+    login: (user: User, token: string) => void;
     logout: () => void;
 }
 
@@ -22,11 +23,12 @@ export const useAuthStore = create<AuthState>()(
     persist(
         (set) => ({
             user: null,
+            token: null,
             isAuthenticated: false,
             _hasHydrated: false,
             setHasHydrated: (v) => set({ _hasHydrated: v }),
-            login: (userData) => set({ user: userData, isAuthenticated: true }),
-            logout: () => set({ user: null, isAuthenticated: false }),
+            login: (userData, token) => set({ user: userData, token, isAuthenticated: true }),
+            logout: () => set({ user: null, token: null, isAuthenticated: false }),
         }),
         {
             name: 'vismed-auth-storage',
@@ -35,6 +37,7 @@ export const useAuthStore = create<AuthState>()(
             },
             partialize: (state) => ({
                 user: state.user,
+                token: state.token,
                 isAuthenticated: state.isAuthenticated,
             }),
         }

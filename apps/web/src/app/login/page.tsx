@@ -28,7 +28,7 @@ export default function LoginPage() {
 
             Cookies.set('vismed_auth_token', access_token, { expires: 7 });
 
-            login(user);
+            login(user, access_token);
 
             router.push('/select-clinic');
         } catch (error: any) {

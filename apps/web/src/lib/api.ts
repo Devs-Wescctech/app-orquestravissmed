@@ -2,8 +2,24 @@ import Cookies from 'js-cookie';
 
 const API_BASE = '/api';
 
+function getToken(): string | undefined {
+  const cookieToken = Cookies.get('vismed_auth_token');
+  if (cookieToken) return cookieToken;
+
+  if (typeof window !== 'undefined') {
+    try {
+      const stored = localStorage.getItem('vismed-auth-storage');
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        return parsed?.state?.token || undefined;
+      }
+    } catch {}
+  }
+  return undefined;
+}
+
 async function request(method: string, url: string, body?: any, config?: any) {
-  const token = Cookies.get('vismed_auth_token');
+  const token = getToken();
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
