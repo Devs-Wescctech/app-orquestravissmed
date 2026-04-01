@@ -203,29 +203,39 @@ export class SyncProcessor extends WorkerHost {
                 }
             });
 
-            // 3.5 IMPORT FULL SERVICE CATALOG from Doctoralia Facility
-            // This ensures the MatchingEngine can compare against ALL available services, not just assigned ones
-            this.logger.log('Importando catálogo completo de serviços da Facility Doctoralia...');
-            await this.updateSyncStatus(syncRunId, 'importing_service_catalog');
+            this.logger.log('Importando dicionário global de Serviços da Doctoralia...');
+            await this.updateSyncStatus(syncRunId, 'importing_services_dictionary');
             try {
-                const catalogRes = await client.getFacilityServicesCatalog(facilityId);
-                const catalogItems = catalogRes._items || [];
-                this.logger.log(`Catálogo de Serviços: ${catalogItems.length} itens encontrados.`);
+                const dictRes = await client.getServicesDictionary();
+                const dictItems = dictRes._items || [];
+                this.logger.log(`Dicionário de Serviços: ${dictItems.length} encontrados.`);
+                await this.logEvent(syncRunId, 'SERVICE_CATALOG', 'fetch_success', `Dicionário global: ${dictItems.length} serviços encontrados.`);
 
-                for (const item of catalogItems) {
+                let savedSvcCount = 0;
+                for (const item of dictItems) {
                     const svcId = String(item.id);
-                    await this.prisma.doctoraliaService.upsert({
-                        where: { doctoraliaServiceId: svcId },
-                        update: { name: item.name, normalizedName: item.name?.toLowerCase() },
-                        create: { doctoraliaServiceId: svcId, name: item.name, normalizedName: item.name?.toLowerCase() }
-                    });
+                    const svcName = item.name || `Service #${svcId}`;
+                    try {
+                        const normName = svcName.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+                        await this.prisma.doctoraliaService.upsert({
+                            where: { doctoraliaServiceId: svcId },
+                            update: { name: svcName, normalizedName: normName },
+                            create: { doctoraliaServiceId: svcId, name: svcName, normalizedName: normName }
+                        });
+                        savedSvcCount++;
+                    } catch (itemErr: any) {
+                        this.logger.debug(`Falha ao salvar serviço ${svcId}: ${itemErr?.message}`);
+                    }
+                    if (savedSvcCount % 500 === 0) {
+                        this.logger.log(`Dicionário de Serviços: ${savedSvcCount}/${dictItems.length} salvos...`);
+                    }
                 }
-                await this.logEvent(syncRunId, 'SERVICE_CATALOG', 'fetch_success', `Imported ${catalogItems.length} services from Doctoralia catalog`);
-                totalProcessed += catalogItems.length;
+                totalProcessed += savedSvcCount;
+                this.logger.log(`Dicionário de Serviços: ${savedSvcCount} salvos no dicionário local.`);
                 await this.prisma.syncRun.update({ where: { id: syncRunId }, data: { totalRecords: totalProcessed } });
             } catch (catalogError: any) {
-                this.logger.warn(`Falha ao importar catálogo de serviços: ${catalogError.message}`);
-                await this.logEvent(syncRunId, 'SERVICE_CATALOG', 'error', `Failed to import service catalog: ${catalogError.message}`);
+                this.logger.warn(`Falha ao importar dicionário de serviços: ${catalogError.message}`);
+                await this.logEvent(syncRunId, 'SERVICE_CATALOG', 'fetch_error', `Erro: ${catalogError.message}`);
             }
 
             // 4. Insurance Providers (Global Dictionary) — before matching so convênios can match

@@ -153,6 +153,10 @@ export class DocplannerClient {
         return this.request('GET', `/api/v3/integration/facilities/${facilityId}/services/catalog`);
     }
 
+    async getServicesDictionary(): Promise<any> {
+        return this.request('GET', '/api/v3/integration/services');
+    }
+
     async getBookings(facilityId: string, doctorId: string, addressId: string, start: string, end: string): Promise<any> {
         const s = start.includes('T') ? start : `${start}T00:00:00-0300`;
         const e = end.includes('T') ? end : `${end}T23:59:59-0300`;

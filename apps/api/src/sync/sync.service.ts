@@ -418,23 +418,38 @@ export class SyncService {
                 await this.saveGenericMapping(clinicId, 'SERVICE', srvId, srv, syncRunId);
             }
 
-            this.logger.log('Importando catálogo de serviços da Facility...');
-            await this.updateSyncStatus(syncRunId, 'importing_service_catalog');
+            this.logger.log('Importando dicionário global de Serviços da Doctoralia...');
+            await this.updateSyncStatus(syncRunId, 'importing_services_dictionary');
             try {
-                const catalogRes = await client.getFacilityServicesCatalog(facilityId);
-                const catalogItems = catalogRes._items || [];
-                for (const item of catalogItems) {
+                const dictRes = await client.getServicesDictionary();
+                const dictItems = dictRes._items || [];
+                this.logger.log(`Dicionário de Serviços: ${dictItems.length} encontrados.`);
+                await this.logEvent(syncRunId, 'SERVICE_CATALOG', 'fetch_success', `Dicionário global: ${dictItems.length} serviços encontrados.`);
+
+                let savedSvcCount = 0;
+                for (const item of dictItems) {
                     const svcId = String(item.id);
-                    await this.prisma.doctoraliaService.upsert({
-                        where: { doctoraliaServiceId: svcId },
-                        update: { name: item.name, normalizedName: item.name?.toLowerCase() },
-                        create: { doctoraliaServiceId: svcId, name: item.name, normalizedName: item.name?.toLowerCase() }
-                    });
+                    const svcName = item.name || `Service #${svcId}`;
+                    try {
+                        const normName = svcName.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+                        await this.prisma.doctoraliaService.upsert({
+                            where: { doctoraliaServiceId: svcId },
+                            update: { name: svcName, normalizedName: normName },
+                            create: { doctoraliaServiceId: svcId, name: svcName, normalizedName: normName }
+                        });
+                        savedSvcCount++;
+                    } catch (itemErr: any) {
+                        this.logger.debug(`Falha ao salvar serviço ${svcId}: ${itemErr?.message}`);
+                    }
+                    if (savedSvcCount % 500 === 0) {
+                        this.logger.log(`Dicionário de Serviços: ${savedSvcCount}/${dictItems.length} salvos...`);
+                    }
                 }
-                await this.logEvent(syncRunId, 'SERVICE_CATALOG', 'fetch_success', `Imported ${catalogItems.length} services from catalog`);
-                totalProcessed += catalogItems.length;
+                totalProcessed += savedSvcCount;
+                this.logger.log(`Dicionário de Serviços: ${savedSvcCount} salvos no dicionário local.`);
             } catch (catalogError: any) {
-                this.logger.warn(`Falha ao importar catálogo: ${catalogError.message}`);
+                this.logger.warn(`Falha ao importar dicionário de serviços: ${catalogError.message}`);
+                await this.logEvent(syncRunId, 'SERVICE_CATALOG', 'fetch_error', `Erro: ${catalogError.message}`);
             }
 
             this.logger.log('Importando dicionário global de Insurance Providers da Doctoralia...');

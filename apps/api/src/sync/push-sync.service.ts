@@ -158,9 +158,14 @@ export class PushSyncService {
         // ADD: Expected by VisMed but NOT currently assigned
         for (const [dictId, specName] of expectedDictIds.entries()) {
             if (!currentByDictId.has(dictId)) {
+                const numericId = Number(dictId);
+                if (!Number.isFinite(numericId)) {
+                    this.logger.warn(`Doctor ${doctorName}: [SKIP] Service dict:${dictId} (${specName}) has non-numeric ID, skipping.`);
+                    continue;
+                }
                 try {
                     const payload = {
-                        service_id: dictId,
+                        service_id: numericId,
                         is_price_from: false,
                         is_visible: true,
                         default_duration: 30,
