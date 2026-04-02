@@ -398,9 +398,16 @@ export class AppointmentsService {
 
         try {
             const client = this.docplanner.createClient(conn.domain || 'doctoralia.com.br', conn.clientId, conn.clientSecret || '');
-            const res = await client.deleteSlots(cd.facilityId, doctorExternalId, cd.address.id, start, end);
+            const startDate = new Date(start.split('T')[0]);
+            const endDate = new Date(end.split('T')[0]);
+            let deletedDays = 0;
+            for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
+                const dateStr = d.toISOString().split('T')[0];
+                await client.deleteSlots(cd.facilityId, doctorExternalId, cd.address.id, dateStr);
+                deletedDays++;
+            }
             await this.logRequest({ clinicId, action: 'DELETE_SLOTS', doctorId: doctorExternalId, start, end, durationMs: Date.now() - startTime, status: 'success' });
-            return res;
+            return { success: true, deletedDays };
         } catch (e: any) {
             const isHttp = e instanceof HttpException;
             const details = isHttp ? (e.getResponse() as any).details : null;

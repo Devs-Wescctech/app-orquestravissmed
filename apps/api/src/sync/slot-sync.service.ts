@@ -55,30 +55,14 @@ export class SlotSyncService {
             const parsed = this.parseTurno(turno);
             if (!parsed) continue;
 
-            const [startH, startM] = parsed.start.split(':').map(Number);
-            const [endH, endM] = parsed.end.split(':').map(Number);
-            const startMinutes = startH * 60 + startM;
-            const endMinutes = endH * 60 + endM;
-
-            for (let m = startMinutes; m + slotDurationMinutes <= endMinutes; m += slotDurationMinutes) {
-                const slotStartH = Math.floor(m / 60);
-                const slotStartM = m % 60;
-                const slotEndM_total = m + slotDurationMinutes;
-                const slotEndH = Math.floor(slotEndM_total / 60);
-                const slotEndMin = slotEndM_total % 60;
-
-                const startStr = `${String(slotStartH).padStart(2, '0')}:${String(slotStartM).padStart(2, '0')}`;
-                const endStr = `${String(slotEndH).padStart(2, '0')}:${String(slotEndMin).padStart(2, '0')}`;
-
-                slots.push({
-                    start: `${date}T${startStr}:00${timezone}`,
-                    end: `${date}T${endStr}:00${timezone}`,
-                    address_services: uniqueServiceIds.map(id => ({
-                        address_service_id: id,
-                        duration: slotDurationMinutes,
-                    })),
-                });
-            }
+            slots.push({
+                start: `${date}T${parsed.start}:00${timezone}`,
+                end: `${date}T${parsed.end}:00${timezone}`,
+                address_services: uniqueServiceIds.map(id => ({
+                    address_service_id: String(id),
+                    duration: slotDurationMinutes,
+                })),
+            });
         }
         return slots;
     }
@@ -249,11 +233,11 @@ export class SlotSyncService {
             }
 
             try {
-                this.logger.log(`Doctor ${doctor.name}: sending ${allSlots.length} slots to address ${addrId}. Sample slot: ${JSON.stringify(allSlots[0])}`);
+                this.logger.log(`Doctor ${doctor.name}: sending ${allSlots.length} work periods to address ${addrId} for ${dates.length} days. Sample: ${JSON.stringify(allSlots[0])}`);
                 const putResponse = await client.replaceSlots(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, { slots: allSlots });
                 this.logger.log(`Doctor ${doctor.name}: PUT slots response: ${JSON.stringify(putResponse)}`);
                 totalSlots += allSlots.length;
-                this.logger.log(`Doctor ${doctor.name}: synced ${allSlots.length} slots to address ${addrId} for ${dates.length} days`);
+                this.logger.log(`Doctor ${doctor.name}: synced ${allSlots.length} work periods to address ${addrId} for ${dates.length} days`);
                 if (syncRunId) {
                     await this.logEvent(syncRunId, 'SLOT_SYNC', 'created', `Doctor ${doctor.name}: ${allSlots.length} slots sincronizados para endereço ${addrId}`);
                 }

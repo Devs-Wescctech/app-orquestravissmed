@@ -197,10 +197,9 @@ export class DocplannerClient {
         return this.request('POST', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/bookings`, payload);
     }
 
-    async deleteSlots(facilityId: string, doctorId: string, addressId: string, start: string, end: string): Promise<any> {
-        const s = start.includes('T') ? start : `${start}T00:00:00-0300`;
-        const e = end.includes('T') ? end : `${end}T23:59:59-0300`;
-        return this.request('DELETE', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/slots?start=${encodeURIComponent(s)}&end=${encodeURIComponent(e)}`);
+    async deleteSlots(facilityId: string, doctorId: string, addressId: string, date: string): Promise<any> {
+        const dateOnly = date.includes('T') ? date.split('T')[0] : date;
+        return this.request('DELETE', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/slots/${dateOnly}`);
     }
 
     async updateAddress(facilityId: string, doctorId: string, addressId: string, payload: any): Promise<any> {
