@@ -63,7 +63,6 @@ export default function MappingHub() {
     const [isLoading, setIsLoading] = useState(true);
     const [isResolving, setIsResolving] = useState(false);
     const [updatingCalendarIds, setUpdatingCalendarIds] = useState<Set<string>>(new Set());
-    const [syncingSlotIds, setSyncingSlotIds] = useState<Set<string>>(new Set());
 
     // Per-tab data
     const [professionals, setProfessionals] = useState<VismedProfessional[]>([]);
@@ -168,27 +167,6 @@ export default function MappingHub() {
             toast.error('Erro ao atualizar status do calendário.');
         } finally {
             setUpdatingCalendarIds(prev => {
-                const next = new Set(prev);
-                next.delete(professionalId);
-                return next;
-            });
-        }
-    };
-
-    const handleSyncSlots = async (professionalId: string) => {
-        setSyncingSlotIds(prev => new Set(prev).add(professionalId));
-        try {
-            const res = await api.post(`/sync/${activeClinic?.id}/slots/${professionalId}`);
-            if (res.data?.success) {
-                toast.success(res.data?.message || 'Horários sincronizados com sucesso.');
-            } else {
-                toast.error(res.data?.message || 'Falha ao sincronizar horários.');
-            }
-        } catch (err: any) {
-            console.error('handleSyncSlots error', err);
-            toast.error(err.response?.data?.message || 'Erro ao sincronizar horários.');
-        } finally {
-            setSyncingSlotIds(prev => {
                 const next = new Set(prev);
                 next.delete(professionalId);
                 return next;
@@ -343,12 +321,12 @@ export default function MappingHub() {
                         <table className="w-full text-sm text-left border-separate border-spacing-0">
                             <thead className="bg-slate-50/50 text-[10px] text-slate-400 uppercase font-black tracking-[2px] border-b border-slate-100">
                                 <tr>
-                                    <th className="px-6 py-5 w-[22%]">Profissional</th>
+                                    <th className="px-6 py-5 w-[24%]">Profissional</th>
                                     <th className="px-4 py-5 w-[14%]">Turnos</th>
-                                    <th className="px-4 py-5 w-[16%]">Especialidades</th>
-                                    <th className="px-4 py-5 w-[20%]">Vínculo Doctoralia</th>
-                                    <th className="px-4 py-5 w-[14%] text-center">Calendário</th>
-                                    <th className="px-4 py-5 w-[14%] text-center">Ações</th>
+                                    <th className="px-4 py-5 w-[18%]">Especialidades</th>
+                                    <th className="px-4 py-5 w-[22%]">Vínculo Doctoralia</th>
+                                    <th className="px-4 py-5 w-[10%] text-center">Calendário</th>
+                                    <th className="px-4 py-5 w-[12%] text-center">Status Sync</th>
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-50">
@@ -492,22 +470,44 @@ export default function MappingHub() {
                                             )}
                                         </td>
                                         <td className="px-4 py-5 text-center">
-                                            {p.doctoraliaCounterpart && (p.turnos?.turnoM || p.turnos?.turnoT || p.turnos?.turnoN) ? (
-                                                <button
-                                                    onClick={() => handleSyncSlots(p.id)}
-                                                    disabled={syncingSlotIds.has(p.id)}
-                                                    className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-[9px] font-black uppercase tracking-wider bg-blue-500 text-white shadow-sm hover:bg-blue-600 hover:scale-105 active:scale-95 transition-all disabled:opacity-60 disabled:cursor-wait"
-                                                >
-                                                    {syncingSlotIds.has(p.id) ? (
-                                                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                                                    ) : (
-                                                        <Calendar className="h-3.5 w-3.5" />
-                                                    )}
-                                                    {syncingSlotIds.has(p.id) ? 'Enviando...' : 'Sync Slots'}
-                                                </button>
-                                            ) : (
-                                                <span className="text-[9px] font-bold text-slate-200 uppercase">—</span>
-                                            )}
+                                            {(() => {
+                                                const hasLink = !!p.doctoraliaCounterpart;
+                                                const hasTurnos = !!(p.turnos?.turnoM || p.turnos?.turnoT || p.turnos?.turnoN);
+                                                const calEnabled = p.doctoraliaCounterpart?.calendarStatus === 'enabled';
+                                                const allDone = hasLink && hasTurnos && calEnabled;
+                                                const partial = hasLink && hasTurnos;
+
+                                                if (allDone) {
+                                                    return (
+                                                        <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[9px] font-black uppercase tracking-wider bg-primary/10 text-primary border border-primary/20">
+                                                            <CheckCircle2 className="h-3.5 w-3.5" />
+                                                            Completo
+                                                        </span>
+                                                    );
+                                                }
+                                                if (partial) {
+                                                    return (
+                                                        <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[9px] font-black uppercase tracking-wider bg-amber-50 text-amber-600 border border-amber-100" title="Calendário desabilitado">
+                                                            <AlertTriangle className="h-3.5 w-3.5" />
+                                                            Parcial
+                                                        </span>
+                                                    );
+                                                }
+                                                if (hasLink) {
+                                                    return (
+                                                        <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[9px] font-black uppercase tracking-wider bg-blue-50 text-blue-500 border border-blue-100" title="Sem turnos cadastrados">
+                                                            <Calendar className="h-3.5 w-3.5" />
+                                                            Sem Turnos
+                                                        </span>
+                                                    );
+                                                }
+                                                return (
+                                                    <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[9px] font-black uppercase tracking-wider bg-slate-50 text-slate-300 border border-slate-100">
+                                                        <Link2Off className="h-3.5 w-3.5" />
+                                                        Pendente
+                                                    </span>
+                                                );
+                                            })()}
                                         </td>
                                     </tr>
                                 ))}

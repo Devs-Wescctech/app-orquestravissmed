@@ -150,6 +150,8 @@ export class MatchingEngineService {
         /faturar/i,
         /particular/i,
         /cartao\s+clinica/i,
+        /estetica/i,
+        /google\s+a\s+faturar/i,
     ];
 
     private extractInsuranceCoreTokens(name: string): string[] {
@@ -260,10 +262,16 @@ export class MatchingEngineService {
             }
         }
 
-        if (bestMatch && bestScore >= 0.50) {
-            await this.pendingReviewInsuranceMapping(vismedInsuranceId, bestMatch, bestScore);
-            this.logger.log(`Insurance fuzzy match (${(bestScore * 100).toFixed(0)}%): "${insurance.name}" → "${bestMatch.name}" — PENDING MANUAL REVIEW`);
-            return true;
+        if (bestMatch && bestScore >= 0.65) {
+            const insTokens = this.extractInsuranceCoreTokens(insurance.name);
+            const provTokens = this.extractInsuranceCoreTokens(bestMatch.name);
+            const hasSharedToken = insTokens.some(t => provTokens.some(pt => pt === t));
+            if (hasSharedToken) {
+                await this.pendingReviewInsuranceMapping(vismedInsuranceId, bestMatch, bestScore);
+                this.logger.log(`Insurance fuzzy match (${(bestScore * 100).toFixed(0)}%): "${insurance.name}" → "${bestMatch.name}" — PENDING MANUAL REVIEW`);
+                return true;
+            }
+            this.logger.debug(`Insurance fuzzy match ${(bestScore * 100).toFixed(0)}% rejected (no shared tokens): "${insurance.name}" vs "${bestMatch.name}"`);
         }
 
         this.logger.debug(`No insurance match found for: ${insurance.name}`);
@@ -374,13 +382,31 @@ export class MatchingEngineService {
 
         // --- INSURANCE / CONVÊNIOS ---
         let newInsCount = 0;
-        const unmatchedInsurances = await this.prisma.vismedInsurance.findMany();
+        const allInsurances = await this.prisma.vismedInsurance.findMany();
+
+        let cleanedCount = 0;
+        for (const ins of allInsurances) {
+            if (this.isLikelyNonInsurance(ins.name)) {
+                const badMappings = await this.prisma.mapping.findMany({
+                    where: { entityType: 'INSURANCE', vismedId: ins.id, status: { in: ['LINKED', 'PENDING_REVIEW'] } }
+                });
+                for (const bm of badMappings) {
+                    await this.prisma.mapping.update({ where: { id: bm.id }, data: { status: 'UNLINKED', externalId: null, conflictData: {} } });
+                    cleanedCount++;
+                    this.logger.warn(`Cleaned false-positive insurance match: "${ins.name}" (was ${bm.status})`);
+                }
+            }
+        }
+        if (cleanedCount > 0) {
+            this.logger.log(`Cleaned ${cleanedCount} false-positive insurance match(es) via NON_INSURANCE_PATTERNS.`);
+        }
+
         const alreadyProcessedInsIds = (await this.prisma.mapping.findMany({
             where: { entityType: 'INSURANCE', status: { in: ['LINKED', 'PENDING_REVIEW'] } },
             select: { vismedId: true }
         })).map(m => m.vismedId).filter(Boolean);
 
-        const insurancesToMatch = unmatchedInsurances.filter(i => !alreadyProcessedInsIds.includes(i.id));
+        const insurancesToMatch = allInsurances.filter(i => !alreadyProcessedInsIds.includes(i.id));
 
         if (insurancesToMatch.length === 0) {
             this.logger.log('Nenhum Convênio VisMed Órfão encontrado.');
