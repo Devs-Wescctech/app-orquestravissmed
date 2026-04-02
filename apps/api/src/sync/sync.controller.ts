@@ -5,6 +5,7 @@ import { RolesGuard } from '../auth/roles.guard';
 import { PrismaService } from '../prisma/prisma.service';
 import { DocplannerService } from '../integrations/docplanner.service';
 import { SlotSyncService } from './slot-sync.service';
+import { PushSyncService } from './push-sync.service';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 
 @ApiTags('sync')
@@ -17,6 +18,7 @@ export class SyncController {
         private prisma: PrismaService,
         private docplanner: DocplannerService,
         private slotSync: SlotSyncService,
+        private pushSync: PushSyncService,
     ) { }
 
     private validateUserClinicAccess(user: any, clinicId: string) {
@@ -285,6 +287,96 @@ export class SyncController {
         }
 
         return { doctoraliaDoctorId, facilityId: dDoc.doctoraliaFacilityId, addresses: results };
+    }
+
+    @Post(':clinicId/insurance')
+    @ApiOperation({ summary: 'Sync insurance providers to all doctors in Doctoralia' })
+    async syncInsuranceProviders(
+        @Request() req: any,
+        @Param('clinicId') clinicId: string,
+    ) {
+        this.validateUserClinicAccess(req.user, clinicId);
+        const client = await this.getDoctoraliaClient(clinicId);
+
+        const mappings = await this.prisma.professionalUnifiedMapping.findMany({
+            where: { isActive: true },
+            include: {
+                vismedDoctor: true,
+                doctoraliaDoctor: true,
+            }
+        });
+
+        const clinicDoctorMappings = await this.prisma.mapping.findMany({
+            where: { clinicId, entityType: 'DOCTOR' },
+            select: { vismedId: true },
+        });
+        const clinicDoctorIds = new Set(clinicDoctorMappings.map(m => m.vismedId).filter(Boolean));
+
+        const results: any[] = [];
+
+        for (const mapping of mappings) {
+            if (!clinicDoctorIds.has(mapping.vismedDoctorId)) continue;
+            const dDoc = mapping.doctoraliaDoctor;
+            if (!dDoc) continue;
+
+            let addresses: any[] = [];
+            try {
+                const res = await client.getAddresses(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId);
+                addresses = res._items || [];
+            } catch (e: any) {
+                results.push({ doctor: dDoc.name, error: e.message });
+                continue;
+            }
+
+            for (const addr of addresses) {
+                const addrId = String(addr.id);
+                try {
+                    const syncResult = await this.pushSync.syncInsuranceProviders(
+                        null, client, clinicId, dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, dDoc.name
+                    );
+                    results.push({ doctor: dDoc.name, addressId: addrId, ...syncResult });
+                } catch (e: any) {
+                    results.push({ doctor: dDoc.name, addressId: addrId, error: e.message });
+                }
+            }
+        }
+
+        return {
+            total: results.length,
+            results,
+        };
+    }
+
+    @Get(':clinicId/insurance/:doctoraliaDoctorId')
+    @ApiOperation({ summary: 'Get current insurance providers for a doctor address' })
+    async getInsuranceProviders(
+        @Request() req: any,
+        @Param('clinicId') clinicId: string,
+        @Param('doctoraliaDoctorId') doctoraliaDoctorId: string,
+    ) {
+        this.validateUserClinicAccess(req.user, clinicId);
+        const client = await this.getDoctoraliaClient(clinicId);
+
+        const dDoc = await this.prisma.doctoraliaDoctor.findFirst({
+            where: { doctoraliaDoctorId },
+        });
+        if (!dDoc) throw new NotFoundException('Médico Doctoralia não encontrado.');
+
+        const addrsRes = await client.getAddresses(dDoc.doctoraliaFacilityId, doctoraliaDoctorId);
+        const addresses = addrsRes._items || [];
+        const results: any[] = [];
+
+        for (const addr of addresses) {
+            const addrId = String(addr.id);
+            const insRes = await client.getAddressInsuranceProviders(dDoc.doctoraliaFacilityId, doctoraliaDoctorId, addrId);
+            results.push({
+                addressId: addrId,
+                addressName: addr.name,
+                insuranceProviders: insRes._items || [],
+            });
+        }
+
+        return { doctoraliaDoctorId, addresses: results };
     }
 
     private async updateCalendarStatusInMapping(clinicId: string, doctoraliaDoctorInternalId: string, status: string) {

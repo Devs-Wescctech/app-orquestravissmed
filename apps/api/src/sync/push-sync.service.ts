@@ -116,9 +116,12 @@ export class PushSyncService {
 
                 // 3. SERVICES DELTA
                 await this.syncServicesDelta(syncRunId, client, dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, vDoc.specialties, dDoc.name);
+
+                // 4. INSURANCE PROVIDERS SYNC
+                await this.syncInsuranceProviders(syncRunId, client, clinicId, dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, dDoc.name);
             }
 
-            // 4. SLOT SYNC (turnos VisMed → slots Doctoralia)
+            // 5. SLOT SYNC (turnos VisMed → slots Doctoralia)
             if (vDoc.turnoM || vDoc.turnoT || vDoc.turnoN) {
                 try {
                     const slotResult = await this.slotSync.syncSlotsForDoctor(vDoc.id, client, syncRunId, 30);
@@ -217,6 +220,78 @@ export class PushSyncService {
                 }
             }
         }
+    }
+
+    async syncInsuranceProviders(
+        syncRunId: string | null,
+        client: DocplannerClient,
+        clinicId: string,
+        facilityId: string,
+        doctorId: string,
+        addressId: string,
+        doctorName: string
+    ): Promise<{ added: number; removed: number; unchanged: number }> {
+        const result = { added: 0, removed: 0, unchanged: 0 };
+
+        const linkedInsuranceMappings = await this.prisma.mapping.findMany({
+            where: { clinicId, entityType: 'INSURANCE', status: 'LINKED', externalId: { not: null } },
+        });
+
+        if (linkedInsuranceMappings.length === 0) {
+            this.logger.debug(`Doctor ${doctorName}: no linked insurance mappings to sync`);
+            return result;
+        }
+
+        const desiredProviderIds = new Set(linkedInsuranceMappings.map(m => String(m.externalId)));
+
+        let currentProviders: any[] = [];
+        try {
+            const res = await client.getAddressInsuranceProviders(facilityId, doctorId, addressId);
+            currentProviders = res._items || [];
+        } catch (error: any) {
+            this.logger.warn(`Doctor ${doctorName}: failed to fetch current insurance providers for address ${addressId}: ${error.message}`);
+            return result;
+        }
+
+        const currentProviderIds = new Set(currentProviders.map((p: any) => String(p.insurance_provider_id || p.id)));
+
+        const toAdd = [...desiredProviderIds].filter(id => !currentProviderIds.has(id));
+        const toRemove = [...currentProviderIds].filter(id => !desiredProviderIds.has(id));
+
+        for (const providerId of toAdd) {
+            try {
+                await client.addAddressInsuranceProvider(facilityId, doctorId, addressId, providerId);
+                result.added++;
+                this.logger.log(`Doctor ${doctorName}: [INS] Added insurance provider ${providerId} to address ${addressId}`);
+            } catch (error: any) {
+                if (error?.status === 400 && error?.message?.includes('already assigned')) {
+                    result.unchanged++;
+                    this.logger.debug(`Doctor ${doctorName}: insurance provider ${providerId} already on address ${addressId}`);
+                } else {
+                    this.logger.warn(`Doctor ${doctorName}: [INS FAILED] Failed to add insurance provider ${providerId}: ${error.message}`);
+                }
+            }
+        }
+
+        for (const providerId of toRemove) {
+            try {
+                await client.deleteAddressInsuranceProvider(facilityId, doctorId, addressId, providerId);
+                result.removed++;
+                this.logger.log(`Doctor ${doctorName}: [INS] Removed insurance provider ${providerId} from address ${addressId}`);
+            } catch (error: any) {
+                this.logger.warn(`Doctor ${doctorName}: [INS FAILED] Failed to remove insurance provider ${providerId}: ${error.message}`);
+            }
+        }
+
+        result.unchanged += [...desiredProviderIds].filter(id => currentProviderIds.has(id)).length;
+
+        if (result.added > 0 || result.removed > 0) {
+            const msg = `Doctor ${doctorName}: Insurance sync - added ${result.added}, removed ${result.removed}, unchanged ${result.unchanged}`;
+            this.logger.log(msg);
+            if (syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'synced', msg);
+        }
+
+        return result;
     }
 
     private async logEvent(syncRunId: string, entityType: string, action: string, message: string) {
