@@ -21,7 +21,21 @@ export class SyncService {
         private pushSync: PushSyncService
     ) { }
 
+    private async isQueuePaused(clinicId: string): Promise<boolean> {
+        const connections = await this.prisma.integrationConnection.findMany({
+            where: { clinicId, provider: { in: ['doctoralia', 'vismed'] } },
+            select: { status: true },
+        });
+        return connections.some(c => c.status === 'paused');
+    }
+
     async triggerManualSync(clinicId: string, type: 'full' | 'doctors' | 'services' | 'vismed-full' = 'full', idEmpresaGestora?: number) {
+        const paused = await this.isQueuePaused(clinicId);
+        if (paused) {
+            this.logger.warn(`Sync queue is paused for clinic ${clinicId}, rejecting ${type} sync`);
+            return { id: null, status: 'rejected', reason: 'Queue is paused' };
+        }
+
         await this.prisma.auditLog.create({
             data: {
                 action: 'MANUAL_SYNC_TRIGGERED',

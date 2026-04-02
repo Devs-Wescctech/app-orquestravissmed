@@ -76,6 +76,7 @@ Both pipelines attempt BullMQ queue dispatch first, then fall back to direct inl
 - **Push-sync integration**: After services delta sync, automatically syncs insurance providers (step 4) and slots (step 5) for all doctors. Slots are always evaluated — doctors with turnos get slots pushed, doctors without turnos get a skip event logged.
 - **Insurance push sync**: Compares LINKED insurance mappings in DB with current providers on Doctoralia per address. Adds missing, removes extra. Endpoints: `POST /sync/:clinicId/insurance` (all doctors), `GET /sync/:clinicId/insurance/:doctoraliaDoctorId` (single doctor).
 - **Sync status dashboard**: `GET /sync/:clinicId/status` returns health status (healthy/warning/error/never_synced), doctor counts (clinic-scoped), insurance breakdown (linked/pending/unlinked), and recent runs. Frontend `/sync` page shows status-based dashboard with auto-polling (3s when syncing, 15s idle).
+- **Queue toggle**: `POST /sync/:clinicId/queue/toggle { enabled: bool }` pauses/resumes sync by setting `IntegrationConnection.status` to `paused`/`connected`. Only transitions paused↔connected (preserves other states). Validates boolean input. `triggerManualSync` and `triggerGlobalSync` check queue status and reject syncs when paused.
 - **Frontend**: Mapping page shows turno badges (M/T/N with times), "Sync Slots" button per professional, calendar toggle.
 
 ## Multi-Tenant Security

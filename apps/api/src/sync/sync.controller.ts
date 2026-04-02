@@ -1,4 +1,4 @@
-import { Controller, Post, Param, UseGuards, Get, Body, Request, Query, NotFoundException, ForbiddenException } from '@nestjs/common';
+import { Controller, Post, Param, UseGuards, Get, Body, Request, Query, NotFoundException, ForbiddenException, BadRequestException } from '@nestjs/common';
 import { SyncService } from './sync.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
@@ -149,9 +149,39 @@ export class SyncController {
         else if (lastFailed && lastCompleted && new Date(lastFailed.startedAt) > new Date(lastCompleted.startedAt)) overallHealth = 'error';
         else if (pendingInsurance > 0 || unlinkedInsurance > 0) overallHealth = 'warning';
 
+        const [vismedStats, doctoraliaConn, vismedConn] = await Promise.all([
+            Promise.all([
+                this.prisma.vismedUnit.count(),
+                this.prisma.vismedDoctor.count(),
+                this.prisma.vismedSpecialty.count(),
+                this.prisma.vismedInsurance.count(),
+            ]).then(([units, doctors, specialties, insurances]) => ({ units, doctors, specialties, insurances })),
+            this.prisma.integrationConnection.findFirst({ where: { clinicId, provider: 'doctoralia' } }),
+            this.prisma.integrationConnection.findFirst({ where: { clinicId, provider: 'vismed' } }),
+        ]);
+
+        const doctoraliaConnected = doctoraliaConn?.status === 'connected';
+        const vismedConnected = vismedConn?.status === 'connected';
+        const queueEnabled = doctoraliaConn?.status !== 'paused' && vismedConn?.status !== 'paused';
+
+        const allHistoryRuns = await this.prisma.syncRun.findMany({
+            where: { clinicId },
+            orderBy: { startedAt: 'desc' },
+            take: 10,
+            select: { id: true, type: true, status: true, startedAt: true, endedAt: true, totalRecords: true },
+        });
+
+        const lastVismedRun = allHistoryRuns.find(r => r.type === 'vismed-full');
+        const lastDoctoraliaRun = allHistoryRuns.find(r => r.type === 'full' && r.status === 'completed');
+
+        const successCount = allHistoryRuns.filter(r => r.status === 'completed').length;
+        const successRate = allHistoryRuns.length > 0 ? Math.round((successCount / allHistoryRuns.length) * 100) : 0;
+
         return {
             health: overallHealth,
             isRunning,
+            queueEnabled,
+            successRate,
             lastSync: lastCompleted ? {
                 id: lastCompleted.id,
                 startedAt: lastCompleted.startedAt,
@@ -165,15 +195,58 @@ export class SyncController {
             } : null,
             doctors: { mapped: doctorMappings },
             insurance: { linked: linkedInsurance, pending: pendingInsurance, unlinked: unlinkedInsurance, total: insuranceMappings.length },
-            recentRuns: lastRuns.map(r => ({
-                id: r.id,
-                type: r.type,
-                status: r.status,
-                startedAt: r.startedAt,
-                endedAt: r.endedAt,
-                totalRecords: r.totalRecords,
-            })),
+            vismed: {
+                connected: vismedConnected,
+                stats: vismedStats,
+                lastSync: lastVismedRun ? { startedAt: lastVismedRun.startedAt, endedAt: lastVismedRun.endedAt, status: lastVismedRun.status, totalRecords: lastVismedRun.totalRecords } : null,
+            },
+            doctoralia: {
+                connected: doctoraliaConnected,
+                lastSync: lastDoctoraliaRun ? { startedAt: lastDoctoraliaRun.startedAt, endedAt: lastDoctoraliaRun.endedAt, status: lastDoctoraliaRun.status, totalRecords: lastDoctoraliaRun.totalRecords } : null,
+            },
+            recentRuns: allHistoryRuns,
         };
+    }
+
+    @ApiOperation({ summary: 'Toggle sync queue (pause/resume)' })
+    @Post(':clinicId/queue/toggle')
+    async toggleSyncQueue(
+        @Param('clinicId') clinicId: string,
+        @Body('enabled') enabled: boolean,
+        @Request() req?: any,
+    ) {
+        this.validateUserClinicAccess(req?.user, clinicId);
+
+        if (typeof enabled !== 'boolean') {
+            throw new BadRequestException('Field "enabled" must be a boolean');
+        }
+
+        const connections = await this.prisma.integrationConnection.findMany({
+            where: { clinicId, provider: { in: ['doctoralia', 'vismed'] } },
+        });
+
+        if (connections.length === 0) {
+            throw new NotFoundException('No integration connections found for this clinic');
+        }
+
+        let updatedCount = 0;
+        for (const conn of connections) {
+            if (enabled && conn.status === 'paused') {
+                await this.prisma.integrationConnection.update({
+                    where: { id: conn.id },
+                    data: { status: 'connected' },
+                });
+                updatedCount++;
+            } else if (!enabled && conn.status !== 'paused') {
+                await this.prisma.integrationConnection.update({
+                    where: { id: conn.id },
+                    data: { status: 'paused' },
+                });
+                updatedCount++;
+            }
+        }
+
+        return { enabled, updated: updatedCount };
     }
 
     @ApiOperation({ summary: 'Sync slots for a single doctor based on VisMed shifts' })
