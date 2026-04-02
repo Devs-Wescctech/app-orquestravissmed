@@ -78,7 +78,7 @@ export class DocplannerClient {
             this.logger.verbose(`Calling Docplanner API: ${method} ${url}`);
             const response = await fetch(url, options);
 
-            if (method === 'PUT') {
+            if (method === 'PUT' || method === 'PATCH') {
                 this.logger.log(`API Response: ${method} ${path} → status=${response.status}, content-type=${response.headers.get('content-type')}`);
             }
 
@@ -219,20 +219,24 @@ export class DocplannerClient {
 
     async enableCalendar(facilityId: string, doctorId: string, addressId: string): Promise<any> {
         const addr = await this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}`);
-        this.logger.log(`enableCalendar: address ${addressId}, sending booking_type=integration`);
-        return this.request('PATCH', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}`, {
+        this.logger.log(`enableCalendar: address ${addressId}, current booking_type=${addr.booking_type}, sending booking_type=integration`);
+        const result = await this.request('PATCH', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}`, {
             booking_type: 'integration',
             insurance_support: addr.insurance_support || 'private',
         });
+        this.logger.log(`enableCalendar: response=${JSON.stringify(result)}`);
+        return result;
     }
 
     async disableCalendar(facilityId: string, doctorId: string, addressId: string): Promise<any> {
         const addr = await this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}`);
-        this.logger.log(`disableCalendar: address ${addressId}, sending booking_type=none`);
-        return this.request('PATCH', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}`, {
+        this.logger.log(`disableCalendar: address ${addressId}, current booking_type=${addr.booking_type}, sending booking_type=none`);
+        const result = await this.request('PATCH', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}`, {
             booking_type: 'none',
             insurance_support: addr.insurance_support || 'private',
         });
+        this.logger.log(`disableCalendar: response=${JSON.stringify(result)}`);
+        return result;
     }
 
     async getCalendar(facilityId: string, doctorId: string, addressId: string): Promise<any> {
