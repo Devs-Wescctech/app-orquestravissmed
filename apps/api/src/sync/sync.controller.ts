@@ -223,6 +223,58 @@ export class SyncController {
         return { doctoraliaDoctorId, results };
     }
 
+    @ApiOperation({ summary: 'Debug: check real Doctoralia calendar state for a doctor' })
+    @Get(':clinicId/calendar/:doctoraliaDoctorId/debug')
+    async debugCalendar(
+        @Param('clinicId') clinicId: string,
+        @Param('doctoraliaDoctorId') doctoraliaDoctorId: string,
+        @Request() req?: any,
+    ) {
+        this.validateUserClinicAccess(req?.user, clinicId);
+        const dDoc = await this.validateDoctoraliaDoctorBelongsToClinic(doctoraliaDoctorId, clinicId);
+        const client = await this.getDoctoraliaClient(clinicId);
+
+        const addrsRes = await client.getAddresses(dDoc.doctoraliaFacilityId, doctoraliaDoctorId);
+        const addresses = addrsRes._items || [];
+
+        const results: any[] = [];
+        for (const addr of addresses) {
+            const addrId = String(addr.id);
+            let addrDetail: any = null;
+            let services: any = null;
+            let slots: any = null;
+
+            try {
+                addrDetail = await client.getCalendar(dDoc.doctoraliaFacilityId, doctoraliaDoctorId, addrId);
+            } catch (e: any) { addrDetail = { error: e.message }; }
+
+            try {
+                const svcRes = await client.getServices(dDoc.doctoraliaFacilityId, doctoraliaDoctorId, addrId);
+                services = svcRes._items || svcRes;
+            } catch (e: any) { services = { error: e.message }; }
+
+            try {
+                const tomorrow = new Date();
+                tomorrow.setDate(tomorrow.getDate() + 1);
+                const nextWeek = new Date();
+                nextWeek.setDate(nextWeek.getDate() + 7);
+                const startStr = tomorrow.toISOString().split('T')[0] + 'T00:00:00-03:00';
+                const endStr = nextWeek.toISOString().split('T')[0] + 'T23:59:59-03:00';
+                slots = await client.getSlots(dDoc.doctoraliaFacilityId, doctoraliaDoctorId, addrId, startStr, endStr);
+            } catch (e: any) { slots = { error: e.message }; }
+
+            results.push({
+                addressId: addrId,
+                addressName: addr.name,
+                addressDetail: addrDetail,
+                services,
+                slotsNextWeek: slots,
+            });
+        }
+
+        return { doctoraliaDoctorId, facilityId: dDoc.doctoraliaFacilityId, addresses: results };
+    }
+
     private async updateCalendarStatusInMapping(clinicId: string, doctoraliaDoctorInternalId: string, status: string) {
         try {
             const unifiedMapping = await this.prisma.professionalUnifiedMapping.findFirst({

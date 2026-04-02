@@ -78,6 +78,10 @@ export class DocplannerClient {
             this.logger.verbose(`Calling Docplanner API: ${method} ${url}`);
             const response = await fetch(url, options);
 
+            if (method === 'PUT') {
+                this.logger.log(`API Response: ${method} ${path} → status=${response.status}, content-type=${response.headers.get('content-type')}`);
+            }
+
             if (!response.ok) {
                 const errorText = await response.text();
                 this.logger.error(`Docplanner API Error: ${response.status} ${errorText} URL: ${url}`);
@@ -168,19 +172,23 @@ export class DocplannerClient {
     }
 
     async getBookings(facilityId: string, doctorId: string, addressId: string, start: string, end: string): Promise<any> {
-        const s = start.includes('T') ? start : `${start}T00:00:00-0300`;
-        const e = end.includes('T') ? end : `${end}T23:59:59-0300`;
+        const s = start.includes('T') ? start : `${start}T00:00:00-03:00`;
+        const e = end.includes('T') ? end : `${end}T23:59:59-03:00`;
         return this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/bookings?start=${encodeURIComponent(s)}&end=${encodeURIComponent(e)}`);
     }
 
     async getSlots(facilityId: string, doctorId: string, addressId: string, start: string, end: string): Promise<any> {
-        const s = start.includes('T') ? start : `${start}T00:00:00-0300`;
-        const e = end.includes('T') ? end : `${end}T23:59:59-0300`;
+        const s = start.includes('T') ? start : `${start}T00:00:00-03:00`;
+        const e = end.includes('T') ? end : `${end}T23:59:59-03:00`;
         return this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/slots?start=${encodeURIComponent(s)}&end=${encodeURIComponent(e)}`);
     }
 
     async replaceSlots(facilityId: string, doctorId: string, addressId: string, payload: any): Promise<any> {
-        return this.request('PUT', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/slots`, payload);
+        const slotCount = payload?.slots?.length || 0;
+        this.logger.log(`replaceSlots: sending ${slotCount} slots for doctor ${doctorId}, address ${addressId}`);
+        const result = await this.request('PUT', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/slots`, payload);
+        this.logger.log(`replaceSlots: response=${JSON.stringify(result)}`);
+        return result;
     }
 
     async bookSlot(facilityId: string, doctorId: string, addressId: string, payload: any): Promise<any> {

@@ -44,24 +44,41 @@ export class SlotSyncService {
         return { start, end };
     }
 
-    buildDaySlots(date: string, turnoM: string | null, turnoT: string | null, turnoN: string | null, addressServiceIds: number[], timezone: string = '-0300'): any[] {
+    buildDaySlots(date: string, turnoM: string | null, turnoT: string | null, turnoN: string | null, addressServiceIds: number[], timezone: string = '-03:00', slotDurationMinutes: number = 30): any[] {
         const slots: any[] = [];
         const turnos = [turnoM, turnoT, turnoN];
+
+        const uniqueServiceIds = [...new Set(addressServiceIds)];
+        if (uniqueServiceIds.length === 0) return slots;
 
         for (const turno of turnos) {
             const parsed = this.parseTurno(turno);
             if (!parsed) continue;
 
-            if (addressServiceIds.length === 0) continue;
+            const [startH, startM] = parsed.start.split(':').map(Number);
+            const [endH, endM] = parsed.end.split(':').map(Number);
+            const startMinutes = startH * 60 + startM;
+            const endMinutes = endH * 60 + endM;
 
-            slots.push({
-                start: `${date}T${parsed.start}:00${timezone}`,
-                end: `${date}T${parsed.end}:00${timezone}`,
-                address_services: addressServiceIds.map(id => ({
-                    address_service_id: id,
-                    duration: 30,
-                })),
-            });
+            for (let m = startMinutes; m + slotDurationMinutes <= endMinutes; m += slotDurationMinutes) {
+                const slotStartH = Math.floor(m / 60);
+                const slotStartM = m % 60;
+                const slotEndM_total = m + slotDurationMinutes;
+                const slotEndH = Math.floor(slotEndM_total / 60);
+                const slotEndMin = slotEndM_total % 60;
+
+                const startStr = `${String(slotStartH).padStart(2, '0')}:${String(slotStartM).padStart(2, '0')}`;
+                const endStr = `${String(slotEndH).padStart(2, '0')}:${String(slotEndMin).padStart(2, '0')}`;
+
+                slots.push({
+                    start: `${date}T${startStr}:00${timezone}`,
+                    end: `${date}T${endStr}:00${timezone}`,
+                    address_services: uniqueServiceIds.map(id => ({
+                        address_service_id: id,
+                        duration: slotDurationMinutes,
+                    })),
+                });
+            }
         }
         return slots;
     }
@@ -197,7 +214,15 @@ export class SlotSyncService {
                 }
             }
 
-            const addressServiceIds = addressServices.map((s: any) => Number(s.id));
+            const seenServiceIds = new Set<string>();
+            const deduplicatedServices = addressServices.filter((s: any) => {
+                const key = String(s.service_id || s.id);
+                if (seenServiceIds.has(key)) return false;
+                seenServiceIds.add(key);
+                return true;
+            });
+            const addressServiceIds = deduplicatedServices.map((s: any) => Number(s.id));
+            this.logger.log(`Doctor ${doctor.name} address ${addrId}: using ${addressServiceIds.length} unique address_service_ids (from ${addressServices.length} total): ${addressServiceIds.join(', ')}`);
 
             const allSlots: any[] = [];
             for (const date of dates) {
@@ -208,7 +233,22 @@ export class SlotSyncService {
             if (allSlots.length === 0) continue;
 
             try {
-                await client.replaceSlots(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, { slots: allSlots });
+                await client.enableCalendar(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId);
+                this.logger.log(`Doctor ${doctor.name} address ${addrId}: ensured calendar enabled (booking_type=integration)`);
+            } catch (enableErr: any) {
+                const status = enableErr?.status;
+                if (status && status >= 400 && status < 500) {
+                    this.logger.error(`Doctor ${doctor.name} address ${addrId}: calendar enable rejected (${status}): ${enableErr.message} — skipping slot sync for this address`);
+                    addressesFailed++;
+                    continue;
+                }
+                this.logger.warn(`Doctor ${doctor.name} address ${addrId}: transient error enabling calendar: ${enableErr.message} — proceeding with slot sync`);
+            }
+
+            try {
+                this.logger.log(`Doctor ${doctor.name}: sending ${allSlots.length} slots to address ${addrId}. Sample slot: ${JSON.stringify(allSlots[0])}`);
+                const putResponse = await client.replaceSlots(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, { slots: allSlots });
+                this.logger.log(`Doctor ${doctor.name}: PUT slots response: ${JSON.stringify(putResponse)}`);
                 totalSlots += allSlots.length;
                 this.logger.log(`Doctor ${doctor.name}: synced ${allSlots.length} slots to address ${addrId} for ${dates.length} days`);
                 if (syncRunId) {

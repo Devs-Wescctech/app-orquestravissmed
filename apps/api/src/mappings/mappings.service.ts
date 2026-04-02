@@ -205,12 +205,12 @@ export class MappingsService {
                 doctoraliaCounterpart: d.unifiedMappings[0]?.doctoraliaDoctor ? {
                     name: d.unifiedMappings[0].doctoraliaDoctor.name,
                     doctoraliaDoctorId: d.unifiedMappings[0].doctoraliaDoctor.doctoraliaDoctorId,
-                    calendarStatus: cd.calendarStatus || 'disabled', // Getting from mapping
+                    calendarStatus: cd.calendarStatus || 'enabled',
                     services: d.unifiedMappings[0].doctoraliaDoctor.addressServices.map(as => as.service?.name).filter(Boolean)
                 } : (doctoraliaDoctorIdFromMapping ? {
                     name: cd.name || d.name,
                     doctoraliaDoctorId: doctoraliaDoctorIdFromMapping,
-                    calendarStatus: cd.calendarStatus || 'disabled',
+                    calendarStatus: cd.calendarStatus || 'enabled',
                     services: []
                 } : null)
             };
