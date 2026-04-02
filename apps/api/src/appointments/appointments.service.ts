@@ -55,16 +55,37 @@ export class AppointmentsService {
                 where: { clinicId, entityType: 'DOCTOR', status: 'LINKED' },
             });
 
-            const doctors = mappings.map(m => {
-                const cd = m.conflictData as any || {};
-                return {
+            const client = this.docplanner.createClient(conn.domain || 'doctoralia.com.br', conn.clientId, conn.clientSecret || '');
+
+            let facilityId: string | null = null;
+            const needsEnrich = mappings.some(m => {
+                const c = m.conflictData as any || {};
+                return (!c.facilityId || !c.address?.id) && m.externalId;
+            });
+            if (needsEnrich) {
+                facilityId = await this.resolveFacilityId(client);
+            }
+
+            const doctors: any[] = [];
+            for (const m of mappings) {
+                let cd = m.conflictData as any || {};
+
+                if ((!cd.facilityId || !cd.address?.id) && m.externalId && facilityId) {
+                    cd = await this.enrichDoctorData(m, cd, client, facilityId, m.externalId);
+                }
+
+                if ((!cd.calendarStatus || cd.calendarStatus === 'unknown') && cd.facilityId && cd.address?.id) {
+                    cd = await this.refreshCalendarStatus(m, cd, client, m.externalId);
+                }
+
+                doctors.push({
                     externalId: m.externalId,
                     name: `${cd.name || ''} ${cd.surname || ''}`.trim(),
                     calendarStatus: cd.calendarStatus || 'unknown',
                     addressId: cd.address?.id || null,
                     facilityId: cd.facilityId || null,
-                };
-            });
+                });
+            }
 
             const hasAnyEnabled = doctors.some(d => d.calendarStatus === 'enabled');
 
@@ -91,6 +112,75 @@ export class AppointmentsService {
         }
     }
 
+    // ────────────────────── Resolve Facility ID ──────────────────────
+
+    private async resolveFacilityId(client: any): Promise<string | null> {
+        try {
+            const facRes = await client.getFacilities();
+            const facs = facRes._items || [];
+            return facs.length > 0 ? String(facs[0].id) : null;
+        } catch (e: any) {
+            this.logger.warn(`Failed to resolve facilityId: ${e.message}`);
+            return null;
+        }
+    }
+
+    // ────────────────────── Enrich Doctor Data from Doctoralia ──────────────────────
+
+    private async enrichDoctorData(mapping: any, cd: any, client: any, facilityId: string, doctorExternalId: string): Promise<any> {
+        try {
+            const addrRes = await client.getAddresses(facilityId, doctorExternalId);
+            const addresses = addrRes._items || [];
+            if (addresses.length === 0) return cd;
+
+            const addr = addresses[0];
+            const updatedCd = {
+                ...cd,
+                facilityId,
+                address: {
+                    id: addr.id,
+                    name: addr.name,
+                    city: addr.city_name,
+                    street: addr.street,
+                    postCode: addr.post_code,
+                },
+            };
+
+            await this.prisma.mapping.update({
+                where: { id: mapping.id },
+                data: { conflictData: updatedCd as any, updatedAt: new Date() },
+            });
+
+            this.logger.log(`Enriched doctor ${doctorExternalId} with facilityId=${facilityId}, addressId=${addr.id}`);
+            return updatedCd;
+        } catch (e: any) {
+            this.logger.warn(`Failed to enrich doctor ${doctorExternalId}: ${e.message}`);
+            return cd;
+        }
+    }
+
+    // ────────────────────── Refresh Calendar Status from Doctoralia ──────────────────────
+
+    private async refreshCalendarStatus(mapping: any, cd: any, client: any, doctorExternalId: string): Promise<any> {
+        if (!cd.facilityId || !cd.address?.id) return cd;
+
+        try {
+            const calRes = await client.getCalendar(cd.facilityId, doctorExternalId, String(cd.address.id));
+            const status = calRes?.status || 'unknown';
+            this.logger.log(`Refreshed calendarStatus for doctor ${doctorExternalId}: ${status}`);
+
+            const updatedCd = { ...cd, calendarStatus: status };
+            await this.prisma.mapping.update({
+                where: { id: mapping.id },
+                data: { conflictData: updatedCd as any, updatedAt: new Date() },
+            });
+            return updatedCd;
+        } catch (e: any) {
+            this.logger.warn(`Failed to refresh calendar status for doctor ${doctorExternalId}: ${e.message}`);
+            return cd;
+        }
+    }
+
     // ────────────────────── Bookings ──────────────────────
 
     async getBookings(clinicId: string, doctorExternalId: string, start: string, end: string) {
@@ -112,20 +202,29 @@ export class AppointmentsService {
             return { bookings: [], error: 'Médico não encontrado' };
         }
 
-        const cd = mapping.conflictData as any || {};
+        let cd = mapping.conflictData as any || {};
+        const client = this.docplanner.createClient(conn.domain || 'doctoralia.com.br', conn.clientId, conn.clientSecret || '');
 
-        // Feature-flag: block when calendar disabled
-        if (cd.calendarStatus !== 'enabled') {
+        if (!cd.facilityId || !cd.address?.id) {
+            const facilityId = await this.resolveFacilityId(client);
+            if (facilityId) {
+                cd = await this.enrichDoctorData(mapping, cd, client, facilityId, doctorExternalId);
+            }
+            if (!cd.facilityId || !cd.address?.id) {
+                return { bookings: [], error: 'Dados de endereço incompletos. Execute uma sincronização com enriquecimento.' };
+            }
+        }
+
+        if (!cd.calendarStatus || cd.calendarStatus === 'unknown') {
+            cd = await this.refreshCalendarStatus(mapping, cd, client, doctorExternalId);
+        }
+
+        if (cd.calendarStatus === 'disabled') {
             await this.logRequest({ clinicId, action: 'FETCH_BOOKINGS', doctorId: doctorExternalId, start, end, durationMs: Date.now() - startTime, status: 'blocked', error: 'Calendar desabilitado' });
             return { bookings: [], calendarStatus: cd.calendarStatus, blocked: true, error: 'Calendar desabilitado para este médico' };
         }
 
-        if (!cd.facilityId || !cd.address?.id) {
-            return { bookings: [], error: 'Dados de endereço incompletos. Execute uma sincronização com enriquecimento.' };
-        }
-
         try {
-            const client = this.docplanner.createClient(conn.domain || 'doctoralia.com.br', conn.clientId, conn.clientSecret || '');
             const bookingsRes = await client.getBookings(cd.facilityId, doctorExternalId, cd.address.id, start, end);
 
             await this.logRequest({ clinicId, action: 'FETCH_BOOKINGS', doctorId: doctorExternalId, start, end, durationMs: Date.now() - startTime, status: 'success' });
@@ -171,19 +270,29 @@ export class AppointmentsService {
             return { slots: [], error: 'Médico não encontrado' };
         }
 
-        const cd = mapping.conflictData as any || {};
+        let cd = mapping.conflictData as any || {};
+        const client = this.docplanner.createClient(conn.domain || 'doctoralia.com.br', conn.clientId, conn.clientSecret || '');
 
-        if (cd.calendarStatus !== 'enabled') {
+        if (!cd.facilityId || !cd.address?.id) {
+            const facilityId = await this.resolveFacilityId(client);
+            if (facilityId) {
+                cd = await this.enrichDoctorData(mapping, cd, client, facilityId, doctorExternalId);
+            }
+            if (!cd.facilityId || !cd.address?.id) {
+                return { slots: [], error: 'Dados de endereço incompletos.' };
+            }
+        }
+
+        if (!cd.calendarStatus || cd.calendarStatus === 'unknown') {
+            cd = await this.refreshCalendarStatus(mapping, cd, client, doctorExternalId);
+        }
+
+        if (cd.calendarStatus === 'disabled') {
             await this.logRequest({ clinicId, action: 'FETCH_SLOTS', doctorId: doctorExternalId, start, end, durationMs: Date.now() - startTime, status: 'blocked', error: 'Calendar desabilitado' });
             return { slots: [], calendarStatus: cd.calendarStatus, blocked: true, error: 'Calendar desabilitado para este médico' };
         }
 
-        if (!cd.facilityId || !cd.address?.id) {
-            return { slots: [], error: 'Dados de endereço incompletos.' };
-        }
-
         try {
-            const client = this.docplanner.createClient(conn.domain || 'doctoralia.com.br', conn.clientId, conn.clientSecret || '');
             const slotsRes = await client.getSlots(cd.facilityId, doctorExternalId, cd.address.id, start, end);
 
             await this.logRequest({ clinicId, action: 'FETCH_SLOTS', doctorId: doctorExternalId, start, end, durationMs: Date.now() - startTime, status: 'success' });
@@ -333,7 +442,12 @@ export class AppointmentsService {
         const client = this.docplanner.createClient(conn.domain || 'doctoralia.com.br', conn.clientId, conn.clientSecret || '');
 
         for (const m of mappings) {
-            const cd = m.conflictData as any || {};
+            let cd = m.conflictData as any || {};
+
+            if ((!cd.calendarStatus || cd.calendarStatus === 'unknown') && cd.facilityId && cd.address?.id) {
+                cd = await this.refreshCalendarStatus(m, cd, client, m.externalId);
+            }
+
             if (cd.calendarStatus === 'enabled' && cd.facilityId && cd.address?.id) {
                 calendarEnabled = true;
                 try {
