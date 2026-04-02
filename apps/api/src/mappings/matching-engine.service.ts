@@ -196,7 +196,7 @@ export class MatchingEngineService {
         const exactMatch = dProviders.find(p => this.normalizeString(p.name) === normInsurance);
         if (exactMatch) {
             await this.linkInsuranceMapping(vismedInsuranceId, exactMatch);
-            this.logger.log(`Insurance exact match: "${insurance.name}" → "${exactMatch.name}" (doctoraliaId: ${exactMatch.doctoraliaId})`);
+            this.logger.log(`Insurance exact match (100%): "${insurance.name}" → "${exactMatch.name}" (doctoraliaId: ${exactMatch.doctoraliaId}) — AUTO-LINKED`);
             return true;
         }
 
@@ -206,8 +206,8 @@ export class MatchingEngineService {
             return normP.includes(normInsurance) || normInsurance.includes(normP);
         });
         if (containsMatch) {
-            await this.linkInsuranceMapping(vismedInsuranceId, containsMatch);
-            this.logger.log(`Insurance contains match: "${insurance.name}" → "${containsMatch.name}"`);
+            await this.pendingReviewInsuranceMapping(vismedInsuranceId, containsMatch, 0.90);
+            this.logger.log(`Insurance contains match (~90%): "${insurance.name}" → "${containsMatch.name}" — PENDING MANUAL REVIEW`);
             return true;
         }
 
@@ -243,15 +243,9 @@ export class MatchingEngineService {
                 }
             }
 
-            if (bestTokenMatch && bestTokenScore >= 0.75) {
-                await this.linkInsuranceMapping(vismedInsuranceId, bestTokenMatch);
-                this.logger.log(`Insurance token match: "${insurance.name}" → "${bestTokenMatch.name}" (score: ${bestTokenScore.toFixed(2)})`);
-                return true;
-            }
-
             if (bestTokenMatch && bestTokenScore >= 0.55) {
                 await this.pendingReviewInsuranceMapping(vismedInsuranceId, bestTokenMatch, bestTokenScore);
-                this.logger.log(`Insurance token pending review: "${insurance.name}" → "${bestTokenMatch.name}" (score: ${bestTokenScore.toFixed(2)})`);
+                this.logger.log(`Insurance token match (${(bestTokenScore * 100).toFixed(0)}%): "${insurance.name}" → "${bestTokenMatch.name}" — PENDING MANUAL REVIEW`);
                 return true;
             }
         }
@@ -266,14 +260,9 @@ export class MatchingEngineService {
             }
         }
 
-        if (bestMatch && bestScore >= 0.60) {
-            if (bestScore >= 0.70) {
-                await this.linkInsuranceMapping(vismedInsuranceId, bestMatch);
-                this.logger.log(`Insurance fuzzy match: "${insurance.name}" → "${bestMatch.name}" (score: ${bestScore.toFixed(2)})`);
-            } else {
-                await this.pendingReviewInsuranceMapping(vismedInsuranceId, bestMatch, bestScore);
-                this.logger.log(`Insurance pending review: "${insurance.name}" → "${bestMatch.name}" (score: ${bestScore.toFixed(2)} < 0.70)`);
-            }
+        if (bestMatch && bestScore >= 0.50) {
+            await this.pendingReviewInsuranceMapping(vismedInsuranceId, bestMatch, bestScore);
+            this.logger.log(`Insurance fuzzy match (${(bestScore * 100).toFixed(0)}%): "${insurance.name}" → "${bestMatch.name}" — PENDING MANUAL REVIEW`);
             return true;
         }
 
@@ -386,12 +375,12 @@ export class MatchingEngineService {
         // --- INSURANCE / CONVÊNIOS ---
         let newInsCount = 0;
         const unmatchedInsurances = await this.prisma.vismedInsurance.findMany();
-        const linkedInsIds = (await this.prisma.mapping.findMany({
-            where: { entityType: 'INSURANCE', status: 'LINKED' },
+        const alreadyProcessedInsIds = (await this.prisma.mapping.findMany({
+            where: { entityType: 'INSURANCE', status: { in: ['LINKED', 'PENDING_REVIEW'] } },
             select: { vismedId: true }
         })).map(m => m.vismedId).filter(Boolean);
 
-        const insurancesToMatch = unmatchedInsurances.filter(i => !linkedInsIds.includes(i.id));
+        const insurancesToMatch = unmatchedInsurances.filter(i => !alreadyProcessedInsIds.includes(i.id));
 
         if (insurancesToMatch.length === 0) {
             this.logger.log('Nenhum Convênio VisMed Órfão encontrado.');

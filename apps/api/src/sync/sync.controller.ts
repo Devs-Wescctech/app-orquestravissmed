@@ -112,6 +112,70 @@ export class SyncController {
         });
     }
 
+    @ApiOperation({ summary: 'Get overall sync health status for a clinic' })
+    @Get(':clinicId/status')
+    async getSyncStatus(@Param('clinicId') clinicId: string, @Request() req: any) {
+        this.validateUserClinicAccess(req.user, clinicId);
+
+        const lastRuns = await this.prisma.syncRun.findMany({
+            where: { clinicId },
+            orderBy: { startedAt: 'desc' },
+            take: 5,
+            include: { events: true },
+        });
+
+        const lastCompleted = lastRuns.find(r => r.status === 'completed');
+        const isRunning = lastRuns.some(r => r.status === 'running');
+        const lastFailed = lastRuns.find(r => r.status === 'failed');
+
+        const clinicDoctorMappingIds = await this.prisma.mapping.findMany({
+            where: { clinicId, entityType: 'DOCTOR' },
+            select: { vismedId: true },
+        });
+        const clinicVismedIds = clinicDoctorMappingIds.map(m => m.vismedId).filter(Boolean) as string[];
+        const doctorMappings = clinicVismedIds.length > 0
+            ? await this.prisma.professionalUnifiedMapping.count({ where: { isActive: true, vismedDoctorId: { in: clinicVismedIds } } })
+            : 0;
+        const insuranceMappings = await this.prisma.mapping.findMany({
+            where: { clinicId, entityType: 'INSURANCE' },
+            select: { status: true },
+        });
+        const linkedInsurance = insuranceMappings.filter(m => m.status === 'LINKED').length;
+        const pendingInsurance = insuranceMappings.filter(m => m.status === 'PENDING_REVIEW').length;
+        const unlinkedInsurance = insuranceMappings.filter(m => m.status === 'UNLINKED').length;
+
+        let overallHealth: 'healthy' | 'warning' | 'error' | 'never_synced' = 'healthy';
+        if (!lastCompleted) overallHealth = 'never_synced';
+        else if (lastFailed && lastCompleted && new Date(lastFailed.startedAt) > new Date(lastCompleted.startedAt)) overallHealth = 'error';
+        else if (pendingInsurance > 0 || unlinkedInsurance > 0) overallHealth = 'warning';
+
+        return {
+            health: overallHealth,
+            isRunning,
+            lastSync: lastCompleted ? {
+                id: lastCompleted.id,
+                startedAt: lastCompleted.startedAt,
+                endedAt: lastCompleted.endedAt,
+                totalRecords: lastCompleted.totalRecords,
+            } : null,
+            lastError: lastFailed && (!lastCompleted || new Date(lastFailed.startedAt) > new Date(lastCompleted.startedAt)) ? {
+                id: lastFailed.id,
+                startedAt: lastFailed.startedAt,
+                message: lastFailed.events?.find((e: any) => e.action === 'error')?.message || 'Erro desconhecido',
+            } : null,
+            doctors: { mapped: doctorMappings },
+            insurance: { linked: linkedInsurance, pending: pendingInsurance, unlinked: unlinkedInsurance, total: insuranceMappings.length },
+            recentRuns: lastRuns.map(r => ({
+                id: r.id,
+                type: r.type,
+                status: r.status,
+                startedAt: r.startedAt,
+                endedAt: r.endedAt,
+                totalRecords: r.totalRecords,
+            })),
+        };
+    }
+
     @ApiOperation({ summary: 'Sync slots for a single doctor based on VisMed shifts' })
     @Post(':clinicId/slots/:vismedDoctorId')
     async syncSlotsForDoctor(

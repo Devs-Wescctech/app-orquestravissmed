@@ -63,8 +63,8 @@ Both pipelines attempt BullMQ queue dispatch first, then fall back to direct inl
 - **Specialty deduplication**: `getProfessionalMappings` deduplicates specialties per doctor by `normalizedName` to avoid visual duplicates (e.g., "Clinico Geral" vs "Clínico Geral").
 - **Insurance enrichment**: `findAll` for INSURANCE mappings now returns `doctoraliaCounterpart` with name/doctoraliaId from `DoctoraliaInsuranceProvider`.
 - **Specialty stats**: `GET /mappings/specialties/stats` returns totalVismedSpecialties, totalDoctoraliaServices, totalMatched, totalAutoApproved, totalPendingReview, totalUnmatched, coveragePercent.
-- **Manual approval threshold**: Matches (specialties and insurance/convênios) with score < 70% require manual approval. Specialties get `requiresReview=true`, insurance gets `PENDING_REVIEW` status. Approve/reject via `POST /mappings/insurance/approve` and `/reject` (clinic-scoped).
-- **Insurance matching engine**: Uses NON_INSURANCE_PATTERNS to skip payment-type entries, token-based matching with combined score (60% token overlap + 40% dice similarity), auto-links at 0.75+, pending review at 0.55+. Substring matching requires min 4-char tokens to avoid false positives.
+- **Manual approval threshold**: Insurance convênios: ONLY exact name match (100%) auto-links. All other matches (contains, token, fuzzy) go to `PENDING_REVIEW` for manual confirmation. Approve/reject via `POST /mappings/insurance/approve` and `/reject` (clinic-scoped). Re-matching skips both LINKED and PENDING_REVIEW entries.
+- **Insurance matching engine**: Uses NON_INSURANCE_PATTERNS to skip payment-type entries, token-based matching with combined score (60% token overlap + 40% dice similarity). Only exact string match auto-links; contains match goes to PENDING_REVIEW at ~90%, token match at 55%+, fuzzy match at 50%+. Substring matching requires min 4-char tokens to avoid false positives.
 - **Orphan cleanup safety**: `cleanupOrphans` in sync.processor.ts skips orphaning when activeIds is empty (for ALL entity types, not just DOCTOR).
 
 ## Turnos (Work Shifts) Module
@@ -73,7 +73,9 @@ Both pipelines attempt BullMQ queue dispatch first, then fall back to direct inl
 - **SlotSyncService** (`slot-sync.service.ts`): Converts turnoM/T/N into Doctoralia calendar work periods via `replaceSlots` API. Sends work periods (e.g., 08:00-12:00 with duration=30) and lets Docplanner calculate individual bookable slots — per API docs: "Add work periods, not individual slots". Deduplicates address services by `service_id`. Auto-enables calendar before sending; skips address on 4xx enable failure. `deleteSlots` uses `DELETE .../slots/{date}` (per-date, not range query params). `address_service_id` sent as string per API spec.
 - **Calendar Breaks API**: `DocplannerClient` supports `getCalendarBreaks`, `addCalendarBreak`, `moveCalendarBreak`, `deleteCalendarBreak`.
 - **Endpoints**: `POST /sync/:clinicId/slots/:vismedDoctorId` (single), `POST /sync/:clinicId/slots` (all), `GET /sync/shifts/:vismedDoctorId`, `POST /sync/:clinicId/calendar/:doctorId/enable|disable`.
-- **Push-sync integration**: After services delta sync, automatically calls `slotSync.syncSlotsForDoctor` for doctors with turnos.
+- **Push-sync integration**: After services delta sync, automatically syncs insurance providers (step 4) and slots (step 5) for all doctors. Slots are always evaluated — doctors with turnos get slots pushed, doctors without turnos get a skip event logged.
+- **Insurance push sync**: Compares LINKED insurance mappings in DB with current providers on Doctoralia per address. Adds missing, removes extra. Endpoints: `POST /sync/:clinicId/insurance` (all doctors), `GET /sync/:clinicId/insurance/:doctoraliaDoctorId` (single doctor).
+- **Sync status dashboard**: `GET /sync/:clinicId/status` returns health status (healthy/warning/error/never_synced), doctor counts (clinic-scoped), insurance breakdown (linked/pending/unlinked), and recent runs. Frontend `/sync` page shows status-based dashboard with auto-polling (3s when syncing, 15s idle).
 - **Frontend**: Mapping page shows turno badges (M/T/N with times), "Sync Slots" button per professional, calendar toggle.
 
 ## Multi-Tenant Security

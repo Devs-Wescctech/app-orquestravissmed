@@ -121,15 +121,18 @@ export class PushSyncService {
                 await this.syncInsuranceProviders(syncRunId, client, clinicId, dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, dDoc.name);
             }
 
-            // 5. SLOT SYNC (turnos VisMed → slots Doctoralia)
-            if (vDoc.turnoM || vDoc.turnoT || vDoc.turnoN) {
-                try {
+            // 5. SLOT SYNC (turnos VisMed → slots Doctoralia) — always runs
+            try {
+                if (vDoc.turnoM || vDoc.turnoT || vDoc.turnoN) {
                     const slotResult = await this.slotSync.syncSlotsForDoctor(vDoc.id, client, syncRunId, 30);
                     this.logger.log(`Doctor ${dDoc.name}: [SLOTS] ${slotResult.message}`);
-                } catch (error: any) {
-                    this.logger.warn(`Doctor ${dDoc.name}: [SLOTS FAILED] ${error.message}`);
-                    await this.logEvent(syncRunId, 'SLOT_SYNC', 'error', `Doctor ${dDoc.name}: Falha no sync de slots - ${error.message}`);
+                } else {
+                    this.logger.warn(`Doctor ${dDoc.name}: [SLOTS] No shifts configured in VisMed, skipping slot generation.`);
+                    await this.logEvent(syncRunId, 'SLOT_SYNC', 'skipped', `Doctor ${dDoc.name}: Sem turnos configurados no VisMed`);
                 }
+            } catch (error: any) {
+                this.logger.warn(`Doctor ${dDoc.name}: [SLOTS FAILED] ${error.message}`);
+                await this.logEvent(syncRunId, 'SLOT_SYNC', 'error', `Doctor ${dDoc.name}: Falha no sync de slots - ${error.message}`);
             }
         }
 
