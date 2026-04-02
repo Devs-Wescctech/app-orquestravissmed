@@ -130,7 +130,7 @@ export class DocplannerClient {
     }
 
     async getCalendarStatus(facilityId: string, doctorId: string, addressId: string): Promise<any> {
-        return this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/calendar-status`);
+        return this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/calendar`);
     }
 
     async getInsurances(facilityId: string): Promise<any> {
