@@ -178,7 +178,12 @@ export class SyncController {
                 results.push({ addressId: addr.id, status: 'enabled' });
                 anySuccess = true;
             } catch (e: any) {
-                results.push({ addressId: addr.id, status: 'error', message: e.message });
+                if (e.status === 409) {
+                    results.push({ addressId: addr.id, status: 'enabled', note: 'already enabled' });
+                    anySuccess = true;
+                } else {
+                    results.push({ addressId: addr.id, status: 'error', message: e.message });
+                }
             }
         }
 
@@ -212,7 +217,12 @@ export class SyncController {
                 results.push({ addressId: addr.id, status: 'disabled' });
                 anySuccess = true;
             } catch (e: any) {
-                results.push({ addressId: addr.id, status: 'error', message: e.message });
+                if (e.status === 409) {
+                    results.push({ addressId: addr.id, status: 'disabled', note: 'already disabled' });
+                    anySuccess = true;
+                } else {
+                    results.push({ addressId: addr.id, status: 'error', message: e.message });
+                }
             }
         }
 
@@ -240,13 +250,15 @@ export class SyncController {
         const results: any[] = [];
         for (const addr of addresses) {
             const addrId = String(addr.id);
-            let addrDetail: any = null;
+            let calendarStatus: any = null;
             let services: any = null;
             let slots: any = null;
 
             try {
-                addrDetail = await client.getCalendar(dDoc.doctoraliaFacilityId, doctoraliaDoctorId, addrId);
-            } catch (e: any) { addrDetail = { error: e.message }; }
+                calendarStatus = await client.getCalendar(dDoc.doctoraliaFacilityId, doctoraliaDoctorId, addrId);
+            } catch (e: any) {
+                calendarStatus = { error: e.message, status: e.status };
+            }
 
             try {
                 const svcRes = await client.getServices(dDoc.doctoraliaFacilityId, doctoraliaDoctorId, addrId);
@@ -266,7 +278,7 @@ export class SyncController {
             results.push({
                 addressId: addrId,
                 addressName: addr.name,
-                addressDetail: addrDetail,
+                calendarStatus,
                 services,
                 slotsNextWeek: slots,
             });

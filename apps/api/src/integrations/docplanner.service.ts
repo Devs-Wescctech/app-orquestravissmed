@@ -105,7 +105,9 @@ export class DocplannerClient {
                 return { ...(body || {}), _location: location, _status: 201 };
             }
 
-            return await response.json();
+            const text = await response.text();
+            if (!text || !text.trim()) return null;
+            try { return JSON.parse(text); } catch { return null; }
         } finally {
             clearTimeout(timeout);
         }
@@ -218,29 +220,21 @@ export class DocplannerClient {
     }
 
     async enableCalendar(facilityId: string, doctorId: string, addressId: string): Promise<any> {
-        const addr = await this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}`);
-        this.logger.log(`enableCalendar: address ${addressId}, current booking_type=${addr.booking_type}, sending booking_type=integration`);
-        const result = await this.request('PATCH', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}`, {
-            booking_type: 'integration',
-            insurance_support: addr.insurance_support || 'private',
-        });
+        this.logger.log(`enableCalendar: POST .../addresses/${addressId}/calendar/enable`);
+        const result = await this.request('POST', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/calendar/enable`);
         this.logger.log(`enableCalendar: response=${JSON.stringify(result)}`);
         return result;
     }
 
     async disableCalendar(facilityId: string, doctorId: string, addressId: string): Promise<any> {
-        const addr = await this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}`);
-        this.logger.log(`disableCalendar: address ${addressId}, current booking_type=${addr.booking_type}, sending booking_type=none`);
-        const result = await this.request('PATCH', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}`, {
-            booking_type: 'none',
-            insurance_support: addr.insurance_support || 'private',
-        });
+        this.logger.log(`disableCalendar: POST .../addresses/${addressId}/calendar/disable`);
+        const result = await this.request('POST', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/calendar/disable`);
         this.logger.log(`disableCalendar: response=${JSON.stringify(result)}`);
         return result;
     }
 
     async getCalendar(facilityId: string, doctorId: string, addressId: string): Promise<any> {
-        return this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}`);
+        return this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/calendar`);
     }
 
     async getCalendarBreaks(facilityId: string, doctorId: string, addressId: string, since?: string): Promise<any> {

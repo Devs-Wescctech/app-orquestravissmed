@@ -234,15 +234,18 @@ export class SlotSyncService {
 
             try {
                 await client.enableCalendar(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId);
-                this.logger.log(`Doctor ${doctor.name} address ${addrId}: ensured calendar enabled (booking_type=integration)`);
+                this.logger.log(`Doctor ${doctor.name} address ${addrId}: calendar enabled`);
             } catch (enableErr: any) {
                 const status = enableErr?.status;
-                if (status && status >= 400 && status < 500) {
+                if (status === 409) {
+                    this.logger.log(`Doctor ${doctor.name} address ${addrId}: calendar already enabled (409)`);
+                } else if (status && status >= 400 && status < 500) {
                     this.logger.error(`Doctor ${doctor.name} address ${addrId}: calendar enable rejected (${status}): ${enableErr.message} — skipping slot sync for this address`);
                     addressesFailed++;
                     continue;
+                } else {
+                    this.logger.warn(`Doctor ${doctor.name} address ${addrId}: transient error enabling calendar: ${enableErr.message} — proceeding with slot sync`);
                 }
-                this.logger.warn(`Doctor ${doctor.name} address ${addrId}: transient error enabling calendar: ${enableErr.message} — proceeding with slot sync`);
             }
 
             try {
