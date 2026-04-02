@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { MappingEntityType, Prisma } from '@prisma/client';
 
@@ -469,11 +469,14 @@ export class MappingsService {
     }
 
     async approveInsuranceMatch(mappingId: string, clinicId: string, userId?: string) {
+        if (!mappingId) {
+            throw new BadRequestException('mappingId é obrigatório.');
+        }
         const mapping = await this.prisma.mapping.findFirst({
             where: { id: mappingId, clinicId, entityType: 'INSURANCE', status: 'PENDING_REVIEW' }
         });
         if (!mapping) {
-            throw new Error('Mapeamento de convênio não encontrado ou não está pendente de revisão.');
+            throw new NotFoundException('Mapeamento de convênio não encontrado ou não está pendente de revisão.');
         }
 
         const updated = await this.prisma.mapping.update({
@@ -496,11 +499,14 @@ export class MappingsService {
     }
 
     async rejectInsuranceMatch(mappingId: string, clinicId: string, userId?: string) {
+        if (!mappingId) {
+            throw new BadRequestException('mappingId é obrigatório.');
+        }
         const mapping = await this.prisma.mapping.findFirst({
             where: { id: mappingId, clinicId, entityType: 'INSURANCE', status: 'PENDING_REVIEW' }
         });
         if (!mapping) {
-            throw new Error('Mapeamento de convênio não encontrado ou não está pendente de revisão.');
+            throw new NotFoundException('Mapeamento de convênio não encontrado ou não está pendente de revisão.');
         }
 
         const updated = await this.prisma.mapping.update({

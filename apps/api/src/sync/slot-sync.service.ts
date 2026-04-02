@@ -17,27 +17,18 @@ export class SlotSyncService {
         if (!turnoStr || turnoStr.trim() === '-' || turnoStr.trim() === '') return null;
         const cleaned = turnoStr.trim().replace(/\s+/g, ' ');
         const match = cleaned.match(/^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/);
-        if (!match) {
-            this.logger.warn(`Could not parse turno: "${turnoStr}"`);
-            return null;
-        }
+        if (!match) return null;
         const startH = parseInt(match[1], 10);
         const startM = parseInt(match[2], 10);
         const endH = parseInt(match[3], 10);
         const endM = parseInt(match[4], 10);
 
         if (startH < 0 || startH > 23 || startM < 0 || startM > 59 ||
-            endH < 0 || endH > 23 || endM < 0 || endM > 59) {
-            this.logger.warn(`Invalid turno time values: "${turnoStr}"`);
-            return null;
-        }
+            endH < 0 || endH > 23 || endM < 0 || endM > 59) return null;
 
         const startTotal = startH * 60 + startM;
         const endTotal = endH * 60 + endM;
-        if (endTotal <= startTotal) {
-            this.logger.warn(`Turno end must be after start: "${turnoStr}"`);
-            return null;
-        }
+        if (endTotal <= startTotal) return null;
 
         const start = `${String(startH).padStart(2, '0')}:${String(startM).padStart(2, '0')}`;
         const end = `${String(endH).padStart(2, '0')}:${String(endM).padStart(2, '0')}`;
@@ -207,6 +198,16 @@ export class SlotSyncService {
             });
             const addressServiceIds = deduplicatedServices.map((s: any) => Number(s.id));
             this.logger.log(`Doctor ${doctor.name} address ${addrId}: using ${addressServiceIds.length} unique address_service_ids (from ${addressServices.length} total): ${addressServiceIds.join(', ')}`);
+
+            const invalidTurnos: string[] = [];
+            for (const t of [doctor.turnoM, doctor.turnoT, doctor.turnoN]) {
+                if (t && t.trim() !== '-' && t.trim() !== '' && !this.parseTurno(t)) {
+                    invalidTurnos.push(t);
+                }
+            }
+            if (invalidTurnos.length > 0) {
+                this.logger.warn(`Doctor ${doctor.name}: skipping invalid turno(s): ${invalidTurnos.map(t => `"${t}"`).join(', ')}`);
+            }
 
             const allSlots: any[] = [];
             for (const date of dates) {
