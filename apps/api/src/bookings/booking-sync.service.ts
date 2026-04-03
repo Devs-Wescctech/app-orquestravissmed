@@ -444,7 +444,8 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             cd.facilityId,
             mapping.externalId,
             String(cd.address.id),
-            { start: startFormatted, ...bookPayload },
+            startFormatted,
+            bookPayload,
         );
 
         const doctoraliaBookingId = bookResult?.id ? String(bookResult.id) : null;

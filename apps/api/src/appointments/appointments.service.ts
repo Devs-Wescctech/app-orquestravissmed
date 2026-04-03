@@ -370,7 +370,10 @@ export class AppointmentsService {
 
         try {
             const client = this.docplanner.createClient(conn.domain || 'doctoralia.com.br', conn.clientId, conn.clientSecret || '');
-            const res = await client.bookSlot(cd.facilityId, doctorExternalId, cd.address.id, payload);
+            const slotStart = payload.start;
+            const bookBody = { ...payload };
+            delete bookBody.start;
+            const res = await client.bookSlot(cd.facilityId, doctorExternalId, cd.address.id, slotStart, bookBody);
             await this.logRequest({ clinicId, action: 'BOOK_SLOT', doctorId: doctorExternalId, durationMs: Date.now() - startTime, status: 'success' });
             return res;
         } catch (e: any) {

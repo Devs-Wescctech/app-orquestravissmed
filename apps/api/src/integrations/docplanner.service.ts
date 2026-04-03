@@ -205,8 +205,9 @@ export class DocplannerClient {
         return result;
     }
 
-    async bookSlot(facilityId: string, doctorId: string, addressId: string, payload: any): Promise<any> {
-        return this.request('POST', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/bookings`, payload);
+    async bookSlot(facilityId: string, doctorId: string, addressId: string, slotStart: string, payload: any): Promise<any> {
+        const encodedStart = encodeURIComponent(slotStart);
+        return this.request('POST', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/slots/${encodedStart}/book`, payload);
     }
 
     async deleteSlots(facilityId: string, doctorId: string, addressId: string, date: string): Promise<any> {
