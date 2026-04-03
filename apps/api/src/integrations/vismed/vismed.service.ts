@@ -4,7 +4,7 @@ import * as https from 'https';
 @Injectable()
 export class VismedService {
     private readonly logger = new Logger(VismedService.name);
-    private readonly defaultBaseUrl = 'https://app.vissmed.com.br/api-vissmed-4/api/v1.0';
+    private readonly defaultBaseUrl = 'https://app.vissmed.com.br/api-vissmed-7/api/v1.0';
 
     private buildApiUrl(path: string, baseUrl?: string): string {
         if (!baseUrl) {
@@ -12,7 +12,7 @@ export class VismedService {
         }
 
         let domain = baseUrl.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
-        return `https://${domain}/api-vissmed-4/api/v1.0/${path}`;
+        return `https://${domain}/api-vissmed-7/api/v1.0/${path}`;
     }
 
     private requestData(path: string, baseUrl?: string): Promise<any> {
@@ -176,7 +176,7 @@ export class VismedService {
     }, baseUrl?: string): Promise<any> {
         try {
             this.logger.log(`Criando agendamento VisMed para ${payload.nome} em ${payload.data_agendamento} às ${payload.horarios_profissional}`);
-            return await this.postData('schedule/pacient', payload, baseUrl);
+            return await this.postData('schedule/online/schedule/pacient', payload, baseUrl);
         } catch (error) {
             this.logger.error(`Erro ao criar agendamento VisMed: ${error.message}`);
             throw error;
