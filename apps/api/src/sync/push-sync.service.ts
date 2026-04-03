@@ -126,6 +126,18 @@ export class PushSyncService {
                 if (vDoc.turnoM || vDoc.turnoT || vDoc.turnoN) {
                     const slotResult = await this.slotSync.syncSlotsForDoctor(vDoc.id, client, syncRunId, 30);
                     this.logger.log(`Doctor ${dDoc.name}: [SLOTS] ${slotResult.message}`);
+                    if (slotResult.success) {
+                        const doctorMapping = await this.prisma.mapping.findFirst({
+                            where: { clinicId, entityType: 'DOCTOR', vismedId: vDoc.id, status: 'LINKED' }
+                        });
+                        if (doctorMapping) {
+                            const existing = (doctorMapping.conflictData as any) || {};
+                            await this.prisma.mapping.update({
+                                where: { id: doctorMapping.id },
+                                data: { conflictData: { ...existing, calendarStatus: 'enabled' } }
+                            });
+                        }
+                    }
                 } else {
                     this.logger.warn(`Doctor ${dDoc.name}: [SLOTS] No shifts configured in VisMed, skipping slot generation.`);
                     await this.logEvent(syncRunId, 'SLOT_SYNC', 'skipped', `Doctor ${dDoc.name}: Sem turnos configurados no VisMed`);
@@ -184,11 +196,14 @@ export class PushSyncService {
         this.logger.log(`Doctor ${doctorName}: VisMed expects ${expectedDictIds.size} service(s): [${matchedNames.join(', ')}]. Currently has ${currentServices.length} service(s).`);
 
         // ADD: Expected by VisMed but NOT currently assigned
+        const addedDictIds = new Set<string>();
+        const failedDictIds = new Set<string>();
         for (const [dictId, specName] of expectedDictIds.entries()) {
             if (!currentByDictId.has(dictId)) {
                 const numericId = Number(dictId);
                 if (!Number.isFinite(numericId)) {
                     this.logger.warn(`Doctor ${doctorName}: [SKIP] Service dict:${dictId} (${specName}) has non-numeric ID, skipping.`);
+                    failedDictIds.add(dictId);
                     continue;
                 }
                 try {
@@ -200,9 +215,11 @@ export class PushSyncService {
                         description: `Sincronizado via VisMed - ${specName}`
                     };
                     await client.addAddressService(facilityId, doctorId, addressId, payload);
+                    addedDictIds.add(dictId);
                     this.logger.log(`Doctor ${doctorName}: [ADD] Service dict:${dictId} (${specName}) to Address ${addressId}`);
                     await this.logEvent(syncRunId, 'SERVICE_PUSH', 'created', `Doctor ${doctorName}: Adicionado serviço "${specName}" (dict:${dictId}) ao endereço ${addressId}`);
                 } catch (error: any) {
+                    failedDictIds.add(dictId);
                     this.logger.warn(`Doctor ${doctorName}: [ADD FAILED] Service dict:${dictId}: ${error.message}`);
                     await this.logEvent(syncRunId, 'SERVICE_PUSH', 'error', `Doctor ${doctorName}: Falha ao adicionar serviço "${specName}" (dict:${dictId}) - ${error.message}`);
                 }
@@ -210,16 +227,22 @@ export class PushSyncService {
         }
 
         // DELETE: Currently assigned but NOT expected by VisMed
-        for (const [dictId, addrSvc] of currentByDictId.entries()) {
-            if (!expectedDictIds.has(dictId)) {
-                try {
-                    const addrSvcId = String(addrSvc.id); // Use address_service ID for DELETE
-                    await client.deleteAddressService(facilityId, doctorId, addressId, addrSvcId);
-                    this.logger.log(`Doctor ${doctorName}: [DELETE] Service addr_svc:${addrSvcId} (dict:${dictId}) from Address ${addressId}`);
-                    await this.logEvent(syncRunId, 'SERVICE_PUSH', 'deleted', `Doctor ${doctorName}: Removido serviço excessivo (dict:${dictId}) do endereço ${addressId}`);
-                } catch (error: any) {
-                    this.logger.warn(`Doctor ${doctorName}: [DELETE FAILED] Service addr_svc:${addrSvc.id}: ${error.message}`);
-                    await this.logEvent(syncRunId, 'SERVICE_PUSH', 'error', `Doctor ${doctorName}: Falha ao remover serviço (dict:${dictId}) - ${error.message}`);
+        // SAFETY: Only delete if ALL expected adds succeeded. If any add failed, keep existing
+        // services to avoid leaving the doctor with zero services (which breaks slots).
+        if (failedDictIds.size > 0) {
+            this.logger.log(`Doctor ${doctorName}: [SKIP DELETE] ${failedDictIds.size} service add(s) failed, keeping existing services to avoid service gap.`);
+        } else {
+            for (const [dictId, addrSvc] of currentByDictId.entries()) {
+                if (!expectedDictIds.has(dictId)) {
+                    try {
+                        const addrSvcId = String(addrSvc.id);
+                        await client.deleteAddressService(facilityId, doctorId, addressId, addrSvcId);
+                        this.logger.log(`Doctor ${doctorName}: [DELETE] Service addr_svc:${addrSvcId} (dict:${dictId}) from Address ${addressId}`);
+                        await this.logEvent(syncRunId, 'SERVICE_PUSH', 'deleted', `Doctor ${doctorName}: Removido serviço excessivo (dict:${dictId}) do endereço ${addressId}`);
+                    } catch (error: any) {
+                        this.logger.warn(`Doctor ${doctorName}: [DELETE FAILED] Service addr_svc:${addrSvc.id}: ${error.message}`);
+                        await this.logEvent(syncRunId, 'SERVICE_PUSH', 'error', `Doctor ${doctorName}: Falha ao remover serviço (dict:${dictId}) - ${error.message}`);
+                    }
                 }
             }
         }

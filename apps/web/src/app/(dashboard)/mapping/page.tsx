@@ -28,7 +28,7 @@ interface VismedProfessional {
     }>;
     doctoraliaCounterpart?: {
         name: string; doctoraliaDoctorId: string; services: string[];
-        calendarStatus?: 'enabled' | 'disabled';
+        calendarStatus?: 'enabled' | 'disabled' | 'unknown';
     } | null;
 }
 
@@ -478,9 +478,11 @@ export default function MappingHub() {
                                             {(() => {
                                                 const hasLink = !!p.doctoraliaCounterpart;
                                                 const hasTurnos = !!(p.turnos?.turnoM || p.turnos?.turnoT || p.turnos?.turnoN);
-                                                const calEnabled = p.doctoraliaCounterpart?.calendarStatus === 'enabled';
-                                                const allDone = hasLink && hasTurnos && calEnabled;
-                                                const partial = hasLink && hasTurnos;
+                                                const calStatus = p.doctoraliaCounterpart?.calendarStatus;
+                                                const calEnabled = calStatus === 'enabled';
+                                                const calUnknown = !calStatus || calStatus === 'unknown';
+                                                const allDone = hasLink && hasTurnos && calEnabled && !calUnknown;
+                                                const partial = hasLink && hasTurnos && !allDone;
 
                                                 if (allDone) {
                                                     return (
