@@ -4,15 +4,21 @@ import * as https from 'https';
 @Injectable()
 export class VismedService {
     private readonly logger = new Logger(VismedService.name);
-    private readonly defaultBaseUrl = 'https://app.vissmed.com.br/api-vissmed-7/api/v1.0';
+    private readonly defaultBaseUrl = 'https://app.vissmed.com.br/api-vissmed-7';
+
+    private normalizeBaseUrl(raw: string): string {
+        let url = raw.trim().replace(/\/+$/, '');
+        if (!/^https?:\/\//i.test(url)) {
+            url = `https://${url}`;
+        }
+        url = url.replace(/\/api\/v1\.0\/?$/i, '').replace(/\/+$/, '');
+        return url;
+    }
 
     private buildApiUrl(path: string, baseUrl?: string): string {
-        if (!baseUrl) {
-            return `${this.defaultBaseUrl}/${path}`;
-        }
-
-        let domain = baseUrl.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
-        return `https://${domain}/api-vissmed-7/api/v1.0/${path}`;
+        const raw = baseUrl || this.defaultBaseUrl;
+        const base = this.normalizeBaseUrl(raw);
+        return `${base}/api/v1.0/${path}`;
     }
 
     private requestData(path: string, baseUrl?: string): Promise<any> {

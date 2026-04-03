@@ -415,7 +415,7 @@ export default function ClinicsManagement() {
                                                 </div>
                                                 <div className="space-y-2">
                                                     <label className="text-[10px] font-black text-slate-400 uppercase tracking-[2px]">Link de Integração (URL)</label>
-                                                    <input type="text" name="vismed_domain" key={selectedClinic.id + '-vismed-domain'} defaultValue={selectedClinic.integrations?.find((i: any) => i.provider === 'vismed')?.domain || ''} className="w-full h-12 rounded-xl border-2 border-slate-100 bg-white px-4 text-xs font-bold focus:border-primary outline-none transition-all" placeholder="Ex: api.vismed.com.br" />
+                                                    <input type="text" name="vismed_domain" key={selectedClinic.id + '-vismed-domain'} defaultValue={selectedClinic.integrations?.find((i: any) => i.provider === 'vismed')?.domain || ''} className="w-full h-12 rounded-xl border-2 border-slate-100 bg-white px-4 text-xs font-bold focus:border-primary outline-none transition-all" placeholder="Ex: https://app.vissmed.com.br/api-vissmed-4" />
                                                 </div>
                                             </div>
                                         </div>
