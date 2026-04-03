@@ -1,8 +1,9 @@
 'use client';
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import {
-    CalendarDays, AlertCircle, Loader2, Clock, RefreshCw, User, ChevronLeft, ChevronRight,
+    CalendarDays, Loader2, Clock, RefreshCw, User, ChevronLeft, ChevronRight,
     Stethoscope, X, Phone, Mail, FileText, Globe, Building2, ArrowRightLeft, Ban,
+    Plus, ChevronDown,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { useClinic } from '@/lib/clinic-store';
@@ -39,6 +40,8 @@ interface BookingRecord {
     booked_by?: string;
 }
 
+type ViewMode = 'day' | 'week' | 'month';
+
 function formatTime(dateStr: string) {
     try {
         const d = new Date(dateStr);
@@ -46,7 +49,7 @@ function formatTime(dateStr: string) {
     } catch { return dateStr; }
 }
 
-function formatDate(dateStr: string) {
+function formatDateShort(dateStr: string) {
     try {
         const d = new Date(dateStr);
         return d.toLocaleDateString('pt-BR', { weekday: 'short', day: '2-digit', month: '2-digit' });
@@ -63,6 +66,28 @@ function getDaysInRange(start: string, end: string): string[] {
     return days;
 }
 
+function getMonday(date: Date): Date {
+    const d = new Date(date);
+    const day = d.getDay();
+    d.setDate(d.getDate() - (day === 0 ? 6 : day - 1));
+    return d;
+}
+
+function getMonthRange(date: Date): { start: string; end: string } {
+    const y = date.getFullYear();
+    const m = date.getMonth();
+    const firstDay = new Date(y, m, 1);
+    const lastDay = new Date(y, m + 1, 0);
+    const start = getMonday(firstDay);
+    const endSunday = new Date(lastDay);
+    const dayOfWeek = endSunday.getDay();
+    if (dayOfWeek !== 0) endSunday.setDate(endSunday.getDate() + (7 - dayOfWeek));
+    return {
+        start: start.toISOString().split('T')[0],
+        end: endSunday.toISOString().split('T')[0],
+    };
+}
+
 export default function AppointmentsPage() {
     const { user } = useAuthStore();
     const { activeClinic } = useClinic();
@@ -72,44 +97,49 @@ export default function AppointmentsPage() {
     const [selectedDoctorId, setSelectedDoctorId] = useState('');
     const [isLoading, setIsLoading] = useState(true);
     const [isFetching, setIsFetching] = useState(false);
+    const [showDoctorDropdown, setShowDoctorDropdown] = useState(false);
 
+    const [viewMode, setViewMode] = useState<ViewMode>('week');
     const today = new Date();
-    const [weekStart, setWeekStart] = useState(() => {
-        const d = new Date(today);
-        d.setDate(d.getDate() - d.getDay() + 1);
-        return d.toISOString().split('T')[0];
-    });
+    const todayStr = today.toISOString().split('T')[0];
+    const [currentDate, setCurrentDate] = useState(today);
 
-    const weekEnd = useMemo(() => {
-        const d = new Date(weekStart + 'T00:00:00');
-        d.setDate(d.getDate() + 6);
-        return d.toISOString().split('T')[0];
-    }, [weekStart]);
-
-    const weekDays = useMemo(() => getDaysInRange(weekStart, weekEnd), [weekStart, weekEnd]);
+    const { rangeStart, rangeEnd, displayDays } = useMemo(() => {
+        if (viewMode === 'day') {
+            const dayStr = currentDate.toISOString().split('T')[0];
+            return { rangeStart: dayStr, rangeEnd: dayStr, displayDays: [dayStr] };
+        } else if (viewMode === 'week') {
+            const monday = getMonday(currentDate);
+            const sunday = new Date(monday);
+            sunday.setDate(monday.getDate() + 6);
+            const start = monday.toISOString().split('T')[0];
+            const end = sunday.toISOString().split('T')[0];
+            return { rangeStart: start, rangeEnd: end, displayDays: getDaysInRange(start, end) };
+        } else {
+            const { start, end } = getMonthRange(currentDate);
+            return { rangeStart: start, rangeEnd: end, displayDays: getDaysInRange(start, end) };
+        }
+    }, [viewMode, currentDate]);
 
     const [doctoraliaBookings, setDoctoraliaBookings] = useState<any[]>([]);
     const [syncRecords, setSyncRecords] = useState<BookingRecord[]>([]);
     const [selectedBooking, setSelectedBooking] = useState<any>(null);
+    const [syncStats, setSyncStats] = useState<any>(null);
 
     const [isBookingModalOpen, setIsBookingModalOpen] = useState(false);
     const [bookingSlot, setBookingSlot] = useState<{ date: string; time: string } | null>(null);
     const [patientForm, setPatientForm] = useState({ name: '', surname: '', phone: '', email: '', cpf: '' });
     const [isSaving, setIsSaving] = useState(false);
 
-    const [syncStats, setSyncStats] = useState<any>(null);
-
-    const navigateWeek = (direction: number) => {
-        const d = new Date(weekStart + 'T00:00:00');
-        d.setDate(d.getDate() + direction * 7);
-        setWeekStart(d.toISOString().split('T')[0]);
+    const navigate = (direction: number) => {
+        const d = new Date(currentDate);
+        if (viewMode === 'day') d.setDate(d.getDate() + direction);
+        else if (viewMode === 'week') d.setDate(d.getDate() + direction * 7);
+        else d.setMonth(d.getMonth() + direction);
+        setCurrentDate(d);
     };
 
-    const goToToday = () => {
-        const d = new Date();
-        d.setDate(d.getDate() - d.getDay() + 1);
-        setWeekStart(d.toISOString().split('T')[0]);
-    };
+    const goToToday = () => setCurrentDate(new Date());
 
     const fetchDoctors = useCallback(async () => {
         if (!clinicId) return;
@@ -119,12 +149,11 @@ export default function AppointmentsPage() {
             setDoctors(docs);
             if (docs.length > 0 && !selectedDoctorId) {
                 const enabled = docs.find((d: Doctor) => d.calendarStatus === 'enabled');
-                if (enabled) setSelectedDoctorId(enabled.externalId);
-                else setSelectedDoctorId(docs[0].externalId);
+                setSelectedDoctorId(enabled ? enabled.externalId : docs[0].externalId);
             }
             setIsLoading(false);
-        } catch (e: any) {
-            toast.error('Erro ao carregar médicos');
+        } catch {
+            toast.error('Erro ao carregar profissionais');
             setIsLoading(false);
         }
     }, [clinicId, selectedDoctorId]);
@@ -137,23 +166,22 @@ export default function AppointmentsPage() {
         try {
             const [bookingsRes, syncRes, statsRes] = await Promise.all([
                 api.get('/appointments/bookings', {
-                    params: { clinicId, doctorId: selectedDoctorId, start: weekStart, end: weekEnd }
+                    params: { clinicId, doctorId: selectedDoctorId, start: rangeStart, end: rangeEnd }
                 }),
                 api.get('/booking-sync/records', {
-                    params: { clinicId, doctoraliaDoctorId: selectedDoctorId, start: weekStart, end: weekEnd }
+                    params: { clinicId, doctoraliaDoctorId: selectedDoctorId, start: rangeStart, end: rangeEnd }
                 }).catch(() => ({ data: [] })),
                 api.get('/booking-sync/stats', { params: { clinicId } }).catch(() => ({ data: null })),
             ]);
-
             setDoctoraliaBookings(bookingsRes.data?.bookings || []);
             setSyncRecords(Array.isArray(syncRes.data) ? syncRes.data : []);
             setSyncStats(statsRes.data);
-        } catch (e: any) {
+        } catch {
             toast.error('Erro ao buscar agendamentos');
         } finally {
             setIsFetching(false);
         }
-    }, [clinicId, selectedDoctorId, weekStart, weekEnd]);
+    }, [clinicId, selectedDoctorId, rangeStart, rangeEnd]);
 
     useEffect(() => { fetchBookings(); }, [fetchBookings]);
 
@@ -169,7 +197,6 @@ export default function AppointmentsPage() {
         for (const b of doctoraliaBookings) {
             const bid = String(b.id || b.visit_booking_id || '');
             if (bid && seenDoctoraliaIds.has(bid)) continue;
-
             merged.push({
                 doctoraliaBookingId: bid,
                 origin: b.booked_by === 'integration' ? 'VISMED' : 'DOCTORALIA',
@@ -187,23 +214,18 @@ export default function AppointmentsPage() {
                 booked_by: b.booked_by,
             });
         }
-
         return merged.sort((a, b) => new Date(a.startAt).getTime() - new Date(b.startAt).getTime());
     }, [syncRecords, doctoraliaBookings, selectedDoctorId]);
 
     const bookingsByDay = useMemo(() => {
         const map: Record<string, BookingRecord[]> = {};
-        for (const day of weekDays) {
-            map[day] = [];
-        }
+        for (const day of displayDays) map[day] = [];
         for (const b of allBookings) {
             const dayKey = new Date(b.startAt).toISOString().split('T')[0];
-            if (map[dayKey]) {
-                map[dayKey].push(b);
-            }
+            if (map[dayKey]) map[dayKey].push(b);
         }
         return map;
-    }, [allBookings, weekDays]);
+    }, [allBookings, displayDays]);
 
     const handleOpenBooking = (date: string) => {
         setBookingSlot({ date, time: '08:00' });
@@ -213,19 +235,11 @@ export default function AppointmentsPage() {
 
     const handleCreateBooking = async () => {
         if (!clinicId || !selectedDoctorId || !bookingSlot) return;
-        if (!patientForm.name.trim()) {
-            toast.error('Nome do paciente é obrigatório');
-            return;
-        }
-
+        if (!patientForm.name.trim()) { toast.error('Nome do paciente é obrigatório'); return; }
         setIsSaving(true);
         const toastId = toast.loading('Criando agendamento...');
-
         try {
             const slotStart = `${bookingSlot.date}T${bookingSlot.time}:00-03:00`;
-
-            const selectedDoc = doctors.find(d => d.externalId === selectedDoctorId);
-
             await api.post('/booking-sync/book-from-vismed', {
                 clinicId,
                 doctoraliaDoctorId: selectedDoctorId,
@@ -238,7 +252,6 @@ export default function AppointmentsPage() {
                     cpf: patientForm.cpf,
                 },
             });
-
             toast.success('Agendamento criado com sucesso!', { id: toastId });
             setIsBookingModalOpen(false);
             fetchBookings();
@@ -252,12 +265,9 @@ export default function AppointmentsPage() {
     const handleCancelBooking = async (booking: BookingRecord) => {
         if (!clinicId || !booking.doctoraliaBookingId) return;
         if (!confirm('Deseja realmente cancelar este agendamento?')) return;
-
         const toastId = toast.loading('Cancelando...');
         try {
-            await api.delete(`/booking-sync/cancel/${booking.doctoraliaBookingId}`, {
-                params: { clinicId },
-            });
+            await api.delete(`/booking-sync/cancel/${booking.doctoraliaBookingId}`, { params: { clinicId } });
             toast.success('Agendamento cancelado', { id: toastId });
             setSelectedBooking(null);
             fetchBookings();
@@ -267,248 +277,386 @@ export default function AppointmentsPage() {
     };
 
     const selectedDoctor = doctors.find(d => d.externalId === selectedDoctorId);
-    const todayStr = today.toISOString().split('T')[0];
 
-    const hours = Array.from({ length: 15 }, (_, i) => {
-        const h = i + 7;
-        return `${h.toString().padStart(2, '0')}:00`;
-    });
+    const periodLabel = useMemo(() => {
+        if (viewMode === 'day') {
+            return currentDate.toLocaleDateString('pt-BR', { weekday: 'long', day: '2-digit', month: 'long', year: 'numeric' });
+        } else if (viewMode === 'week') {
+            const s = new Date(rangeStart + 'T00:00:00');
+            const e = new Date(rangeEnd + 'T00:00:00');
+            return `${s.toLocaleDateString('pt-BR', { day: '2-digit', month: 'short' })} — ${e.toLocaleDateString('pt-BR', { day: '2-digit', month: 'short', year: 'numeric' })}`;
+        } else {
+            return currentDate.toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' });
+        }
+    }, [viewMode, currentDate, rangeStart, rangeEnd]);
+
+    const totalBookings = allBookings.filter(b => b.status !== 'CANCELLED').length;
+    const vismedCount = allBookings.filter(b => b.origin === 'VISMED' && b.status !== 'CANCELLED').length;
+    const doctoraliaCount = allBookings.filter(b => b.origin === 'DOCTORALIA' && b.status !== 'CANCELLED').length;
 
     if (isLoading) {
         return (
-            <div className="flex flex-col items-center justify-center min-h-screen">
-                <Loader2 className="h-12 w-12 animate-spin text-primary opacity-20" />
-                <div className="mt-4 text-[11px] font-black text-slate-400 uppercase tracking-[4px] animate-pulse">Carregando Agenda...</div>
+            <div className="flex flex-col items-center justify-center min-h-[60vh]">
+                <Loader2 className="h-10 w-10 animate-spin text-primary opacity-30" />
+                <span className="mt-4 text-[10px] font-black text-slate-400 uppercase tracking-[4px] animate-pulse">Carregando Agenda</span>
             </div>
         );
     }
 
     return (
-        <div className="max-w-[1700px] mx-auto space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-700 pb-20">
+        <div className="max-w-7xl mx-auto space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
 
-            <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4">
+            {/* ─── HEADER ─── */}
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
                 <div className="flex items-center gap-5">
-                    <div className="h-16 w-16 rounded-[24px] bg-gradient-to-br from-primary to-indigo-600 flex items-center justify-center shadow-2xl shadow-primary/30">
+                    <div className="h-16 w-16 rounded-[24px] bg-gradient-to-br from-primary to-indigo-600 flex items-center justify-center shadow-[0_12px_24px_-8px_rgba(99,102,241,0.4)] border border-white/20 transform rotate-1 transition-transform hover:rotate-0 duration-500">
                         <CalendarDays className="h-8 w-8 text-white" />
                     </div>
                     <div>
-                        <h1 className="text-3xl font-black text-slate-900 tracking-tight">Agenda</h1>
-                        <p className="text-slate-500 text-sm font-medium">Agendamentos sincronizados VisMed + Doctoralia</p>
+                        <div className="flex items-center gap-3">
+                            <h1 className="text-3xl font-black text-slate-900 tracking-tighter uppercase">Agenda</h1>
+                            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest bg-indigo-50 text-indigo-700 border border-indigo-100 shadow-sm">
+                                <ArrowRightLeft className="h-3 w-3" /> Sync Bidirecional
+                            </span>
+                        </div>
+                        <p className="text-sm text-slate-500 font-medium mt-0.5">VisMed + Doctoralia</p>
                     </div>
                 </div>
 
                 <div className="flex items-center gap-3">
-                    {syncStats && (
-                        <div className="flex items-center gap-4 mr-4">
-                            <div className="flex items-center gap-1.5">
-                                <div className="h-2.5 w-2.5 rounded-full bg-emerald-500"></div>
-                                <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider">VisMed: {syncStats.byOrigin?.VISMED || 0}</span>
-                            </div>
-                            <div className="flex items-center gap-1.5">
-                                <div className="h-2.5 w-2.5 rounded-full bg-blue-500"></div>
-                                <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider">Doctoralia: {syncStats.byOrigin?.DOCTORALIA || 0}</span>
-                            </div>
-                        </div>
-                    )}
-                    <button onClick={() => { fetchDoctors(); fetchBookings(); }} className="flex items-center gap-2 px-5 py-2.5 bg-white border border-slate-200 text-slate-600 rounded-xl text-[11px] font-bold hover:bg-slate-50 transition-all shadow-sm">
+                    <button
+                        onClick={() => { fetchDoctors(); fetchBookings(); }}
+                        disabled={isFetching}
+                        className="flex items-center gap-2 px-5 py-3 bg-white/80 backdrop-blur-sm border border-slate-200 text-slate-600 rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-white hover:shadow-md transition-all disabled:opacity-50"
+                    >
                         <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} /> Atualizar
                     </button>
                 </div>
             </div>
 
-            <div className="grid grid-cols-1 xl:grid-cols-[280px_1fr] gap-6 items-start">
-
-                <aside className="space-y-4">
-                    <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-                        <div className="px-4 py-3 border-b border-slate-100">
-                            <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-[2px]">Profissionais</h3>
-                        </div>
-                        <div className="max-h-[500px] overflow-y-auto">
-                            {doctors.map((doc) => (
-                                <button
-                                    key={doc.externalId}
-                                    onClick={() => setSelectedDoctorId(doc.externalId)}
-                                    className={`w-full px-4 py-3 flex items-center gap-3 text-left transition-all border-b border-slate-50 last:border-0
-                                        ${selectedDoctorId === doc.externalId
-                                            ? 'bg-primary/5 border-l-4 !border-l-primary'
-                                            : 'hover:bg-slate-50'}`}
-                                >
-                                    <div className={`h-9 w-9 rounded-xl flex items-center justify-center text-[12px] font-black shrink-0
-                                        ${selectedDoctorId === doc.externalId ? 'bg-primary text-white' : 'bg-slate-100 text-slate-400'}`}>
-                                        {doc.name.charAt(0)}
-                                    </div>
-                                    <div className="min-w-0 flex-1">
-                                        <div className={`text-[12px] font-bold truncate ${selectedDoctorId === doc.externalId ? 'text-primary' : 'text-slate-700'}`}>
-                                            {doc.name}
-                                        </div>
-                                        <div className="flex items-center gap-1.5 mt-0.5">
-                                            <div className={`h-1.5 w-1.5 rounded-full ${doc.calendarStatus === 'enabled' ? 'bg-emerald-500' : 'bg-slate-300'}`}></div>
-                                            <span className="text-[9px] font-bold text-slate-400 uppercase">{doc.calendarStatus === 'enabled' ? 'Online' : 'Offline'}</span>
-                                        </div>
-                                    </div>
-                                </button>
-                            ))}
-                            {doctors.length === 0 && (
-                                <div className="p-6 text-center text-slate-400 text-sm">Nenhum médico mapeado</div>
-                            )}
+            {/* ─── METRICS ─── */}
+            <div className="grid grid-cols-3 gap-4">
+                {[
+                    { label: 'Total Agendamentos', value: totalBookings, color: 'text-slate-900' },
+                    { label: 'Via VisMed', value: vismedCount, color: 'text-emerald-600', dot: 'bg-emerald-500' },
+                    { label: 'Via Doctoralia', value: doctoraliaCount, color: 'text-blue-600', dot: 'bg-blue-500' },
+                ].map((m) => (
+                    <div key={m.label} className="bg-white/70 backdrop-blur-xl rounded-[32px] p-5 shadow-sm border border-slate-100/60 flex items-center gap-4 transition-all duration-300 hover:shadow-lg hover:-translate-y-0.5">
+                        {m.dot && <div className={`h-3 w-3 rounded-full ${m.dot} shrink-0`}></div>}
+                        <div>
+                            <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest">{m.label}</div>
+                            <div className={`text-2xl font-black tracking-tighter ${m.color}`}>{m.value}</div>
                         </div>
                     </div>
-
-                    <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
-                        <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-[2px] mb-3">Legenda</h3>
-                        <div className="space-y-2">
-                            <div className="flex items-center gap-2">
-                                <div className="h-3 w-3 rounded bg-emerald-500"></div>
-                                <span className="text-[11px] text-slate-600 font-medium">Agendado pelo VisMed</span>
-                            </div>
-                            <div className="flex items-center gap-2">
-                                <div className="h-3 w-3 rounded bg-blue-500"></div>
-                                <span className="text-[11px] text-slate-600 font-medium">Agendado pela Doctoralia</span>
-                            </div>
-                            <div className="flex items-center gap-2">
-                                <div className="h-3 w-3 rounded bg-red-400"></div>
-                                <span className="text-[11px] text-slate-600 font-medium">Cancelado</span>
-                            </div>
-                            <div className="flex items-center gap-2">
-                                <div className="h-3 w-3 rounded bg-amber-400"></div>
-                                <span className="text-[11px] text-slate-600 font-medium">Movido</span>
-                            </div>
-                        </div>
-                    </div>
-                </aside>
-
-                <main className="space-y-4">
-                    <div className="bg-white rounded-2xl border border-slate-200 shadow-sm">
-                        <div className="flex items-center justify-between px-6 py-3 border-b border-slate-100">
-                            <div className="flex items-center gap-3">
-                                <button onClick={() => navigateWeek(-1)} className="h-8 w-8 rounded-lg bg-slate-50 hover:bg-slate-100 flex items-center justify-center transition-all">
-                                    <ChevronLeft className="h-4 w-4 text-slate-600" />
-                                </button>
-                                <button onClick={goToToday} className="px-3 py-1.5 rounded-lg bg-primary/10 text-primary text-[10px] font-black uppercase tracking-wider hover:bg-primary/20 transition-all">
-                                    Hoje
-                                </button>
-                                <button onClick={() => navigateWeek(1)} className="h-8 w-8 rounded-lg bg-slate-50 hover:bg-slate-100 flex items-center justify-center transition-all">
-                                    <ChevronRight className="h-4 w-4 text-slate-600" />
-                                </button>
-                            </div>
-                            <div className="text-[13px] font-bold text-slate-700">
-                                {new Date(weekStart + 'T00:00:00').toLocaleDateString('pt-BR', { day: '2-digit', month: 'short' })} — {new Date(weekEnd + 'T00:00:00').toLocaleDateString('pt-BR', { day: '2-digit', month: 'short', year: 'numeric' })}
-                            </div>
-                            {selectedDoctor && (
-                                <div className="flex items-center gap-2">
-                                    <Stethoscope className="h-4 w-4 text-primary" />
-                                    <span className="text-[12px] font-bold text-slate-600">{selectedDoctor.name}</span>
-                                </div>
-                            )}
-                        </div>
-
-                        <div className="grid grid-cols-7 border-b border-slate-100">
-                            {weekDays.map((day) => {
-                                const d = new Date(day + 'T00:00:00');
-                                const isToday = day === todayStr;
-                                const dayBookings = bookingsByDay[day] || [];
-                                return (
-                                    <div key={day} className={`text-center py-2 border-r border-slate-50 last:border-0 ${isToday ? 'bg-primary/5' : ''}`}>
-                                        <div className="text-[9px] font-black text-slate-400 uppercase tracking-widest">
-                                            {d.toLocaleDateString('pt-BR', { weekday: 'short' })}
-                                        </div>
-                                        <div className={`text-[18px] font-black mt-0.5 ${isToday ? 'text-primary' : 'text-slate-800'}`}>
-                                            {d.getDate()}
-                                        </div>
-                                        {dayBookings.length > 0 && (
-                                            <div className="flex items-center justify-center gap-0.5 mt-1">
-                                                {dayBookings.slice(0, 5).map((b, i) => (
-                                                    <div key={i} className={`h-1.5 w-1.5 rounded-full ${
-                                                        b.status === 'CANCELLED' ? 'bg-red-400' :
-                                                        b.status === 'MOVED' ? 'bg-amber-400' :
-                                                        b.origin === 'VISMED' ? 'bg-emerald-500' : 'bg-blue-500'
-                                                    }`}></div>
-                                                ))}
-                                                {dayBookings.length > 5 && <span className="text-[8px] text-slate-400 ml-0.5">+{dayBookings.length - 5}</span>}
-                                            </div>
-                                        )}
-                                    </div>
-                                );
-                            })}
-                        </div>
-
-                        <div className="divide-y divide-slate-50">
-                            {weekDays.map((day) => {
-                                const d = new Date(day + 'T00:00:00');
-                                const isToday = day === todayStr;
-                                const dayBookings = bookingsByDay[day] || [];
-
-                                return (
-                                    <div key={day} className={`${isToday ? 'bg-primary/[0.02]' : ''}`}>
-                                        <div className="grid grid-cols-[100px_1fr] min-h-[60px]">
-                                            <div className="px-3 py-2 border-r border-slate-100 flex flex-col justify-center">
-                                                <div className="text-[10px] font-black text-slate-400 uppercase">
-                                                    {d.toLocaleDateString('pt-BR', { weekday: 'short' })}
-                                                </div>
-                                                <div className={`text-[15px] font-black ${isToday ? 'text-primary' : 'text-slate-700'}`}>
-                                                    {d.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' })}
-                                                </div>
-                                            </div>
-                                            <div className="px-3 py-2 flex flex-wrap gap-2 items-center">
-                                                {dayBookings.length === 0 ? (
-                                                    <span className="text-[11px] text-slate-300 font-medium italic">Sem agendamentos</span>
-                                                ) : (
-                                                    dayBookings.map((b, idx) => {
-                                                        const isCancelled = b.status === 'CANCELLED';
-                                                        const isMoved = b.status === 'MOVED';
-                                                        const isVismed = b.origin === 'VISMED';
-
-                                                        const bgColor = isCancelled ? 'bg-red-50 border-red-200 text-red-700'
-                                                            : isMoved ? 'bg-amber-50 border-amber-200 text-amber-700'
-                                                            : isVismed ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
-                                                            : 'bg-blue-50 border-blue-200 text-blue-700';
-
-                                                        const dotColor = isCancelled ? 'bg-red-400'
-                                                            : isMoved ? 'bg-amber-400'
-                                                            : isVismed ? 'bg-emerald-500'
-                                                            : 'bg-blue-500';
-
-                                                        return (
-                                                            <button
-                                                                key={idx}
-                                                                onClick={() => setSelectedBooking(b)}
-                                                                className={`flex items-center gap-2 px-3 py-1.5 rounded-xl border text-[11px] font-bold transition-all hover:shadow-md hover:-translate-y-0.5 ${bgColor} ${isCancelled ? 'line-through opacity-60' : ''}`}
-                                                            >
-                                                                <div className={`h-2 w-2 rounded-full ${dotColor}`}></div>
-                                                                <span className="font-black">{formatTime(b.startAt)}</span>
-                                                                <span className="max-w-[120px] truncate">{b.patientName}{b.patientSurname ? ` ${b.patientSurname}` : ''}</span>
-                                                                <span className="text-[8px] font-black uppercase tracking-wider opacity-60">{isVismed ? 'VM' : 'DC'}</span>
-                                                            </button>
-                                                        );
-                                                    })
-                                                )}
-                                                <button
-                                                    onClick={() => handleOpenBooking(day)}
-                                                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl border border-dashed border-slate-200 text-[10px] font-bold text-slate-400 hover:border-primary hover:text-primary hover:bg-primary/5 transition-all"
-                                                >
-                                                    + Agendar
-                                                </button>
-                                            </div>
-                                        </div>
-                                    </div>
-                                );
-                            })}
-                        </div>
-                    </div>
-
-                    {isFetching && (
-                        <div className="flex items-center justify-center gap-2 py-2">
-                            <Loader2 className="h-4 w-4 animate-spin text-primary" />
-                            <span className="text-[11px] text-slate-400 font-bold">Carregando agendamentos...</span>
-                        </div>
-                    )}
-                </main>
+                ))}
             </div>
 
+            {/* ─── TOOLBAR: View mode + Doctor selector + Navigation ─── */}
+            <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-3">
+                <div className="flex items-center gap-3">
+                    {/* View mode pills */}
+                    <div className="bg-white/40 backdrop-blur-md rounded-[20px] p-1.5 flex gap-1 border border-slate-100/60">
+                        {(['day', 'week', 'month'] as ViewMode[]).map((mode) => (
+                            <button
+                                key={mode}
+                                onClick={() => setViewMode(mode)}
+                                className={`px-4 py-2 rounded-[16px] text-[10px] font-black uppercase tracking-widest transition-all duration-300 ${
+                                    viewMode === mode
+                                        ? 'bg-white text-slate-900 shadow-md'
+                                        : 'text-slate-400 hover:text-slate-600'
+                                }`}
+                            >
+                                {mode === 'day' ? 'Dia' : mode === 'week' ? 'Semana' : 'Mês'}
+                            </button>
+                        ))}
+                    </div>
+
+                    {/* Doctor selector */}
+                    <div className="relative">
+                        <button
+                            onClick={() => setShowDoctorDropdown(!showDoctorDropdown)}
+                            className="flex items-center gap-2.5 px-4 py-2.5 bg-white/80 backdrop-blur-sm border border-slate-200 rounded-2xl hover:bg-white hover:shadow-md transition-all"
+                        >
+                            <div className="h-7 w-7 rounded-xl bg-gradient-to-br from-primary to-emerald-600 text-white flex items-center justify-center text-[11px] font-black">
+                                {selectedDoctor?.name?.charAt(0) || '?'}
+                            </div>
+                            <span className="text-[11px] font-bold text-slate-700 max-w-[160px] truncate">{selectedDoctor?.name || 'Selecionar'}</span>
+                            <ChevronDown className="h-3.5 w-3.5 text-slate-400" />
+                        </button>
+                        {showDoctorDropdown && (
+                            <>
+                                <div className="fixed inset-0 z-40" onClick={() => setShowDoctorDropdown(false)} />
+                                <div className="absolute top-full left-0 mt-2 w-72 bg-white rounded-2xl shadow-2xl border border-slate-200 z-50 overflow-hidden animate-in fade-in slide-in-from-top-2 duration-200">
+                                    <div className="p-3 border-b border-slate-100">
+                                        <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Profissionais</span>
+                                    </div>
+                                    <div className="max-h-[300px] overflow-y-auto">
+                                        {doctors.map((doc) => (
+                                            <button
+                                                key={doc.externalId}
+                                                onClick={() => { setSelectedDoctorId(doc.externalId); setShowDoctorDropdown(false); }}
+                                                className={`w-full px-4 py-3 flex items-center gap-3 text-left transition-all hover:bg-slate-50 ${
+                                                    selectedDoctorId === doc.externalId ? 'bg-primary/5' : ''
+                                                }`}
+                                            >
+                                                <div className={`h-8 w-8 rounded-xl flex items-center justify-center text-[11px] font-black ${
+                                                    selectedDoctorId === doc.externalId ? 'bg-primary text-white' : 'bg-slate-100 text-slate-400'
+                                                }`}>
+                                                    {doc.name.charAt(0)}
+                                                </div>
+                                                <div className="flex-1 min-w-0">
+                                                    <div className={`text-[12px] font-bold truncate ${selectedDoctorId === doc.externalId ? 'text-primary' : 'text-slate-700'}`}>
+                                                        {doc.name}
+                                                    </div>
+                                                    <div className="flex items-center gap-1.5 mt-0.5">
+                                                        <div className={`h-1.5 w-1.5 rounded-full ${doc.calendarStatus === 'enabled' ? 'bg-emerald-500' : 'bg-slate-300'}`}></div>
+                                                        <span className="text-[9px] font-bold text-slate-400 uppercase">{doc.calendarStatus === 'enabled' ? 'Online' : 'Offline'}</span>
+                                                    </div>
+                                                </div>
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+                            </>
+                        )}
+                    </div>
+                </div>
+
+                {/* Navigation */}
+                <div className="flex items-center gap-2">
+                    <button onClick={() => navigate(-1)} className="h-9 w-9 rounded-xl bg-white/80 border border-slate-200 hover:bg-white hover:shadow-md flex items-center justify-center transition-all">
+                        <ChevronLeft className="h-4 w-4 text-slate-600" />
+                    </button>
+                    <button onClick={goToToday} className="px-4 py-2 rounded-xl bg-primary/10 text-primary text-[10px] font-black uppercase tracking-widest hover:bg-primary/20 transition-all">
+                        Hoje
+                    </button>
+                    <button onClick={() => navigate(1)} className="h-9 w-9 rounded-xl bg-white/80 border border-slate-200 hover:bg-white hover:shadow-md flex items-center justify-center transition-all">
+                        <ChevronRight className="h-4 w-4 text-slate-600" />
+                    </button>
+                    <span className="text-[13px] font-bold text-slate-700 ml-2 capitalize">{periodLabel}</span>
+                </div>
+            </div>
+
+            {/* ─── CALENDAR BODY ─── */}
+            <div className="bg-white/70 backdrop-blur-xl rounded-[32px] shadow-sm border border-slate-100/80 overflow-hidden">
+                {/* Column headers for week/month */}
+                {viewMode !== 'day' && (
+                    <div className={`grid border-b border-slate-100 ${viewMode === 'month' ? 'grid-cols-7' : 'grid-cols-7'}`}>
+                        {(viewMode === 'month' ? ['Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb', 'Dom'] : displayDays.map(day => {
+                            const d = new Date(day + 'T00:00:00');
+                            return d.toLocaleDateString('pt-BR', { weekday: 'short' });
+                        })).map((label, i) => (
+                            <div key={i} className="text-center py-2.5 text-[9px] font-black text-slate-400 uppercase tracking-widest border-r border-slate-50 last:border-0">
+                                {label}
+                            </div>
+                        ))}
+                    </div>
+                )}
+
+                {/* Month grid */}
+                {viewMode === 'month' && (
+                    <div className="grid grid-cols-7">
+                        {displayDays.map((day) => {
+                            const d = new Date(day + 'T00:00:00');
+                            const isToday = day === todayStr;
+                            const isCurrentMonth = d.getMonth() === currentDate.getMonth();
+                            const dayBookings = bookingsByDay[day] || [];
+                            return (
+                                <div
+                                    key={day}
+                                    className={`min-h-[100px] border-r border-b border-slate-50 p-2 transition-colors ${
+                                        isToday ? 'bg-primary/[0.04]' : !isCurrentMonth ? 'bg-slate-50/50' : 'hover:bg-slate-50/50'
+                                    }`}
+                                >
+                                    <div className="flex items-center justify-between mb-1">
+                                        <span className={`text-[13px] font-black ${
+                                            isToday ? 'text-white bg-primary rounded-lg px-2 py-0.5' : isCurrentMonth ? 'text-slate-700' : 'text-slate-300'
+                                        }`}>
+                                            {d.getDate()}
+                                        </span>
+                                        {isCurrentMonth && (
+                                            <button
+                                                onClick={() => handleOpenBooking(day)}
+                                                className="h-5 w-5 rounded-md bg-slate-100 hover:bg-primary hover:text-white text-slate-400 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all text-[10px]"
+                                                style={{ opacity: 1 }}
+                                            >
+                                                <Plus className="h-3 w-3" />
+                                            </button>
+                                        )}
+                                    </div>
+                                    <div className="space-y-0.5">
+                                        {dayBookings.slice(0, 3).map((b, idx) => {
+                                            const isCancelled = b.status === 'CANCELLED';
+                                            const isVismed = b.origin === 'VISMED';
+                                            const dotColor = isCancelled ? 'bg-red-400' : b.status === 'MOVED' ? 'bg-amber-400' : isVismed ? 'bg-emerald-500' : 'bg-blue-500';
+                                            return (
+                                                <button
+                                                    key={idx}
+                                                    onClick={() => setSelectedBooking(b)}
+                                                    className={`w-full text-left flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[9px] font-bold transition-all hover:bg-slate-100 ${isCancelled ? 'line-through opacity-50' : 'text-slate-600'}`}
+                                                >
+                                                    <div className={`h-1.5 w-1.5 rounded-full shrink-0 ${dotColor}`}></div>
+                                                    <span className="font-black text-slate-500">{formatTime(b.startAt)}</span>
+                                                    <span className="truncate">{b.patientName}</span>
+                                                </button>
+                                            );
+                                        })}
+                                        {dayBookings.length > 3 && (
+                                            <span className="text-[8px] font-black text-slate-400 pl-1">+{dayBookings.length - 3} mais</span>
+                                        )}
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+                )}
+
+                {/* Week view */}
+                {viewMode === 'week' && (
+                    <div className="grid grid-cols-7">
+                        {/* Day number row */}
+                        {displayDays.map((day) => {
+                            const d = new Date(day + 'T00:00:00');
+                            const isToday = day === todayStr;
+                            const dayBookings = bookingsByDay[day] || [];
+                            return (
+                                <div key={day} className={`border-r border-slate-50 last:border-0 ${isToday ? 'bg-primary/[0.03]' : ''}`}>
+                                    <div className="text-center py-2 border-b border-slate-50">
+                                        <span className={`inline-flex items-center justify-center h-8 w-8 rounded-xl text-[16px] font-black ${
+                                            isToday ? 'bg-primary text-white' : 'text-slate-700'
+                                        }`}>
+                                            {d.getDate()}
+                                        </span>
+                                    </div>
+                                    <div className="min-h-[400px] p-2 space-y-1">
+                                        {dayBookings.map((b, idx) => {
+                                            const isCancelled = b.status === 'CANCELLED';
+                                            const isMoved = b.status === 'MOVED';
+                                            const isVismed = b.origin === 'VISMED';
+                                            const bgColor = isCancelled ? 'bg-red-50 border-red-200'
+                                                : isMoved ? 'bg-amber-50 border-amber-200'
+                                                : isVismed ? 'bg-emerald-50 border-emerald-200'
+                                                : 'bg-blue-50 border-blue-200';
+                                            const textColor = isCancelled ? 'text-red-700'
+                                                : isMoved ? 'text-amber-700'
+                                                : isVismed ? 'text-emerald-700'
+                                                : 'text-blue-700';
+                                            const dotColor = isCancelled ? 'bg-red-400' : isMoved ? 'bg-amber-400' : isVismed ? 'bg-emerald-500' : 'bg-blue-500';
+                                            return (
+                                                <button
+                                                    key={idx}
+                                                    onClick={() => setSelectedBooking(b)}
+                                                    className={`w-full text-left p-2 rounded-xl border transition-all hover:shadow-md hover:-translate-y-0.5 ${bgColor} ${isCancelled ? 'opacity-50 line-through' : ''}`}
+                                                >
+                                                    <div className="flex items-center gap-1.5 mb-1">
+                                                        <div className={`h-2 w-2 rounded-full ${dotColor}`}></div>
+                                                        <span className={`text-[10px] font-black ${textColor}`}>{formatTime(b.startAt)}</span>
+                                                    </div>
+                                                    <div className={`text-[10px] font-bold truncate ${textColor}`}>
+                                                        {b.patientName}{b.patientSurname ? ` ${b.patientSurname}` : ''}
+                                                    </div>
+                                                    <div className="text-[8px] font-black uppercase tracking-wider opacity-50 mt-0.5">{isVismed ? 'VisMed' : 'Doctoralia'}</div>
+                                                </button>
+                                            );
+                                        })}
+                                        <button
+                                            onClick={() => handleOpenBooking(day)}
+                                            className="w-full flex items-center justify-center gap-1 py-2 rounded-xl border border-dashed border-slate-200 text-[9px] font-bold text-slate-300 hover:border-primary hover:text-primary hover:bg-primary/5 transition-all mt-1"
+                                        >
+                                            <Plus className="h-3 w-3" /> Agendar
+                                        </button>
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+                )}
+
+                {/* Day view */}
+                {viewMode === 'day' && (() => {
+                    const dayStr = displayDays[0];
+                    const dayBookings = bookingsByDay[dayStr] || [];
+                    const hours = Array.from({ length: 14 }, (_, i) => i + 7);
+                    return (
+                        <div>
+                            <div className="text-center py-3 border-b border-slate-100">
+                                <span className="text-[13px] font-bold text-slate-700 capitalize">
+                                    {new Date(dayStr + 'T00:00:00').toLocaleDateString('pt-BR', { weekday: 'long', day: '2-digit', month: 'long' })}
+                                </span>
+                            </div>
+                            <div className="divide-y divide-slate-50">
+                                {hours.map((hour) => {
+                                    const hourStr = `${hour.toString().padStart(2, '0')}`;
+                                    const hourBookings = dayBookings.filter(b => {
+                                        const bHour = new Date(b.startAt).getHours();
+                                        return bHour === hour;
+                                    });
+                                    return (
+                                        <div key={hour} className="grid grid-cols-[80px_1fr] min-h-[56px]">
+                                            <div className="px-4 py-3 border-r border-slate-100 flex items-start">
+                                                <span className="text-[12px] font-bold text-slate-400">{hourStr}:00</span>
+                                            </div>
+                                            <div className="px-3 py-2 flex flex-wrap gap-2 items-start">
+                                                {hourBookings.map((b, idx) => {
+                                                    const isCancelled = b.status === 'CANCELLED';
+                                                    const isMoved = b.status === 'MOVED';
+                                                    const isVismed = b.origin === 'VISMED';
+                                                    const bgColor = isCancelled ? 'bg-red-50 border-red-200 text-red-700'
+                                                        : isMoved ? 'bg-amber-50 border-amber-200 text-amber-700'
+                                                        : isVismed ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                                                        : 'bg-blue-50 border-blue-200 text-blue-700';
+                                                    const dotColor = isCancelled ? 'bg-red-400' : isMoved ? 'bg-amber-400' : isVismed ? 'bg-emerald-500' : 'bg-blue-500';
+                                                    return (
+                                                        <button
+                                                            key={idx}
+                                                            onClick={() => setSelectedBooking(b)}
+                                                            className={`flex items-center gap-2.5 px-4 py-2.5 rounded-2xl border text-[11px] font-bold transition-all hover:shadow-lg hover:-translate-y-0.5 ${bgColor} ${isCancelled ? 'line-through opacity-50' : ''}`}
+                                                        >
+                                                            <div className={`h-2.5 w-2.5 rounded-full ${dotColor}`}></div>
+                                                            <span className="font-black">{formatTime(b.startAt)}</span>
+                                                            <span className="max-w-[200px] truncate">{b.patientName}{b.patientSurname ? ` ${b.patientSurname}` : ''}</span>
+                                                            <span className="text-[8px] font-black uppercase tracking-wider opacity-50">{isVismed ? 'VM' : 'DC'}</span>
+                                                        </button>
+                                                    );
+                                                })}
+                                                {hourBookings.length === 0 && (
+                                                    <button
+                                                        onClick={() => { setBookingSlot({ date: dayStr, time: `${hourStr}:00` }); setPatientForm({ name: '', surname: '', phone: '', email: '', cpf: '' }); setIsBookingModalOpen(true); }}
+                                                        className="flex items-center gap-1 px-3 py-2 rounded-xl border border-dashed border-transparent hover:border-slate-200 text-[9px] font-bold text-transparent hover:text-slate-400 transition-all"
+                                                    >
+                                                        <Plus className="h-3 w-3" /> Agendar
+                                                    </button>
+                                                )}
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        </div>
+                    );
+                })()}
+            </div>
+
+            {/* Legend bar */}
+            <div className="flex items-center gap-6 px-2">
+                {[
+                    { color: 'bg-emerald-500', label: 'VisMed' },
+                    { color: 'bg-blue-500', label: 'Doctoralia' },
+                    { color: 'bg-red-400', label: 'Cancelado' },
+                    { color: 'bg-amber-400', label: 'Movido' },
+                ].map((l) => (
+                    <div key={l.label} className="flex items-center gap-1.5">
+                        <div className={`h-2.5 w-2.5 rounded-full ${l.color}`}></div>
+                        <span className="text-[10px] font-bold text-slate-400">{l.label}</span>
+                    </div>
+                ))}
+            </div>
+
+            {/* ─── BOOKING DETAIL MODAL ─── */}
             {selectedBooking && (
-                <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-center justify-center p-6" onClick={() => setSelectedBooking(null)}>
-                    <div className="bg-white rounded-3xl shadow-2xl p-8 w-full max-w-lg relative animate-in zoom-in-95 duration-200" onClick={(e) => e.stopPropagation()}>
-                        <button onClick={() => setSelectedBooking(null)} className="absolute top-4 right-4 h-8 w-8 rounded-lg bg-slate-100 hover:bg-slate-200 flex items-center justify-center transition-all">
+                <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-50 flex items-center justify-center p-6" onClick={() => setSelectedBooking(null)}>
+                    <div className="bg-white rounded-[32px] shadow-2xl p-8 w-full max-w-lg relative animate-in zoom-in-95 duration-200" onClick={(e) => e.stopPropagation()}>
+                        <button onClick={() => setSelectedBooking(null)} className="absolute top-5 right-5 h-8 w-8 rounded-xl bg-slate-100 hover:bg-slate-200 flex items-center justify-center transition-all">
                             <X className="h-4 w-4 text-slate-500" />
                         </button>
 
@@ -519,14 +667,14 @@ export default function AppointmentsPage() {
                                 {selectedBooking.origin === 'VISMED' ? <Building2 className="h-7 w-7" /> : <Globe className="h-7 w-7" />}
                             </div>
                             <div>
-                                <h2 className="text-xl font-black text-slate-900">Detalhes do Agendamento</h2>
+                                <h2 className="text-xl font-black text-slate-900 tracking-tight">Detalhes do Agendamento</h2>
                                 <div className="flex items-center gap-2 mt-1">
-                                    <span className={`px-2 py-0.5 rounded-md text-[9px] font-black uppercase tracking-wider ${
+                                    <span className={`px-2.5 py-0.5 rounded-lg text-[9px] font-black uppercase tracking-wider ${
                                         selectedBooking.origin === 'VISMED' ? 'bg-emerald-100 text-emerald-700' : 'bg-blue-100 text-blue-700'
                                     }`}>
                                         {selectedBooking.origin === 'VISMED' ? 'VisMed' : 'Doctoralia'}
                                     </span>
-                                    <span className={`px-2 py-0.5 rounded-md text-[9px] font-black uppercase tracking-wider ${
+                                    <span className={`px-2.5 py-0.5 rounded-lg text-[9px] font-black uppercase tracking-wider ${
                                         selectedBooking.status === 'CANCELLED' ? 'bg-red-100 text-red-700' :
                                         selectedBooking.status === 'MOVED' ? 'bg-amber-100 text-amber-700' :
                                         'bg-slate-100 text-slate-600'
@@ -541,66 +689,63 @@ export default function AppointmentsPage() {
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
                                     <div className="text-[9px] font-black text-slate-400 uppercase tracking-wider mb-1">Paciente</div>
-                                    <div className="text-[14px] font-bold text-slate-800 flex items-center gap-2">
+                                    <div className="text-[13px] font-bold text-slate-800 flex items-center gap-2">
                                         <User className="h-4 w-4 text-slate-400" />
                                         {selectedBooking.patientName} {selectedBooking.patientSurname || ''}
                                     </div>
                                 </div>
                                 <div>
                                     <div className="text-[9px] font-black text-slate-400 uppercase tracking-wider mb-1">Horário</div>
-                                    <div className="text-[14px] font-bold text-slate-800 flex items-center gap-2">
+                                    <div className="text-[13px] font-bold text-slate-800 flex items-center gap-2">
                                         <Clock className="h-4 w-4 text-slate-400" />
-                                        {formatTime(selectedBooking.startAt)} - {formatTime(selectedBooking.endAt)}
+                                        {formatTime(selectedBooking.startAt)} — {formatTime(selectedBooking.endAt)}
                                     </div>
                                 </div>
                             </div>
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
                                     <div className="text-[9px] font-black text-slate-400 uppercase tracking-wider mb-1">Data</div>
-                                    <div className="text-[14px] font-bold text-slate-800 flex items-center gap-2">
+                                    <div className="text-[13px] font-bold text-slate-800 flex items-center gap-2">
                                         <CalendarDays className="h-4 w-4 text-slate-400" />
-                                        {formatDate(selectedBooking.startAt)}
+                                        {formatDateShort(selectedBooking.startAt)}
                                     </div>
                                 </div>
                                 <div>
                                     <div className="text-[9px] font-black text-slate-400 uppercase tracking-wider mb-1">Duração</div>
-                                    <div className="text-[14px] font-bold text-slate-800">{selectedBooking.duration || 30} min</div>
+                                    <div className="text-[13px] font-bold text-slate-800">{selectedBooking.duration || 30} min</div>
                                 </div>
                             </div>
                             {selectedBooking.patientPhone && (
                                 <div>
                                     <div className="text-[9px] font-black text-slate-400 uppercase tracking-wider mb-1">Telefone</div>
-                                    <div className="text-[13px] font-bold text-slate-700 flex items-center gap-2">
-                                        <Phone className="h-3.5 w-3.5 text-slate-400" />
-                                        {selectedBooking.patientPhone}
+                                    <div className="text-[12px] font-bold text-slate-700 flex items-center gap-2">
+                                        <Phone className="h-3.5 w-3.5 text-slate-400" /> {selectedBooking.patientPhone}
                                     </div>
                                 </div>
                             )}
                             {selectedBooking.patientEmail && (
                                 <div>
                                     <div className="text-[9px] font-black text-slate-400 uppercase tracking-wider mb-1">Email</div>
-                                    <div className="text-[13px] font-bold text-slate-700 flex items-center gap-2">
-                                        <Mail className="h-3.5 w-3.5 text-slate-400" />
-                                        {selectedBooking.patientEmail}
+                                    <div className="text-[12px] font-bold text-slate-700 flex items-center gap-2">
+                                        <Mail className="h-3.5 w-3.5 text-slate-400" /> {selectedBooking.patientEmail}
                                     </div>
                                 </div>
                             )}
                             {selectedBooking.serviceName && (
                                 <div>
                                     <div className="text-[9px] font-black text-slate-400 uppercase tracking-wider mb-1">Serviço</div>
-                                    <div className="text-[13px] font-bold text-slate-700 flex items-center gap-2">
-                                        <FileText className="h-3.5 w-3.5 text-slate-400" />
-                                        {selectedBooking.serviceName}
+                                    <div className="text-[12px] font-bold text-slate-700 flex items-center gap-2">
+                                        <FileText className="h-3.5 w-3.5 text-slate-400" /> {selectedBooking.serviceName}
                                     </div>
                                 </div>
                             )}
                         </div>
 
                         {selectedBooking.status !== 'CANCELLED' && selectedBooking.doctoraliaBookingId && (
-                            <div className="mt-6 flex gap-3">
+                            <div className="mt-5">
                                 <button
                                     onClick={() => handleCancelBooking(selectedBooking)}
-                                    className="flex-1 py-3 bg-red-50 border border-red-200 text-red-700 rounded-xl text-[11px] font-black uppercase tracking-wider hover:bg-red-100 transition-all flex items-center justify-center gap-2"
+                                    className="w-full py-3 bg-red-50 border border-red-200 text-red-700 rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-red-100 transition-all flex items-center justify-center gap-2"
                                 >
                                     <Ban className="h-4 w-4" /> Cancelar Agendamento
                                 </button>
@@ -610,20 +755,21 @@ export default function AppointmentsPage() {
                 </div>
             )}
 
+            {/* ─── CREATE BOOKING MODAL ─── */}
             {isBookingModalOpen && bookingSlot && (
-                <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-center justify-center p-6" onClick={() => setIsBookingModalOpen(false)}>
-                    <div className="bg-white rounded-3xl shadow-2xl p-8 w-full max-w-lg relative animate-in zoom-in-95 duration-200" onClick={(e) => e.stopPropagation()}>
-                        <button onClick={() => setIsBookingModalOpen(false)} className="absolute top-4 right-4 h-8 w-8 rounded-lg bg-slate-100 hover:bg-slate-200 flex items-center justify-center transition-all">
+                <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-50 flex items-center justify-center p-6" onClick={() => setIsBookingModalOpen(false)}>
+                    <div className="bg-white rounded-[32px] shadow-2xl p-8 w-full max-w-lg relative animate-in zoom-in-95 duration-200" onClick={(e) => e.stopPropagation()}>
+                        <button onClick={() => setIsBookingModalOpen(false)} className="absolute top-5 right-5 h-8 w-8 rounded-xl bg-slate-100 hover:bg-slate-200 flex items-center justify-center transition-all">
                             <X className="h-4 w-4 text-slate-500" />
                         </button>
 
                         <div className="flex items-center gap-4 mb-6">
-                            <div className="h-14 w-14 rounded-2xl bg-emerald-100 text-emerald-600 flex items-center justify-center">
+                            <div className="h-14 w-14 rounded-2xl bg-gradient-to-br from-primary to-emerald-600 text-white flex items-center justify-center">
                                 <CalendarDays className="h-7 w-7" />
                             </div>
                             <div>
-                                <h2 className="text-xl font-black text-slate-900">Novo Agendamento</h2>
-                                <p className="text-[12px] font-bold text-slate-400">
+                                <h2 className="text-xl font-black text-slate-900 tracking-tight">Novo Agendamento</h2>
+                                <p className="text-[11px] font-bold text-slate-400 capitalize">
                                     {new Date(bookingSlot.date + 'T00:00:00').toLocaleDateString('pt-BR', { weekday: 'long', day: '2-digit', month: 'long' })}
                                 </p>
                             </div>
@@ -631,80 +777,55 @@ export default function AppointmentsPage() {
 
                         <div className="space-y-4">
                             <div>
-                                <label className="text-[10px] font-black uppercase tracking-[2px] text-slate-400 mb-1.5 block">Horário</label>
+                                <label className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-1.5 block">Horário</label>
                                 <input
                                     type="time"
                                     value={bookingSlot.time}
                                     onChange={(e) => setBookingSlot({ ...bookingSlot, time: e.target.value })}
-                                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-sm font-bold focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all"
+                                    className="w-full bg-slate-50 border border-slate-200 rounded-2xl px-4 py-3 text-sm font-bold focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all"
                                 />
                             </div>
                             <div className="grid grid-cols-2 gap-3">
                                 <div>
-                                    <label className="text-[10px] font-black uppercase tracking-[2px] text-slate-400 mb-1.5 block">Nome</label>
-                                    <input
-                                        type="text"
-                                        value={patientForm.name}
-                                        onChange={(e) => setPatientForm({ ...patientForm, name: e.target.value })}
-                                        placeholder="Nome do paciente"
-                                        className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all"
-                                    />
+                                    <label className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-1.5 block">Nome</label>
+                                    <input type="text" value={patientForm.name} onChange={(e) => setPatientForm({ ...patientForm, name: e.target.value })} placeholder="Nome do paciente"
+                                        className="w-full bg-slate-50 border border-slate-200 rounded-2xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all" />
                                 </div>
                                 <div>
-                                    <label className="text-[10px] font-black uppercase tracking-[2px] text-slate-400 mb-1.5 block">Sobrenome</label>
-                                    <input
-                                        type="text"
-                                        value={patientForm.surname}
-                                        onChange={(e) => setPatientForm({ ...patientForm, surname: e.target.value })}
-                                        placeholder="Sobrenome"
-                                        className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all"
-                                    />
+                                    <label className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-1.5 block">Sobrenome</label>
+                                    <input type="text" value={patientForm.surname} onChange={(e) => setPatientForm({ ...patientForm, surname: e.target.value })} placeholder="Sobrenome"
+                                        className="w-full bg-slate-50 border border-slate-200 rounded-2xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all" />
                                 </div>
                             </div>
                             <div className="grid grid-cols-2 gap-3">
                                 <div>
-                                    <label className="text-[10px] font-black uppercase tracking-[2px] text-slate-400 mb-1.5 block">Telefone</label>
-                                    <input
-                                        type="tel"
-                                        value={patientForm.phone}
-                                        onChange={(e) => setPatientForm({ ...patientForm, phone: e.target.value })}
-                                        placeholder="(11) 99999-9999"
-                                        className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all"
-                                    />
+                                    <label className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-1.5 block">Telefone</label>
+                                    <input type="tel" value={patientForm.phone} onChange={(e) => setPatientForm({ ...patientForm, phone: e.target.value })} placeholder="(11) 99999-9999"
+                                        className="w-full bg-slate-50 border border-slate-200 rounded-2xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all" />
                                 </div>
                                 <div>
-                                    <label className="text-[10px] font-black uppercase tracking-[2px] text-slate-400 mb-1.5 block">CPF</label>
-                                    <input
-                                        type="text"
-                                        value={patientForm.cpf}
-                                        onChange={(e) => setPatientForm({ ...patientForm, cpf: e.target.value })}
-                                        placeholder="000.000.000-00"
-                                        className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all"
-                                    />
+                                    <label className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-1.5 block">CPF</label>
+                                    <input type="text" value={patientForm.cpf} onChange={(e) => setPatientForm({ ...patientForm, cpf: e.target.value })} placeholder="000.000.000-00"
+                                        className="w-full bg-slate-50 border border-slate-200 rounded-2xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all" />
                                 </div>
                             </div>
                             <div>
-                                <label className="text-[10px] font-black uppercase tracking-[2px] text-slate-400 mb-1.5 block">Email</label>
-                                <input
-                                    type="email"
-                                    value={patientForm.email}
-                                    onChange={(e) => setPatientForm({ ...patientForm, email: e.target.value })}
-                                    placeholder="paciente@email.com"
-                                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all"
-                                />
+                                <label className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-1.5 block">Email</label>
+                                <input type="email" value={patientForm.email} onChange={(e) => setPatientForm({ ...patientForm, email: e.target.value })} placeholder="paciente@email.com"
+                                    className="w-full bg-slate-50 border border-slate-200 rounded-2xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all" />
                             </div>
 
-                            <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 flex items-center gap-3">
+                            <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-3 flex items-center gap-3">
                                 <ArrowRightLeft className="h-4 w-4 text-emerald-600 shrink-0" />
-                                <p className="text-[10px] font-bold text-emerald-700">
-                                    Este agendamento será criado simultaneamente no VisMed e na Doctoralia, bloqueando o horário em ambas as plataformas.
+                                <p className="text-[9px] font-bold text-emerald-700 uppercase tracking-wider">
+                                    Agendamento será criado no VisMed e na Doctoralia simultaneamente.
                                 </p>
                             </div>
 
                             <button
                                 onClick={handleCreateBooking}
                                 disabled={isSaving || !patientForm.name.trim()}
-                                className="w-full py-3.5 bg-primary hover:bg-primary/90 text-white rounded-xl text-[12px] font-black uppercase tracking-wider shadow-lg shadow-primary/30 transition-all disabled:opacity-40 flex items-center justify-center gap-2"
+                                className="w-full py-3.5 bg-gradient-to-r from-primary to-emerald-600 hover:from-primary/90 hover:to-emerald-600/90 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-[0_8px_20px_-6px_rgba(31,181,122,0.4)] transition-all disabled:opacity-40 flex items-center justify-center gap-2"
                             >
                                 {isSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <CalendarDays className="h-4 w-4" />}
                                 {isSaving ? 'Agendando...' : 'Confirmar Agendamento'}
