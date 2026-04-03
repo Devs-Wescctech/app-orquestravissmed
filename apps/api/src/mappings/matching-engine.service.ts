@@ -137,9 +137,8 @@ export class MatchingEngineService {
     }
 
     private static readonly INSURANCE_NOISE_WORDS = new Set([
-        'convenio', 'plano', 'saude', 'seguro', 'cartao', 'clinica', 'particular',
-        'orcamento', 'faturar', 'vista', 'parcelado', 'pagamento', 'avista',
-        'r$', 'de', 'do', 'da', 'dos', 'das', 'e', 'em', 'a', 'o', 'para', 'com',
+        'de', 'do', 'da', 'dos', 'das', 'e', 'em', 'a', 'o', 'para', 'com',
+        'r$', 'na', 'no', 'ao', 'por', 'que', 'uma', 'um',
     ]);
 
     private static readonly NON_INSURANCE_PATTERNS = [
@@ -149,9 +148,6 @@ export class MatchingEngineService {
         /parcelad/i,
         /faturar/i,
         /particular/i,
-        /cartao\s+clinica/i,
-        /estetica/i,
-        /google\s+a\s+faturar/i,
     ];
 
     private extractInsuranceCoreTokens(name: string): string[] {
