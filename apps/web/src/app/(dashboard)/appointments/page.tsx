@@ -1,719 +1,713 @@
 'use client';
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import {
-    CalendarDays, AlertCircle, ExternalLink, Loader2, UserSquare2,
-    CalendarOff, Clock, Search, AlertTriangle, RefreshCw, CalendarClock, Timer,
-    User, ChevronRight, Activity, ShieldCheck, Filter, ArrowUpRight, BarChart3, CheckCircle2, Stethoscope,
-    PowerOff,
-    Settings2,
-    Zap,
-    LayoutGrid,
-    ShieldAlert,
-    Power
+    CalendarDays, AlertCircle, Loader2, Clock, RefreshCw, User, ChevronLeft, ChevronRight,
+    Stethoscope, X, Phone, Mail, FileText, Globe, Building2, ArrowRightLeft, Ban,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { useClinic } from '@/lib/clinic-store';
 import { useAuthStore } from '@/lib/store';
 import { toast } from 'sonner';
 
-type ViewState = 'loading' | 'disabled' | 'empty' | 'error' | 'timeout' | 'ready';
-type Tab = 'bookings' | 'slots';
+interface Doctor {
+    externalId: string;
+    name: string;
+    calendarStatus: string;
+    addressId: string | null;
+    facilityId: string | null;
+}
+
+interface BookingRecord {
+    id?: string;
+    doctoraliaBookingId?: string;
+    origin: 'VISMED' | 'DOCTORALIA';
+    status: string;
+    patientName: string;
+    patientSurname?: string;
+    patientPhone?: string;
+    patientEmail?: string;
+    startAt: string;
+    endAt: string;
+    duration?: number;
+    serviceName?: string;
+    doctoraliaDoctorId?: string;
+    vismedDoctorId?: string;
+    doctorName?: string;
+    start_at?: string;
+    end_at?: string;
+    patient?: { name?: string; surname?: string; phone?: string; email?: string };
+    booked_by?: string;
+}
+
+function formatTime(dateStr: string) {
+    try {
+        const d = new Date(dateStr);
+        return d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+    } catch { return dateStr; }
+}
+
+function formatDate(dateStr: string) {
+    try {
+        const d = new Date(dateStr);
+        return d.toLocaleDateString('pt-BR', { weekday: 'short', day: '2-digit', month: '2-digit' });
+    } catch { return dateStr; }
+}
+
+function getDaysInRange(start: string, end: string): string[] {
+    const days: string[] = [];
+    const s = new Date(start + 'T00:00:00');
+    const e = new Date(end + 'T00:00:00');
+    for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
+        days.push(d.toISOString().split('T')[0]);
+    }
+    return days;
+}
 
 export default function AppointmentsPage() {
     const { user } = useAuthStore();
     const { activeClinic } = useClinic();
-    const [calendarStatus, setCalendarStatus] = useState<any>(null);
-    const [bookings, setBookings] = useState<any[]>([]);
-    const [slots, setSlots] = useState<any[]>([]);
-    const [viewState, setViewState] = useState<ViewState>('loading');
-    const [errorMsg, setErrorMsg] = useState('');
-    const [activeTab, setActiveTab] = useState<Tab>('bookings');
-
-    // Filters
-    const today = new Date().toISOString().split('T')[0];
-    const weekLater = new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0];
-    const [startDate, setStartDate] = useState(today);
-    const [endDate, setEndDate] = useState(weekLater);
-    const [selectedDoctor, setSelectedDoctor] = useState('');
-    const [isFetching, setIsFetching] = useState(false);
-
     const clinicId = activeClinic?.id;
 
-    // ────────────────────── FETCH STATUS ──────────────────────
-    const fetchStatus = useCallback(async () => {
+    const [doctors, setDoctors] = useState<Doctor[]>([]);
+    const [selectedDoctorId, setSelectedDoctorId] = useState('');
+    const [isLoading, setIsLoading] = useState(true);
+    const [isFetching, setIsFetching] = useState(false);
+
+    const today = new Date();
+    const [weekStart, setWeekStart] = useState(() => {
+        const d = new Date(today);
+        d.setDate(d.getDate() - d.getDay() + 1);
+        return d.toISOString().split('T')[0];
+    });
+
+    const weekEnd = useMemo(() => {
+        const d = new Date(weekStart + 'T00:00:00');
+        d.setDate(d.getDate() + 6);
+        return d.toISOString().split('T')[0];
+    }, [weekStart]);
+
+    const weekDays = useMemo(() => getDaysInRange(weekStart, weekEnd), [weekStart, weekEnd]);
+
+    const [doctoraliaBookings, setDoctoraliaBookings] = useState<any[]>([]);
+    const [syncRecords, setSyncRecords] = useState<BookingRecord[]>([]);
+    const [selectedBooking, setSelectedBooking] = useState<any>(null);
+
+    const [isBookingModalOpen, setIsBookingModalOpen] = useState(false);
+    const [bookingSlot, setBookingSlot] = useState<{ date: string; time: string } | null>(null);
+    const [patientForm, setPatientForm] = useState({ name: '', surname: '', phone: '', email: '', cpf: '' });
+    const [isSaving, setIsSaving] = useState(false);
+
+    const [syncStats, setSyncStats] = useState<any>(null);
+
+    const navigateWeek = (direction: number) => {
+        const d = new Date(weekStart + 'T00:00:00');
+        d.setDate(d.getDate() + direction * 7);
+        setWeekStart(d.toISOString().split('T')[0]);
+    };
+
+    const goToToday = () => {
+        const d = new Date();
+        d.setDate(d.getDate() - d.getDay() + 1);
+        setWeekStart(d.toISOString().split('T')[0]);
+    };
+
+    const fetchDoctors = useCallback(async () => {
         if (!clinicId) return;
-        setViewState('loading');
         try {
-            const res = await api.get('/appointments/calendar-status', {
-                params: { clinicId }
-            });
-            setCalendarStatus(res.data);
-
-            if (!res.data?.integrated) {
-                setViewState('error');
-                setErrorMsg('Integração Doctoralia não configurada para esta unidade.');
-            } else if (res.data?.timedOut) {
-                setViewState('timeout');
-                setErrorMsg(res.data.error || 'O servidor de sincronização não respondeu');
-            } else if (!res.data?.calendarEnabled) {
-                setViewState('disabled');
-            } else {
-                setViewState('ready');
+            const res = await api.get('/appointments/calendar-status', { params: { clinicId } });
+            const docs = res.data?.doctors || [];
+            setDoctors(docs);
+            if (docs.length > 0 && !selectedDoctorId) {
+                const enabled = docs.find((d: Doctor) => d.calendarStatus === 'enabled');
+                if (enabled) setSelectedDoctorId(enabled.externalId);
+                else setSelectedDoctorId(docs[0].externalId);
             }
+            setIsLoading(false);
         } catch (e: any) {
-            setViewState('error');
-            setErrorMsg(e.message || 'Erro ao verificar status do calendário');
+            toast.error('Erro ao carregar médicos');
+            setIsLoading(false);
         }
-    }, [clinicId]);
+    }, [clinicId, selectedDoctorId]);
 
-    useEffect(() => {
-        fetchStatus();
-    }, [fetchStatus]);
+    useEffect(() => { fetchDoctors(); }, [fetchDoctors]);
 
-    // ────────────────────── FETCH DATA ──────────────────────
-    const fetchData = useCallback(async () => {
-        if (!clinicId || viewState === 'disabled') return;
+    const fetchBookings = useCallback(async () => {
+        if (!clinicId || !selectedDoctorId) return;
         setIsFetching(true);
-        setErrorMsg('');
-
         try {
-            if (activeTab === 'bookings') {
-                const params: any = { clinicId, start: startDate, end: endDate };
-                if (selectedDoctor) params.doctorId = selectedDoctor;
-                const res = await api.get('/appointments/bookings', { params });
+            const [bookingsRes, syncRes, statsRes] = await Promise.all([
+                api.get('/appointments/bookings', {
+                    params: { clinicId, doctorId: selectedDoctorId, start: weekStart, end: weekEnd }
+                }),
+                api.get('/booking-sync/records', {
+                    params: { clinicId, doctoraliaDoctorId: selectedDoctorId, start: weekStart, end: weekEnd }
+                }).catch(() => ({ data: [] })),
+                api.get('/booking-sync/stats', { params: { clinicId } }).catch(() => ({ data: null })),
+            ]);
 
-                if (res.data?.timedOut) {
-                    setErrorMsg(res.data.error || 'API não respondeu no tempo esperado');
-                } else {
-                    setBookings(res.data?.bookings || []);
-                    if ((res.data?.bookings || []).length === 0) {
-                        setViewState('empty');
-                    } else {
-                        setViewState('ready');
-                    }
-                }
-            } else {
-                if (!selectedDoctor) {
-                    toast.error('Selecione um médico para buscar slots.');
-                    setIsFetching(false);
-                    return;
-                }
-                const params = { clinicId, doctorId: selectedDoctor, start: startDate, end: endDate };
-                const res = await api.get('/appointments/slots', { params });
-
-                if (res.data?.timedOut) {
-                    setErrorMsg(res.data.error || 'API não respondeu');
-                } else {
-                    setSlots(res.data?.slots || []);
-                    setViewState((res.data?.slots || []).length === 0 ? 'empty' : 'ready');
-                }
-            }
+            setDoctoraliaBookings(bookingsRes.data?.bookings || []);
+            setSyncRecords(Array.isArray(syncRes.data) ? syncRes.data : []);
+            setSyncStats(statsRes.data);
         } catch (e: any) {
-            setErrorMsg(e.message || 'Erro desconhecido');
+            toast.error('Erro ao buscar agendamentos');
         } finally {
             setIsFetching(false);
         }
-    }, [clinicId, activeTab, startDate, endDate, selectedDoctor, viewState]);
+    }, [clinicId, selectedDoctorId, weekStart, weekEnd]);
 
-    useEffect(() => {
-        if (viewState === 'ready' || viewState === 'empty') {
-            fetchData();
+    useEffect(() => { fetchBookings(); }, [fetchBookings]);
+
+    const allBookings = useMemo(() => {
+        const merged: BookingRecord[] = [];
+        const seenDoctoraliaIds = new Set<string>();
+
+        for (const rec of syncRecords) {
+            if (rec.doctoraliaBookingId) seenDoctoraliaIds.add(rec.doctoraliaBookingId);
+            merged.push(rec);
         }
-    }, [activeTab, selectedDoctor, startDate, endDate, viewState, fetchData]);
 
-    const [isBookingModalOpen, setIsBookingModalOpen] = useState(false);
-    const [selectedSlot, setSelectedSlot] = useState<any>(null);
-    const [isWorkPeriodModalOpen, setIsWorkPeriodModalOpen] = useState(false);
-    const [isSaving, setIsSaving] = useState(false);
+        for (const b of doctoraliaBookings) {
+            const bid = String(b.id || b.visit_booking_id || '');
+            if (bid && seenDoctoraliaIds.has(bid)) continue;
 
-    // Form states
-    const [patientForm, setPatientForm] = useState({ name: '', phone: '', email: '' });
-    const [workPeriodForm, setWorkPeriodForm] = useState({ start: '08:00', end: '18:00' });
-
-    // ────────────────────── MUTATION ACTIONS ──────────────────────
-    const handleToggleCalendar = async (doctoraliaDoctorId: string, currentStatus: string) => {
-        const newStatus = currentStatus === 'enabled' ? 'disabled' : 'enabled';
-        const toastId = toast.loading(`${newStatus === 'enabled' ? 'Habilitando' : 'Desabilitando'} agenda na Doctoralia...`);
-        
-        try {
-            await api.post('/appointments/calendar-status', {
-                clinicId,
-                doctoraliaDoctorId,
-                status: newStatus
+            merged.push({
+                doctoraliaBookingId: bid,
+                origin: b.booked_by === 'integration' ? 'VISMED' : 'DOCTORALIA',
+                status: b.status || 'booked',
+                patientName: b.patient?.name || 'Paciente',
+                patientSurname: b.patient?.surname || '',
+                patientPhone: b.patient?.phone ? String(b.patient.phone) : '',
+                patientEmail: b.patient?.email || '',
+                startAt: b.start_at,
+                endAt: b.end_at,
+                duration: parseInt(b.duration) || 30,
+                serviceName: b.address_service?.name || '',
+                doctoraliaDoctorId: selectedDoctorId,
+                doctorName: b.doctorName,
+                booked_by: b.booked_by,
             });
-            toast.success(`Agenda ${newStatus === 'enabled' ? 'ativada' : 'desativada'} com sucesso.`, { id: toastId });
-            fetchStatus(); // Refresh the list from the new endpoint
-        } catch (error: any) {
-            toast.error(`Falha ao alterar status: ${error.message}`, { id: toastId });
         }
+
+        return merged.sort((a, b) => new Date(a.startAt).getTime() - new Date(b.startAt).getTime());
+    }, [syncRecords, doctoraliaBookings, selectedDoctorId]);
+
+    const bookingsByDay = useMemo(() => {
+        const map: Record<string, BookingRecord[]> = {};
+        for (const day of weekDays) {
+            map[day] = [];
+        }
+        for (const b of allBookings) {
+            const dayKey = new Date(b.startAt).toISOString().split('T')[0];
+            if (map[dayKey]) {
+                map[dayKey].push(b);
+            }
+        }
+        return map;
+    }, [allBookings, weekDays]);
+
+    const handleOpenBooking = (date: string) => {
+        setBookingSlot({ date, time: '08:00' });
+        setPatientForm({ name: '', surname: '', phone: '', email: '', cpf: '' });
+        setIsBookingModalOpen(true);
     };
 
-    const setQuickDate = (daysOffset: number, isRange: boolean = false) => {
-        const start = new Date();
-        start.setDate(start.getDate() + daysOffset);
-        const startStr = start.toISOString().split('T')[0];
-        
-        setStartDate(startStr);
-        if (!isRange) {
-            setEndDate(startStr);
-        } else {
-            const end = new Date();
-            end.setDate(end.getDate() + daysOffset + 6);
-            setEndDate(end.toISOString().split('T')[0]);
-        }
-    };
-
-    const handleBlockSlot = async (slot: any) => {
-        if (!clinicId || !selectedDoctor) return;
-        const confirm = window.confirm(`Deseja realmente remover o slot de ${slot.start}?`);
-        if (!confirm) return;
-
-        const toastId = toast.loading('Removendo slot...');
-        try {
-            await api.delete('/appointments/slots', {
-                params: {
-                    clinicId,
-                    doctorId: selectedDoctor,
-                    start: slot.start,
-                    end: slot.end
-                }
-            });
-            toast.success('Slot removido com sucesso.', { id: toastId });
-            fetchData();
-        } catch (e: any) {
-            toast.error(`Falha ao remover: ${e.message}`, { id: toastId });
-        }
-    };
-
-    const handleConfirmBooking = async () => {
-        if (!clinicId || !selectedDoctor || !selectedSlot) return;
-        if (!patientForm.name) {
-            toast.error('O nome do paciente é obrigatório.');
+    const handleCreateBooking = async () => {
+        if (!clinicId || !selectedDoctorId || !bookingSlot) return;
+        if (!patientForm.name.trim()) {
+            toast.error('Nome do paciente é obrigatório');
             return;
         }
 
-        const toastId = toast.loading('Agendando consulta...');
         setIsSaving(true);
+        const toastId = toast.loading('Criando agendamento...');
+
         try {
-            await api.post('/appointments/slots/book', {
+            const slotStart = `${bookingSlot.date}T${bookingSlot.time}:00-03:00`;
+
+            const selectedDoc = doctors.find(d => d.externalId === selectedDoctorId);
+
+            await api.post('/booking-sync/book-from-vismed', {
                 clinicId,
-                doctorId: selectedDoctor,
-                start: selectedSlot.start,
-                end: selectedSlot.end,
-                address_service_id: selectedSlot.address_service_id,
+                doctoraliaDoctorId: selectedDoctorId,
+                slotStart,
                 patient: {
                     name: patientForm.name,
-                    phone: patientForm.phone || '11999999999',
-                    email: patientForm.email || 'vissmed@integration.local'
-                }
+                    surname: patientForm.surname || patientForm.name.split(' ').slice(-1)[0],
+                    phone: patientForm.phone,
+                    email: patientForm.email,
+                    cpf: patientForm.cpf,
+                },
             });
-            toast.success('Reserva realizada com sucesso.', { id: toastId });
+
+            toast.success('Agendamento criado com sucesso!', { id: toastId });
             setIsBookingModalOpen(false);
-            setPatientForm({ name: '', phone: '', email: '' });
-            fetchData();
+            fetchBookings();
         } catch (e: any) {
-            const msg = e.message;
-            toast.error(`Falha ao agendar: ${msg}`, { id: toastId });
+            toast.error(`Erro: ${e.response?.data?.message || e.message}`, { id: toastId });
         } finally {
             setIsSaving(false);
         }
     };
 
-    const handleConfirmWorkPeriod = async () => {
-        if (!clinicId || !selectedDoctor) return;
+    const handleCancelBooking = async (booking: BookingRecord) => {
+        if (!clinicId || !booking.doctoraliaBookingId) return;
+        if (!confirm('Deseja realmente cancelar este agendamento?')) return;
 
-        const toastId = toast.loading('Publicando malha de horários...');
-        setIsSaving(true);
+        const toastId = toast.loading('Cancelando...');
         try {
-            const startISO = `${startDate}T${workPeriodForm.start}:00-0300`;
-            const endISO = `${startDate}T${workPeriodForm.end}:00-0300`;
-
-            await api.put('/appointments/slots', {
-                clinicId,
-                doctorId: selectedDoctor,
-                slots: [
-                    {
-                        start: startISO,
-                        end: endISO,
-                        address_services: [
-                            { address_service_id: slots[0]?.address_service_id || 0, duration: 30 }
-                        ]
-                    }
-                ]
+            await api.delete(`/booking-sync/cancel/${booking.doctoraliaBookingId}`, {
+                params: { clinicId },
             });
-            toast.success('Período de trabalho definido.', { id: toastId });
-            setIsWorkPeriodModalOpen(false);
-            fetchData();
+            toast.success('Agendamento cancelado', { id: toastId });
+            setSelectedBooking(null);
+            fetchBookings();
         } catch (e: any) {
-            const msg = e.message;
-            toast.error(`Falha ao definir período: ${msg}`, { id: toastId });
-        } finally {
-            setIsSaving(false);
+            toast.error(`Erro ao cancelar: ${e.response?.data?.message || e.message}`, { id: toastId });
         }
     };
 
-    const doctors = calendarStatus?.doctors || [];
-    const enabledDoctors = doctors.filter((d: any) => d.calendarStatus === 'enabled');
+    const selectedDoctor = doctors.find(d => d.externalId === selectedDoctorId);
+    const todayStr = today.toISOString().split('T')[0];
 
-    if (viewState === 'loading' && slots.length === 0 && bookings.length === 0) {
+    const hours = Array.from({ length: 15 }, (_, i) => {
+        const h = i + 7;
+        return `${h.toString().padStart(2, '0')}:00`;
+    });
+
+    if (isLoading) {
         return (
             <div className="flex flex-col items-center justify-center min-h-screen">
                 <Loader2 className="h-12 w-12 animate-spin text-primary opacity-20" />
-                <div className="mt-4 text-[11px] font-black text-slate-400 uppercase tracking-[4px] animate-pulse">Sincronizando Malha...</div>
+                <div className="mt-4 text-[11px] font-black text-slate-400 uppercase tracking-[4px] animate-pulse">Carregando Agenda...</div>
             </div>
         );
     }
 
     return (
-        <div className="max-w-[1600px] mx-auto space-y-10 animate-in fade-in slide-in-from-bottom-4 duration-700 pb-20">
-            
-            {/* ─── HEADER ─── */}
-            <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-6">
-                <div className="flex items-center gap-6">
-                    <div className="h-20 w-20 rounded-[30px] bg-gradient-to-br from-primary to-indigo-600 flex items-center justify-center shadow-2xl shadow-primary/30 relative group overflow-hidden">
-                        <CalendarDays className="h-10 w-10 text-white relative z-10 transition-transform group-hover:scale-110 duration-500" />
-                        <div className="absolute inset-0 bg-white/20 opacity-0 group-hover:opacity-100 transition-opacity duration-500"></div>
+        <div className="max-w-[1700px] mx-auto space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-700 pb-20">
+
+            <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4">
+                <div className="flex items-center gap-5">
+                    <div className="h-16 w-16 rounded-[24px] bg-gradient-to-br from-primary to-indigo-600 flex items-center justify-center shadow-2xl shadow-primary/30">
+                        <CalendarDays className="h-8 w-8 text-white" />
                     </div>
                     <div>
-                        <div className="flex items-center gap-3 mb-1">
-                            <span className="px-3 py-1 rounded-full bg-primary/10 text-primary text-[10px] font-black uppercase tracking-[2px]">Central de Operações</span>
-                            <div className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse"></div>
-                            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Live Sync</span>
-                        </div>
-                        <h1 className="text-4xl font-black text-slate-900 tracking-tight leading-none">Agendamentos</h1>
-                        <p className="text-slate-500 mt-2 font-medium flex items-center gap-2">
-                             Gestão em tempo real da malha de agendamentos e disponibilidades da infraestrutura Doctoralia.
-                        </p>
+                        <h1 className="text-3xl font-black text-slate-900 tracking-tight">Agenda</h1>
+                        <p className="text-slate-500 text-sm font-medium">Agendamentos sincronizados VisMed + Doctoralia</p>
                     </div>
                 </div>
 
                 <div className="flex items-center gap-3">
-                    <button 
-                        onClick={fetchStatus}
-                        className="flex items-center gap-2 px-6 py-3 bg-white border border-slate-200 text-slate-600 rounded-2xl text-[12px] font-black uppercase tracking-widest hover:bg-slate-50 hover:border-slate-300 transition-all shadow-sm"
-                    >
-                        <RefreshCw className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`} /> Sincronizar Agora
+                    {syncStats && (
+                        <div className="flex items-center gap-4 mr-4">
+                            <div className="flex items-center gap-1.5">
+                                <div className="h-2.5 w-2.5 rounded-full bg-emerald-500"></div>
+                                <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider">VisMed: {syncStats.byOrigin?.VISMED || 0}</span>
+                            </div>
+                            <div className="flex items-center gap-1.5">
+                                <div className="h-2.5 w-2.5 rounded-full bg-blue-500"></div>
+                                <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider">Doctoralia: {syncStats.byOrigin?.DOCTORALIA || 0}</span>
+                            </div>
+                        </div>
+                    )}
+                    <button onClick={() => { fetchDoctors(); fetchBookings(); }} className="flex items-center gap-2 px-5 py-2.5 bg-white border border-slate-200 text-slate-600 rounded-xl text-[11px] font-bold hover:bg-slate-50 transition-all shadow-sm">
+                        <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} /> Atualizar
                     </button>
                 </div>
             </div>
 
-            {/* ─── METRICS BAR ─── */}
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-                {[
-                    { label: 'Total Consultas', value: bookings.length, icon: User, color: 'primary', trend: '+12%' },
-                    { label: 'Slots Livres', value: slots.length, icon: CalendarClock, color: 'emerald', trend: 'Live' },
-                    { label: 'Médicos Ativos', value: enabledDoctors.length, icon: ShieldCheck, color: 'indigo', trend: `${enabledDoctors.length}/${doctors.length}` },
-                    { label: 'Saúde Conexão', value: '98%', icon: Activity, color: 'orange', trend: 'Estável' },
-                ].map((stat, i) => (
-                    <div key={i} className="bg-white/60 backdrop-blur-md rounded-[32px] p-8 border border-slate-100/60 shadow-sm group hover:border-primary/20 transition-all duration-500">
-                        <div className="flex items-start justify-between mb-4">
-                            <div className={`h-14 w-14 rounded-2xl bg-${stat.color === 'primary' ? 'primary' : stat.color + '-500'}/10 text-${stat.color === 'primary' ? 'primary' : stat.color + '-600'} flex items-center justify-center transition-transform group-hover:scale-110 duration-500`}>
-                                <stat.icon className="h-7 w-7" />
-                            </div>
-                            <span className="text-[11px] font-black text-slate-400 uppercase tracking-widest">{stat.trend}</span>
-                        </div>
-                        <div className="text-3xl font-black text-slate-900 tracking-tighter mb-1">{stat.value}</div>
-                        <div className="text-[12px] font-bold text-slate-400 uppercase tracking-widest">{stat.label}</div>
-                    </div>
-                ))}
-            </div>
+            <div className="grid grid-cols-1 xl:grid-cols-[280px_1fr] gap-6 items-start">
 
-            {/* ─── MAIN CONTENT ─── */}
-            <div className="grid grid-cols-1 xl:grid-cols-[400px_1fr] gap-8 items-start">
-                
-                {/* SIDEBAR: COMMAND CENTER */}
-                <aside className="space-y-8 sticky top-24">
-                    {/* Operation Controls */}
-                    <div className="bg-slate-900 rounded-[40px] p-8 text-white shadow-2xl relative overflow-hidden group border border-white/5">
-                        <div className="absolute -top-10 -right-10 opacity-[0.03] group-hover:opacity-[0.07] transition-all duration-1000 rotate-12">
-                            <Activity className="h-64 w-64" />
+                <aside className="space-y-4">
+                    <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+                        <div className="px-4 py-3 border-b border-slate-100">
+                            <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-[2px]">Profissionais</h3>
                         </div>
-
-                        <div className="flex items-center justify-between mb-8 relative z-10">
-                            <h2 className="text-xl font-black flex items-center gap-3">
-                                <div className="h-10 w-10 rounded-2xl bg-primary/20 text-primary flex items-center justify-center shadow-inner">
-                                    <Settings2 className="h-5 w-5" />
-                                </div>
-                                Painel de Controle
-                            </h2>
-                            <div className="flex gap-1">
-                                <div className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse"></div>
-                                <div className="h-1.5 w-1.5 rounded-full bg-emerald-500/40"></div>
-                            </div>
-                        </div>
-                        
-                        <div className="space-y-8 relative z-10">
-                            {/* Quick Dates */}
-                            <div>
-                                <label className="text-[10px] font-black uppercase tracking-[2px] text-slate-500 ml-1 mb-3 block">Navegação Temporal</label>
-                                <div className="flex flex-wrap gap-2">
-                                    {[
-                                        { label: 'Hoje', offset: 0 },
-                                        { label: 'Amanhã', offset: 1 },
-                                        { label: 'Semana', offset: 0, range: true },
-                                    ].map((d, i) => (
-                                        <button 
-                                            key={i}
-                                            onClick={() => setQuickDate(d.offset, d.range)}
-                                            className="px-4 py-2.5 rounded-xl bg-white/5 border border-white/10 text-[10px] font-black uppercase tracking-widest hover:bg-primary hover:border-primary transition-all active:scale-95"
-                                        >
-                                            {d.label}
-                                        </button>
-                                    ))}
-                                </div>
-                                <div className="grid grid-cols-2 gap-3 mt-4">
-                                    <div className="space-y-1">
-                                        <span className="text-[8px] font-black text-slate-600 uppercase tracking-widest ml-1">De</span>
-                                        <input type="date" value={startDate} onChange={(e)=>setStartDate(e.target.value)} className="bg-white/5 border border-white/5 rounded-xl px-4 py-2.5 text-[12px] focus:outline-none focus:ring-1 focus:ring-primary/50 transition-all text-white w-full" />
+                        <div className="max-h-[500px] overflow-y-auto">
+                            {doctors.map((doc) => (
+                                <button
+                                    key={doc.externalId}
+                                    onClick={() => setSelectedDoctorId(doc.externalId)}
+                                    className={`w-full px-4 py-3 flex items-center gap-3 text-left transition-all border-b border-slate-50 last:border-0
+                                        ${selectedDoctorId === doc.externalId
+                                            ? 'bg-primary/5 border-l-4 !border-l-primary'
+                                            : 'hover:bg-slate-50'}`}
+                                >
+                                    <div className={`h-9 w-9 rounded-xl flex items-center justify-center text-[12px] font-black shrink-0
+                                        ${selectedDoctorId === doc.externalId ? 'bg-primary text-white' : 'bg-slate-100 text-slate-400'}`}>
+                                        {doc.name.charAt(0)}
                                     </div>
-                                    <div className="space-y-1">
-                                        <span className="text-[8px] font-black text-slate-600 uppercase tracking-widest ml-1">Até</span>
-                                        <input type="date" value={endDate} onChange={(e)=>setEndDate(e.target.value)} className="bg-white/5 border border-white/5 rounded-xl px-4 py-2.5 text-[12px] focus:outline-none focus:ring-1 focus:ring-primary/50 transition-all text-white w-full" />
-                                    </div>
-                                </div>
-                            </div>
-                            
-                            {/* Specialist List (Modern Replacement for Select) */}
-                            <div>
-                                <div className="flex items-center justify-between mb-4">
-                                    <label className="text-[10px] font-black uppercase tracking-[2px] text-slate-500 ml-1 block">Especialistas Disponíveis</label>
-                                    <span className="px-2 py-0.5 rounded-md bg-white/5 text-[9px] font-bold text-slate-500">{doctors.length} total</span>
-                                </div>
-                                <div className="space-y-2 max-h-[300px] overflow-y-auto pr-2 custom-scrollbar">
-                                    {doctors.map((doc: any, i: number) => (
-                                        <div 
-                                            key={i} 
-                                            onClick={() => setSelectedDoctor(doc.externalId)}
-                                            className={`p-4 rounded-3xl border transition-all cursor-pointer group flex items-center justify-between
-                                                ${selectedDoctor === doc.externalId 
-                                                    ? 'bg-primary/10 border-primary/40 shadow-lg shadow-primary/5' 
-                                                    : 'bg-white/5 border-white/5 hover:border-white/20'}`}
-                                        >
-                                            <div className="flex items-center gap-3">
-                                                <div className={`h-10 w-10 rounded-2xl flex items-center justify-center font-black text-[12px] transition-all
-                                                    ${selectedDoctor === doc.externalId ? 'bg-primary text-white scale-110 shadow-lg shadow-primary/30' : 'bg-white/10 text-slate-400 group-hover:bg-white/20'}`}>
-                                                    {doc.name.charAt(0)}
-                                                </div>
-                                                <div>
-                                                    <div className={`text-[13px] font-black tracking-tight leading-none ${selectedDoctor === doc.externalId ? 'text-white' : 'text-slate-300 group-hover:text-white'}`}>
-                                                        {doc.name.split(' ')[0]} {doc.name.split(' ').slice(-1)}
-                                                    </div>
-                                                    <div className="flex items-center gap-2 mt-1.5">
-                                                        <div className={`h-1.5 w-1.5 rounded-full ${doc.calendarStatus === 'enabled' ? 'bg-emerald-500 animate-pulse' : 'bg-slate-600'}`}></div>
-                                                        <span className="text-[9px] font-bold text-slate-500 uppercase tracking-widest">
-                                                            {doc.calendarStatus === 'enabled' ? 'Calendar On' : 'Offline'}
-                                                        </span>
-                                                    </div>
-                                                </div>
-                                            </div>
-
-                                            <button 
-                                                onClick={(e) => {
-                                                    e.stopPropagation();
-                                                    handleToggleCalendar(doc.externalId, doc.calendarStatus);
-                                                }}
-                                                className={`h-8 w-8 rounded-xl flex items-center justify-center transition-all
-                                                    ${doc.calendarStatus === 'enabled' 
-                                                        ? 'bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500 hover:text-white shadow-emerald-500/20 shadow-md' 
-                                                        : 'bg-slate-800 text-slate-500 hover:bg-primary hover:text-white'}`}
-                                                title={doc.calendarStatus === 'enabled' ? 'Pausar Agenda' : 'Ativar Agenda'}
-                                            >
-                                                {doc.calendarStatus === 'enabled' ? <Power className="h-4 w-4" /> : <PowerOff className="h-4 w-4" />}
-                                            </button>
+                                    <div className="min-w-0 flex-1">
+                                        <div className={`text-[12px] font-bold truncate ${selectedDoctorId === doc.externalId ? 'text-primary' : 'text-slate-700'}`}>
+                                            {doc.name}
                                         </div>
-                                    ))}
-                                </div>
-                            </div>
-
-                            {/* Main Actions */}
-                            <div className="pt-4 space-y-3">
-                                <button 
-                                    onClick={fetchData}
-                                    disabled={isFetching || !selectedDoctor}
-                                    className="w-full h-14 bg-primary hover:bg-primary/90 text-white rounded-[20px] font-black uppercase tracking-[3px] text-[11px] shadow-2xl shadow-primary/40 transition-all flex items-center justify-center gap-3 disabled:opacity-30 disabled:grayscale"
-                                >
-                                    {isFetching ? <Loader2 className="h-5 w-5 animate-spin" /> : <Zap className="h-5 w-5 fill-current" />}
-                                    Escanear Malha
+                                        <div className="flex items-center gap-1.5 mt-0.5">
+                                            <div className={`h-1.5 w-1.5 rounded-full ${doc.calendarStatus === 'enabled' ? 'bg-emerald-500' : 'bg-slate-300'}`}></div>
+                                            <span className="text-[9px] font-bold text-slate-400 uppercase">{doc.calendarStatus === 'enabled' ? 'Online' : 'Offline'}</span>
+                                        </div>
+                                    </div>
                                 </button>
-                                
-                                <button 
-                                    onClick={() => setIsWorkPeriodModalOpen(true)}
-                                    disabled={!selectedDoctor || isFetching}
-                                    className="w-full h-14 bg-white/5 hover:bg-white/10 text-slate-300 rounded-[20px] font-black uppercase tracking-[3px] text-[11px] border border-white/5 transition-all flex items-center justify-center gap-3 disabled:opacity-20 translate-y-0 hover:-translate-y-1 active:translate-y-0"
-                                >
-                                    <LayoutGrid className="h-5 w-5" />
-                                    Publicar Período
-                                </button>
-                            </div>
+                            ))}
+                            {doctors.length === 0 && (
+                                <div className="p-6 text-center text-slate-400 text-sm">Nenhum médico mapeado</div>
+                            )}
                         </div>
                     </div>
 
-                    {/* Operational Safety Alert */}
-                    <div className="bg-amber-500/10 border border-amber-500/20 rounded-[32px] p-6 flex gap-4">
-                        <ShieldAlert className="h-6 w-6 text-amber-500 shrink-0" />
-                        <div>
-                            <div className="text-[11px] font-black text-amber-500 uppercase tracking-widest mb-1">Atenção Operacional</div>
-                            <p className="text-[10px] font-bold text-amber-600/80 leading-relaxed uppercase tracking-wider">
-                                Ações de reserva e bloqueio refletem instantaneamente no marketplace Doctoralia. Verifique os dados do paciente.
-                            </p>
+                    <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
+                        <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-[2px] mb-3">Legenda</h3>
+                        <div className="space-y-2">
+                            <div className="flex items-center gap-2">
+                                <div className="h-3 w-3 rounded bg-emerald-500"></div>
+                                <span className="text-[11px] text-slate-600 font-medium">Agendado pelo VisMed</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <div className="h-3 w-3 rounded bg-blue-500"></div>
+                                <span className="text-[11px] text-slate-600 font-medium">Agendado pela Doctoralia</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <div className="h-3 w-3 rounded bg-red-400"></div>
+                                <span className="text-[11px] text-slate-600 font-medium">Cancelado</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <div className="h-3 w-3 rounded bg-amber-400"></div>
+                                <span className="text-[11px] text-slate-600 font-medium">Movido</span>
+                            </div>
                         </div>
                     </div>
                 </aside>
 
-                {/* MAIN AREA: TABS & RESULTS */}
-                <main className="space-y-8">
-                    {/* Tabs Navigation */}
-                    <div className="flex items-center gap-2 p-2 bg-slate-100/80 backdrop-blur-sm rounded-[28px] border border-slate-200/50 w-fit shadow-inner">
-                        <button
-                            onClick={() => setActiveTab('bookings')}
-                            className={`flex items-center gap-3 px-8 py-4 rounded-[22px] text-[13px] font-black uppercase tracking-[2px] transition-all duration-500
-                                ${activeTab === 'bookings' 
-                                    ? 'bg-white text-slate-900 shadow-2xl shadow-slate-200 scale-[1.02]' 
-                                    : 'text-slate-400 hover:text-slate-600 hover:bg-white/40'}`}
-                        >
-                            <UserSquare2 className={`h-4 w-4 ${activeTab === 'bookings' ? 'text-primary' : 'opacity-40'}`} />
-                            Consultas
-                        </button>
-                        <button
-                            onClick={() => setActiveTab('slots')}
-                            className={`flex items-center gap-3 px-8 py-4 rounded-[22px] text-[13px] font-black uppercase tracking-[2px] transition-all duration-500
-                                ${activeTab === 'slots' 
-                                    ? 'bg-white text-slate-900 shadow-2xl shadow-slate-200 scale-[1.02]' 
-                                    : 'text-slate-400 hover:text-slate-600 hover:bg-white/40'}`}
-                        >
-                            <CalendarClock className={`h-4 w-4 ${activeTab === 'slots' ? 'text-primary' : 'opacity-40'}`} />
-                            Slots Livres
-                        </button>
-                    </div>
-
-                    {/* Content Section */}
-                    {viewState === 'loading' ? (
-                        <div className="flex flex-col items-center justify-center min-h-[500px] bg-white/40 rounded-[40px] border border-dashed border-slate-200">
-                            <Loader2 className="h-12 w-12 animate-spin text-primary opacity-20" />
-                            <div className="mt-4 text-[11px] font-black text-slate-400 uppercase tracking-[4px] animate-pulse">Estabelecendo Link</div>
-                        </div>
-                    ) : viewState === 'disabled' ? (
-                        <div className="bg-amber-50 rounded-[40px] p-12 border border-amber-100 flex flex-col items-center text-center animate-in zoom-in duration-500">
-                            <div className="h-24 w-24 rounded-[32px] bg-amber-100 flex items-center justify-center text-amber-600 mb-8 shadow-inner">
-                                <CalendarOff className="h-12 w-12" />
+                <main className="space-y-4">
+                    <div className="bg-white rounded-2xl border border-slate-200 shadow-sm">
+                        <div className="flex items-center justify-between px-6 py-3 border-b border-slate-100">
+                            <div className="flex items-center gap-3">
+                                <button onClick={() => navigateWeek(-1)} className="h-8 w-8 rounded-lg bg-slate-50 hover:bg-slate-100 flex items-center justify-center transition-all">
+                                    <ChevronLeft className="h-4 w-4 text-slate-600" />
+                                </button>
+                                <button onClick={goToToday} className="px-3 py-1.5 rounded-lg bg-primary/10 text-primary text-[10px] font-black uppercase tracking-wider hover:bg-primary/20 transition-all">
+                                    Hoje
+                                </button>
+                                <button onClick={() => navigateWeek(1)} className="h-8 w-8 rounded-lg bg-slate-50 hover:bg-slate-100 flex items-center justify-center transition-all">
+                                    <ChevronRight className="h-4 w-4 text-slate-600" />
+                                </button>
                             </div>
-                            <h2 className="text-2xl font-black text-amber-900 tracking-tight">Agendas não conectadas</h2>
-                            <p className="text-amber-800/60 mt-4 max-w-md font-medium">Nenhum médico nesta unidade possui a integração de agendamento online habilitada no portal Doctoralia.</p>
-                            <a href="/mapping" className="mt-8 px-8 py-4 bg-amber-900 text-white rounded-2xl font-black uppercase tracking-[2px] text-[12px] shadow-xl shadow-amber-900/40 hover:scale-105 active:scale-95 transition-all">
-                                Ir para Central de Mapeamento
-                            </a>
-                        </div>
-                    ) : viewState === 'empty' ? (
-                        <div className="flex flex-col items-center justify-center min-h-[500px] bg-white/60 backdrop-blur-md rounded-[40px] border border-slate-100 shadow-sm animate-in fade-in transition-all">
-                            <div className="h-20 w-20 bg-slate-50 border border-slate-100 rounded-3xl flex items-center justify-center text-slate-200 mb-6">
-                                <Search className="h-10 w-10" />
+                            <div className="text-[13px] font-bold text-slate-700">
+                                {new Date(weekStart + 'T00:00:00').toLocaleDateString('pt-BR', { day: '2-digit', month: 'short' })} — {new Date(weekEnd + 'T00:00:00').toLocaleDateString('pt-BR', { day: '2-digit', month: 'short', year: 'numeric' })}
                             </div>
-                            <h3 className="text-xl font-black text-slate-900">Nenhum dado encontrado</h3>
-                            <p className="text-slate-400 mt-2 font-medium max-w-[280px] text-center">Tente ajustar o intervalo de datas ou o filtro de especialistas para escanear a rede.</p>
-                        </div>
-                    ) : (
-                        <div className="space-y-4 animate-in fade-in slide-in-from-right-4 duration-700">
-                            {activeTab === 'bookings' ? (
-                                bookings.map((booking: any, idx) => (
-                                    <div key={idx} className="group bg-white/60 hover:bg-white backdrop-blur-md rounded-3xl p-6 border border-slate-100/60 shadow-sm hover:shadow-xl hover:shadow-slate-200/50 hover:border-primary/20 transition-all duration-500 relative overflow-hidden">
-                                        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-6 relative z-10">
-                                            <div className="flex items-center gap-5">
-                                                <div className="h-16 w-16 rounded-2xl bg-indigo-50 border border-indigo-100 flex items-center justify-center text-[22px] text-indigo-500 shrink-0 group-hover:bg-primary group-hover:text-white transition-all duration-500 shadow-inner">
-                                                    <User className="h-8 w-8" />
-                                                </div>
-                                                <div>
-                                                    <div className="text-[17px] font-black text-slate-900 tracking-tight group-hover:text-primary transition-colors">{booking.patient?.name || 'Paciente Privado'}</div>
-                                                    <div className="flex flex-wrap items-center gap-3 mt-1.5">
-                                                        <span className="text-[10px] font-black uppercase tracking-widest py-1 px-3 bg-slate-100 rounded-full text-slate-500">{booking.status || 'Confirmado'}</span>
-                                                        <div className="h-1 w-1 rounded-full bg-slate-300"></div>
-                                                        <span className="text-[11px] font-bold text-slate-400 flex items-center gap-1">
-                                                            <Stethoscope className="h-3 w-3" /> Dr(a). {booking.doctorName}
-                                                        </span>
-                                                    </div>
-                                                </div>
-                                            </div>
-
-                                            <div className="flex items-center gap-6 sm:text-right">
-                                                <div className="flex flex-col items-end">
-                                                    <div className="flex items-center gap-2 text-primary">
-                                                        <Clock className="h-4 w-4" />
-                                                        <span className="text-[15px] font-black tracking-tight">{booking.start_at}</span>
-                                                    </div>
-                                                    <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-1">Horário Agendado</div>
-                                                </div>
-                                                <ChevronRight className="h-5 w-5 text-slate-300 group-hover:text-primary transition-all group-hover:translate-x-1" />
-                                            </div>
-                                        </div>
-                                        {/* Background decoration */}
-                                        <div className="absolute -right-4 -bottom-4 h-24 w-24 bg-primary/5 rounded-full blur-2xl group-hover:bg-primary/10 transition-colors"></div>
-                                    </div>
-                                ))
-                            ) : (
-                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                                    {slots.map((slot: any, idx) => (
-                                        <div key={idx} className="group bg-white/60 hover:bg-slate-900 backdrop-blur-md rounded-[32px] p-6 border border-slate-100 shadow-sm transition-all duration-500 hover:-translate-y-2 hover:shadow-2xl hover:shadow-slate-900/20">
-                                            <div className="flex items-center justify-between mb-4">
-                                                <div className="h-12 w-12 rounded-2xl bg-emerald-50 text-emerald-600 flex items-center justify-center group-hover:bg-emerald-500 group-hover:text-white transition-all duration-500">
-                                                    <Clock className="h-6 w-6" />
-                                                </div>
-                                                <CheckCircle2 className="h-5 w-5 text-emerald-500 opacity-0 group-hover:opacity-100 transition-opacity" />
-                                            </div>
-                                            <div className="text-2xl font-black text-slate-900 group-hover:text-white transition-colors">{slot.start}</div>
-                                            <div className="text-[10px] font-black text-slate-400 uppercase tracking-[2px] mt-2 group-hover:text-emerald-400 transition-colors">Duração: {slot.duration || '00'} Minutos</div>
-                                            
-                                            <div className="flex gap-2 mt-6">
-                                                <button 
-                                                    onClick={() => {
-                                                        setSelectedSlot(slot);
-                                                        setIsBookingModalOpen(true);
-                                                    }}
-                                                    className="flex-1 py-3 bg-emerald-500 rounded-2xl text-[10px] font-black uppercase tracking-widest text-white opacity-0 group-hover:opacity-100 transition-all duration-500 hover:bg-emerald-600 shadow-lg shadow-emerald-500/20"
-                                                >
-                                                    Reservar
-                                                </button>
-                                                <button 
-                                                    onClick={() => handleBlockSlot(slot)}
-                                                    className="flex-1 py-3 bg-slate-100 border border-slate-200 rounded-2xl text-[10px] font-black uppercase tracking-widest text-slate-700 opacity-0 group-hover:opacity-100 transition-all duration-500 hover:bg-red-500 hover:text-white hover:border-red-500"
-                                                >
-                                                    Remover
-                                                </button>
-                                            </div>
-                                        </div>
-                                    ))}
+                            {selectedDoctor && (
+                                <div className="flex items-center gap-2">
+                                    <Stethoscope className="h-4 w-4 text-primary" />
+                                    <span className="text-[12px] font-bold text-slate-600">{selectedDoctor.name}</span>
                                 </div>
                             )}
+                        </div>
+
+                        <div className="grid grid-cols-7 border-b border-slate-100">
+                            {weekDays.map((day) => {
+                                const d = new Date(day + 'T00:00:00');
+                                const isToday = day === todayStr;
+                                const dayBookings = bookingsByDay[day] || [];
+                                return (
+                                    <div key={day} className={`text-center py-2 border-r border-slate-50 last:border-0 ${isToday ? 'bg-primary/5' : ''}`}>
+                                        <div className="text-[9px] font-black text-slate-400 uppercase tracking-widest">
+                                            {d.toLocaleDateString('pt-BR', { weekday: 'short' })}
+                                        </div>
+                                        <div className={`text-[18px] font-black mt-0.5 ${isToday ? 'text-primary' : 'text-slate-800'}`}>
+                                            {d.getDate()}
+                                        </div>
+                                        {dayBookings.length > 0 && (
+                                            <div className="flex items-center justify-center gap-0.5 mt-1">
+                                                {dayBookings.slice(0, 5).map((b, i) => (
+                                                    <div key={i} className={`h-1.5 w-1.5 rounded-full ${
+                                                        b.status === 'CANCELLED' ? 'bg-red-400' :
+                                                        b.status === 'MOVED' ? 'bg-amber-400' :
+                                                        b.origin === 'VISMED' ? 'bg-emerald-500' : 'bg-blue-500'
+                                                    }`}></div>
+                                                ))}
+                                                {dayBookings.length > 5 && <span className="text-[8px] text-slate-400 ml-0.5">+{dayBookings.length - 5}</span>}
+                                            </div>
+                                        )}
+                                    </div>
+                                );
+                            })}
+                        </div>
+
+                        <div className="divide-y divide-slate-50">
+                            {weekDays.map((day) => {
+                                const d = new Date(day + 'T00:00:00');
+                                const isToday = day === todayStr;
+                                const dayBookings = bookingsByDay[day] || [];
+
+                                return (
+                                    <div key={day} className={`${isToday ? 'bg-primary/[0.02]' : ''}`}>
+                                        <div className="grid grid-cols-[100px_1fr] min-h-[60px]">
+                                            <div className="px-3 py-2 border-r border-slate-100 flex flex-col justify-center">
+                                                <div className="text-[10px] font-black text-slate-400 uppercase">
+                                                    {d.toLocaleDateString('pt-BR', { weekday: 'short' })}
+                                                </div>
+                                                <div className={`text-[15px] font-black ${isToday ? 'text-primary' : 'text-slate-700'}`}>
+                                                    {d.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' })}
+                                                </div>
+                                            </div>
+                                            <div className="px-3 py-2 flex flex-wrap gap-2 items-center">
+                                                {dayBookings.length === 0 ? (
+                                                    <span className="text-[11px] text-slate-300 font-medium italic">Sem agendamentos</span>
+                                                ) : (
+                                                    dayBookings.map((b, idx) => {
+                                                        const isCancelled = b.status === 'CANCELLED';
+                                                        const isMoved = b.status === 'MOVED';
+                                                        const isVismed = b.origin === 'VISMED';
+
+                                                        const bgColor = isCancelled ? 'bg-red-50 border-red-200 text-red-700'
+                                                            : isMoved ? 'bg-amber-50 border-amber-200 text-amber-700'
+                                                            : isVismed ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                                                            : 'bg-blue-50 border-blue-200 text-blue-700';
+
+                                                        const dotColor = isCancelled ? 'bg-red-400'
+                                                            : isMoved ? 'bg-amber-400'
+                                                            : isVismed ? 'bg-emerald-500'
+                                                            : 'bg-blue-500';
+
+                                                        return (
+                                                            <button
+                                                                key={idx}
+                                                                onClick={() => setSelectedBooking(b)}
+                                                                className={`flex items-center gap-2 px-3 py-1.5 rounded-xl border text-[11px] font-bold transition-all hover:shadow-md hover:-translate-y-0.5 ${bgColor} ${isCancelled ? 'line-through opacity-60' : ''}`}
+                                                            >
+                                                                <div className={`h-2 w-2 rounded-full ${dotColor}`}></div>
+                                                                <span className="font-black">{formatTime(b.startAt)}</span>
+                                                                <span className="max-w-[120px] truncate">{b.patientName}{b.patientSurname ? ` ${b.patientSurname}` : ''}</span>
+                                                                <span className="text-[8px] font-black uppercase tracking-wider opacity-60">{isVismed ? 'VM' : 'DC'}</span>
+                                                            </button>
+                                                        );
+                                                    })
+                                                )}
+                                                <button
+                                                    onClick={() => handleOpenBooking(day)}
+                                                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl border border-dashed border-slate-200 text-[10px] font-bold text-slate-400 hover:border-primary hover:text-primary hover:bg-primary/5 transition-all"
+                                                >
+                                                    + Agendar
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    </div>
+
+                    {isFetching && (
+                        <div className="flex items-center justify-center gap-2 py-2">
+                            <Loader2 className="h-4 w-4 animate-spin text-primary" />
+                            <span className="text-[11px] text-slate-400 font-bold">Carregando agendamentos...</span>
                         </div>
                     )}
                 </main>
             </div>
 
-            {/* ─── FOOTER INFO ─── */}
-            <footer className="pt-12 border-t border-slate-100 flex flex-col md:flex-row items-center justify-between gap-6">
-                <div className="flex items-center gap-6">
-                    <img src="/vismed-logo-dark.png" alt="VisMed" className="h-5 opacity-40 grayscale" />
-                    <div className="h-4 w-[1px] bg-slate-200"></div>
-                    <p className="text-[11px] font-bold text-slate-400 uppercase tracking-[2px]">Core Integration Engine v2.4</p>
-                </div>
-                <div className="flex items-center gap-2">
-                    <span className="h-2 w-2 rounded-full bg-emerald-500"></span>
-                    <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Sistemas Operantes • Latência: 45ms</span>
-                </div>
-            </footer>
+            {selectedBooking && (
+                <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-center justify-center p-6" onClick={() => setSelectedBooking(null)}>
+                    <div className="bg-white rounded-3xl shadow-2xl p-8 w-full max-w-lg relative animate-in zoom-in-95 duration-200" onClick={(e) => e.stopPropagation()}>
+                        <button onClick={() => setSelectedBooking(null)} className="absolute top-4 right-4 h-8 w-8 rounded-lg bg-slate-100 hover:bg-slate-200 flex items-center justify-center transition-all">
+                            <X className="h-4 w-4 text-slate-500" />
+                        </button>
 
-            {/* ─── MODALS ─── */}
-            {isBookingModalOpen && (
-                <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md z-50 flex items-center justify-center p-6 animate-in fade-in duration-500">
-                    <div className="bg-white/95 backdrop-blur-2xl rounded-[48px] shadow-2xl p-10 w-full max-w-xl relative border border-white/50 animate-in zoom-in-95 duration-300">
-                        <button onClick={() => setIsBookingModalOpen(false)} className="absolute top-8 right-10 h-10 w-10 flex items-center justify-center rounded-xl bg-slate-50 text-slate-400 hover:bg-slate-100 transition-all text-2xl font-light">×</button>
-                        
-                        <div className="flex items-center gap-4 mb-8">
-                            <div className="h-16 w-16 rounded-3xl bg-emerald-50 text-emerald-600 flex items-center justify-center shadow-inner border border-emerald-100">
-                                <User className="h-8 w-8" />
+                        <div className="flex items-center gap-4 mb-6">
+                            <div className={`h-14 w-14 rounded-2xl flex items-center justify-center ${
+                                selectedBooking.origin === 'VISMED' ? 'bg-emerald-100 text-emerald-600' : 'bg-blue-100 text-blue-600'
+                            }`}>
+                                {selectedBooking.origin === 'VISMED' ? <Building2 className="h-7 w-7" /> : <Globe className="h-7 w-7" />}
                             </div>
                             <div>
-                                <h2 className="text-2xl font-black text-slate-900 tracking-tighter">Reservar Horário</h2>
-                                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">{selectedSlot?.start}</p>
+                                <h2 className="text-xl font-black text-slate-900">Detalhes do Agendamento</h2>
+                                <div className="flex items-center gap-2 mt-1">
+                                    <span className={`px-2 py-0.5 rounded-md text-[9px] font-black uppercase tracking-wider ${
+                                        selectedBooking.origin === 'VISMED' ? 'bg-emerald-100 text-emerald-700' : 'bg-blue-100 text-blue-700'
+                                    }`}>
+                                        {selectedBooking.origin === 'VISMED' ? 'VisMed' : 'Doctoralia'}
+                                    </span>
+                                    <span className={`px-2 py-0.5 rounded-md text-[9px] font-black uppercase tracking-wider ${
+                                        selectedBooking.status === 'CANCELLED' ? 'bg-red-100 text-red-700' :
+                                        selectedBooking.status === 'MOVED' ? 'bg-amber-100 text-amber-700' :
+                                        'bg-slate-100 text-slate-600'
+                                    }`}>
+                                        {selectedBooking.status}
+                                    </span>
+                                </div>
                             </div>
                         </div>
 
-                        <div className="space-y-6">
-                            <div>
-                                <label className="text-[10px] font-black uppercase tracking-[2px] text-slate-400 ml-1 mb-2 block">Nome Completo</label>
-                                <input 
-                                    type="text" 
-                                    value={patientForm.name} 
-                                    onChange={(e)=>setPatientForm({...patientForm, name: e.target.value})}
-                                    placeholder="Ex: João da Silva"
-                                    className="w-full bg-slate-50 border border-slate-100 rounded-2xl px-5 py-4 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/20 transition-all" 
-                                />
+                        <div className="space-y-4 bg-slate-50 rounded-2xl p-5">
+                            <div className="grid grid-cols-2 gap-4">
+                                <div>
+                                    <div className="text-[9px] font-black text-slate-400 uppercase tracking-wider mb-1">Paciente</div>
+                                    <div className="text-[14px] font-bold text-slate-800 flex items-center gap-2">
+                                        <User className="h-4 w-4 text-slate-400" />
+                                        {selectedBooking.patientName} {selectedBooking.patientSurname || ''}
+                                    </div>
+                                </div>
+                                <div>
+                                    <div className="text-[9px] font-black text-slate-400 uppercase tracking-wider mb-1">Horário</div>
+                                    <div className="text-[14px] font-bold text-slate-800 flex items-center gap-2">
+                                        <Clock className="h-4 w-4 text-slate-400" />
+                                        {formatTime(selectedBooking.startAt)} - {formatTime(selectedBooking.endAt)}
+                                    </div>
+                                </div>
                             </div>
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
-                                    <label className="text-[10px] font-black uppercase tracking-[2px] text-slate-400 ml-1 mb-2 block">Celular</label>
-                                    <input 
-                                        type="tel" 
-                                        value={patientForm.phone} 
-                                        onChange={(e)=>setPatientForm({...patientForm, phone: e.target.value})}
-                                        placeholder="(11) 99999-9999"
-                                        className="w-full bg-slate-50 border border-slate-100 rounded-2xl px-5 py-4 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/20 transition-all" 
-                                    />
+                                    <div className="text-[9px] font-black text-slate-400 uppercase tracking-wider mb-1">Data</div>
+                                    <div className="text-[14px] font-bold text-slate-800 flex items-center gap-2">
+                                        <CalendarDays className="h-4 w-4 text-slate-400" />
+                                        {formatDate(selectedBooking.startAt)}
+                                    </div>
                                 </div>
                                 <div>
-                                    <label className="text-[10px] font-black uppercase tracking-[2px] text-slate-400 ml-1 mb-2 block">E-mail</label>
-                                    <input 
-                                        type="email" 
-                                        value={patientForm.email} 
-                                        onChange={(e)=>setPatientForm({...patientForm, email: e.target.value})}
-                                        placeholder="paciente@email.com"
-                                        className="w-full bg-slate-50 border border-slate-100 rounded-2xl px-5 py-4 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/20 transition-all" 
-                                    />
+                                    <div className="text-[9px] font-black text-slate-400 uppercase tracking-wider mb-1">Duração</div>
+                                    <div className="text-[14px] font-bold text-slate-800">{selectedBooking.duration || 30} min</div>
                                 </div>
                             </div>
-
-                            <button 
-                                onClick={handleConfirmBooking}
-                                disabled={isSaving}
-                                className="w-full py-5 bg-emerald-500 text-white rounded-[24px] font-black uppercase tracking-[2px] text-[12px] shadow-xl shadow-emerald-500/30 hover:bg-emerald-600 transition-all flex items-center justify-center gap-3 mt-4 disabled:opacity-50"
-                            >
-                                {isSaving ? <Loader2 className="h-5 w-5 animate-spin" /> : <CheckCircle2 className="h-5 w-5" />}
-                                Confirmar Reserva
-                            </button>
+                            {selectedBooking.patientPhone && (
+                                <div>
+                                    <div className="text-[9px] font-black text-slate-400 uppercase tracking-wider mb-1">Telefone</div>
+                                    <div className="text-[13px] font-bold text-slate-700 flex items-center gap-2">
+                                        <Phone className="h-3.5 w-3.5 text-slate-400" />
+                                        {selectedBooking.patientPhone}
+                                    </div>
+                                </div>
+                            )}
+                            {selectedBooking.patientEmail && (
+                                <div>
+                                    <div className="text-[9px] font-black text-slate-400 uppercase tracking-wider mb-1">Email</div>
+                                    <div className="text-[13px] font-bold text-slate-700 flex items-center gap-2">
+                                        <Mail className="h-3.5 w-3.5 text-slate-400" />
+                                        {selectedBooking.patientEmail}
+                                    </div>
+                                </div>
+                            )}
+                            {selectedBooking.serviceName && (
+                                <div>
+                                    <div className="text-[9px] font-black text-slate-400 uppercase tracking-wider mb-1">Serviço</div>
+                                    <div className="text-[13px] font-bold text-slate-700 flex items-center gap-2">
+                                        <FileText className="h-3.5 w-3.5 text-slate-400" />
+                                        {selectedBooking.serviceName}
+                                    </div>
+                                </div>
+                            )}
                         </div>
+
+                        {selectedBooking.status !== 'CANCELLED' && selectedBooking.doctoraliaBookingId && (
+                            <div className="mt-6 flex gap-3">
+                                <button
+                                    onClick={() => handleCancelBooking(selectedBooking)}
+                                    className="flex-1 py-3 bg-red-50 border border-red-200 text-red-700 rounded-xl text-[11px] font-black uppercase tracking-wider hover:bg-red-100 transition-all flex items-center justify-center gap-2"
+                                >
+                                    <Ban className="h-4 w-4" /> Cancelar Agendamento
+                                </button>
+                            </div>
+                        )}
                     </div>
                 </div>
             )}
 
-            {isWorkPeriodModalOpen && (
-                <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md z-50 flex items-center justify-center p-6 animate-in fade-in duration-500">
-                    <div className="bg-white/95 backdrop-blur-2xl rounded-[48px] shadow-2xl p-10 w-full max-w-xl relative border border-white/50 animate-in zoom-in-95 duration-300">
-                        <button onClick={() => setIsWorkPeriodModalOpen(false)} className="absolute top-8 right-10 h-10 w-10 flex items-center justify-center rounded-xl bg-slate-50 text-slate-400 hover:bg-slate-100 transition-all text-2xl font-light">×</button>
-                        
-                        <div className="flex items-center gap-4 mb-8">
-                            <div className="h-16 w-16 rounded-3xl bg-primary/10 text-primary flex items-center justify-center shadow-inner border border-primary/20">
-                                <CalendarClock className="h-8 w-8" />
+            {isBookingModalOpen && bookingSlot && (
+                <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-center justify-center p-6" onClick={() => setIsBookingModalOpen(false)}>
+                    <div className="bg-white rounded-3xl shadow-2xl p-8 w-full max-w-lg relative animate-in zoom-in-95 duration-200" onClick={(e) => e.stopPropagation()}>
+                        <button onClick={() => setIsBookingModalOpen(false)} className="absolute top-4 right-4 h-8 w-8 rounded-lg bg-slate-100 hover:bg-slate-200 flex items-center justify-center transition-all">
+                            <X className="h-4 w-4 text-slate-500" />
+                        </button>
+
+                        <div className="flex items-center gap-4 mb-6">
+                            <div className="h-14 w-14 rounded-2xl bg-emerald-100 text-emerald-600 flex items-center justify-center">
+                                <CalendarDays className="h-7 w-7" />
                             </div>
                             <div>
-                                <h2 className="text-2xl font-black text-slate-900 tracking-tighter">Definir Expediente</h2>
-                                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Publicação de Horários na Doctoralia</p>
+                                <h2 className="text-xl font-black text-slate-900">Novo Agendamento</h2>
+                                <p className="text-[12px] font-bold text-slate-400">
+                                    {new Date(bookingSlot.date + 'T00:00:00').toLocaleDateString('pt-BR', { weekday: 'long', day: '2-digit', month: 'long' })}
+                                </p>
                             </div>
                         </div>
 
-                        <div className="space-y-6">
-                            <div className="grid grid-cols-2 gap-4">
+                        <div className="space-y-4">
+                            <div>
+                                <label className="text-[10px] font-black uppercase tracking-[2px] text-slate-400 mb-1.5 block">Horário</label>
+                                <input
+                                    type="time"
+                                    value={bookingSlot.time}
+                                    onChange={(e) => setBookingSlot({ ...bookingSlot, time: e.target.value })}
+                                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-sm font-bold focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all"
+                                />
+                            </div>
+                            <div className="grid grid-cols-2 gap-3">
                                 <div>
-                                    <label className="text-[10px] font-black uppercase tracking-[2px] text-slate-400 ml-1 mb-2 block">Início</label>
-                                    <input 
-                                        type="time" 
-                                        value={workPeriodForm.start} 
-                                        onChange={(e)=>setWorkPeriodForm({...workPeriodForm, start: e.target.value})}
-                                        className="w-full bg-slate-50 border border-slate-100 rounded-2xl px-5 py-4 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all" 
+                                    <label className="text-[10px] font-black uppercase tracking-[2px] text-slate-400 mb-1.5 block">Nome</label>
+                                    <input
+                                        type="text"
+                                        value={patientForm.name}
+                                        onChange={(e) => setPatientForm({ ...patientForm, name: e.target.value })}
+                                        placeholder="Nome do paciente"
+                                        className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all"
                                     />
                                 </div>
                                 <div>
-                                    <label className="text-[10px] font-black uppercase tracking-[2px] text-slate-400 ml-1 mb-2 block">Término</label>
-                                    <input 
-                                        type="time" 
-                                        value={workPeriodForm.end} 
-                                        onChange={(e)=>setWorkPeriodForm({...workPeriodForm, end: e.target.value})}
-                                        className="w-full bg-slate-50 border border-slate-100 rounded-2xl px-5 py-4 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all" 
+                                    <label className="text-[10px] font-black uppercase tracking-[2px] text-slate-400 mb-1.5 block">Sobrenome</label>
+                                    <input
+                                        type="text"
+                                        value={patientForm.surname}
+                                        onChange={(e) => setPatientForm({ ...patientForm, surname: e.target.value })}
+                                        placeholder="Sobrenome"
+                                        className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all"
                                     />
                                 </div>
                             </div>
-                            
-                            <div className="bg-amber-50 border border-amber-100 p-5 rounded-3xl flex gap-4">
-                                <AlertCircle className="h-5 w-5 text-amber-600 shrink-0" />
-                                <p className="text-[11px] font-bold text-amber-800 leading-relaxed uppercase tracking-wider">
-                                    Esta ação irá criar slots intercalados de 30 minutos dentro do intervalo definido para o dia {startDate}.
+                            <div className="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label className="text-[10px] font-black uppercase tracking-[2px] text-slate-400 mb-1.5 block">Telefone</label>
+                                    <input
+                                        type="tel"
+                                        value={patientForm.phone}
+                                        onChange={(e) => setPatientForm({ ...patientForm, phone: e.target.value })}
+                                        placeholder="(11) 99999-9999"
+                                        className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="text-[10px] font-black uppercase tracking-[2px] text-slate-400 mb-1.5 block">CPF</label>
+                                    <input
+                                        type="text"
+                                        value={patientForm.cpf}
+                                        onChange={(e) => setPatientForm({ ...patientForm, cpf: e.target.value })}
+                                        placeholder="000.000.000-00"
+                                        className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all"
+                                    />
+                                </div>
+                            </div>
+                            <div>
+                                <label className="text-[10px] font-black uppercase tracking-[2px] text-slate-400 mb-1.5 block">Email</label>
+                                <input
+                                    type="email"
+                                    value={patientForm.email}
+                                    onChange={(e) => setPatientForm({ ...patientForm, email: e.target.value })}
+                                    placeholder="paciente@email.com"
+                                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all"
+                                />
+                            </div>
+
+                            <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 flex items-center gap-3">
+                                <ArrowRightLeft className="h-4 w-4 text-emerald-600 shrink-0" />
+                                <p className="text-[10px] font-bold text-emerald-700">
+                                    Este agendamento será criado simultaneamente no VisMed e na Doctoralia, bloqueando o horário em ambas as plataformas.
                                 </p>
                             </div>
 
-                            <button 
-                                onClick={handleConfirmWorkPeriod}
-                                disabled={isSaving}
-                                className="w-full py-5 bg-primary text-white rounded-[24px] font-black uppercase tracking-[2px] text-[12px] shadow-xl shadow-primary/30 hover:bg-primary/90 transition-all flex items-center justify-center gap-3 mt-4 disabled:opacity-50"
+                            <button
+                                onClick={handleCreateBooking}
+                                disabled={isSaving || !patientForm.name.trim()}
+                                className="w-full py-3.5 bg-primary hover:bg-primary/90 text-white rounded-xl text-[12px] font-black uppercase tracking-wider shadow-lg shadow-primary/30 transition-all disabled:opacity-40 flex items-center justify-center gap-2"
                             >
-                                {isSaving ? <Loader2 className="h-5 w-5 animate-spin" /> : <RefreshCw className="h-5 w-5" />}
-                                Publicar Período
+                                {isSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <CalendarDays className="h-4 w-4" />}
+                                {isSaving ? 'Agendando...' : 'Confirmar Agendamento'}
                             </button>
                         </div>
                     </div>

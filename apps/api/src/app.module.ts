@@ -12,6 +12,7 @@ import { SyncModule } from './sync/sync.module';
 import { MappingsModule } from './mappings/mappings.module';
 import { DoctorsModule } from './doctors/doctors.module';
 import { AppointmentsModule } from './appointments/appointments.module';
+import { BookingsModule } from './bookings/bookings.module';
 
 @Module({
   imports: [
@@ -22,6 +23,7 @@ import { AppointmentsModule } from './appointments/appointments.module';
     ClinicsModule,
     DoctorsModule,
     AppointmentsModule,
+    BookingsModule,
     IntegrationsModule,
     BullModule.forRoot({
       connection: {

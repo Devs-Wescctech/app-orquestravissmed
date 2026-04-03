@@ -87,6 +87,15 @@ Both pipelines attempt BullMQ queue dispatch first, then fall back to direct inl
 - **Professional list scoping**: `getProfessionalMappings(clinicId)` only returns doctors that have a `Mapping` entry for the given clinic (filters by `vismedId in clinicVismedDoctorIds`).
 - **Slot sync mapping scoping**: When `clinicId` is provided, `syncSlotsForDoctor` resolves the correct `ProfessionalUnifiedMapping` by filtering to vismed doctor IDs linked to the clinic.
 
+## Bidirectional Booking Sync (VisMed ↔ Doctoralia)
+- **BookingSyncService** (`apps/api/src/bookings/booking-sync.service.ts`): Core sync engine. Handles `slot-booked`, `booking-canceled`, `booking-moved` notifications from Doctoralia. Creates mirror appointments in VisMed. Uses atomic upsert for dedup to prevent race conditions on concurrent notifications.
+- **Webhook endpoint**: `POST /webhooks/doctoralia` — public push endpoint for Doctoralia notifications. Resolves clinic by facilityId matching or falls back to first connected clinic.
+- **Pull polling**: Every 5 minutes via `setInterval` in `onModuleInit`. Cleans up intervals in `onModuleDestroy`. First poll delayed 30s after startup.
+- **BookingSyncController** (`/booking-sync/*`): Auth-protected endpoints — `GET /records` (with `start/end` date filters), `GET /stats`, `POST /book-from-vismed` (accepts `doctoraliaDoctorId` and resolves mapping), `DELETE /cancel/:id`, `POST /poll`.
+- **BookingSync DB model**: Tracks all synced bookings with origin (VISMED/DOCTORALIA), status (BOOKED/CONFIRMED/CANCELLED/MOVED/FAILED/PROCESSING), patient data, timestamps. `doctoraliaBookingId` has unique index for dedup.
+- **Frontend**: Weekly calendar view at `/appointments`. Doctor sidebar, color-coded events (green=VisMed, blue=Doctoralia, red=Cancelled, amber=Moved). Create/cancel booking modals with simultaneous VisMed+Doctoralia sync.
+- **Dedup mechanism**: `booked_by === 'integration'` skips reverse sync (prevents loops). Atomic upsert with PROCESSING status prevents duplicate VisMed appointments from concurrent webhook/poll.
+
 ## Key Files
 - `apps/web/src/lib/api.ts` — HTTP client (fetches `/api/*` via Next.js proxy)
 - `apps/web/src/lib/store.ts` — Zustand auth store with persist + hydration tracking (`_hasHydrated`)

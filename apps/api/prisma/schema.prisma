@@ -410,3 +410,54 @@ model ProfessionalUnifiedMapping {
 
   @@unique([vismedDoctorId, doctoraliaDoctorId])
 }
+
+enum BookingOrigin {
+  VISMED
+  DOCTORALIA
+}
+
+enum BookingSyncStatus {
+  BOOKED
+  CONFIRMED
+  CANCELLED
+  MOVED
+  NO_SHOW
+  FAILED
+  PROCESSING
+}
+
+model BookingSync {
+  id                    String            @id @default(uuid())
+  clinicId              String
+  vismedDoctorId        String?
+  doctoraliaDoctorId    String?
+  doctoraliaBookingId   String?           @unique
+  doctoraliaFacilityId  String?
+  doctoraliaAddressId   String?
+  origin                BookingOrigin
+  status                BookingSyncStatus @default(BOOKED)
+  patientName           String
+  patientSurname        String?
+  patientPhone          String?
+  patientEmail          String?
+  patientCpf            String?
+  patientBirthDate      String?
+  patientGender         String?
+  startAt               DateTime
+  endAt                 DateTime
+  duration              Int?
+  serviceName           String?
+  addressServiceId      String?
+  notificationId        String?
+  notificationName      String?
+  rawPayload            Json?
+  syncError             String?
+  processedAt           DateTime?
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+
+  @@index([clinicId])
+  @@index([doctoraliaBookingId])
+  @@index([startAt])
+  @@index([clinicId, doctoraliaDoctorId, startAt])
+}

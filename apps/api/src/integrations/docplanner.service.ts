@@ -269,6 +269,31 @@ export class DocplannerClient {
     async deleteCalendarBreak(facilityId: string, doctorId: string, addressId: string, breakId: string): Promise<any> {
         return this.request('DELETE', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/breaks/${breakId}`);
     }
+
+    async cancelBooking(facilityId: string, doctorId: string, addressId: string, bookingId: string, reason?: string): Promise<any> {
+        this.logger.log(`cancelBooking: DELETE booking ${bookingId} for doctor ${doctorId}`);
+        const body = reason ? { reason } : undefined;
+        return this.request('DELETE', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/bookings/${bookingId}`, body);
+    }
+
+    async moveBooking(facilityId: string, doctorId: string, addressId: string, bookingId: string, payload: {
+        address_service_id: number;
+        duration: number;
+        start: string;
+        address_id?: number;
+    }): Promise<any> {
+        this.logger.log(`moveBooking: POST move booking ${bookingId} to ${payload.start}`);
+        return this.request('POST', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/bookings/${bookingId}/move`, payload);
+    }
+
+    async getNotifications(limit: number = 100): Promise<any> {
+        return this.request('GET', `/api/v3/integration/notifications/multiple?limit=${limit}`);
+    }
+
+    async releaseFailedNotifications(): Promise<any> {
+        this.logger.log('releaseFailedNotifications: triggering re-queue of failed notifications');
+        return this.request('POST', '/api/v3/integration/notifications/release');
+    }
 }
 
 @Injectable()
