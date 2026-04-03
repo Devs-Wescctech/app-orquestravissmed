@@ -475,7 +475,57 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         });
 
         this.logger.log(`[VISMED→DOCTORALIA] Booked slot ${slotStart} for ${patient.name}, doctoraliaBookingId=${doctoraliaBookingId}`);
-        return { success: true, doctoraliaBookingId, bookResult };
+
+        let vismedCreated = false;
+        try {
+            const vismedConn = await this.prisma.integrationConnection.findFirst({
+                where: { clinicId, provider: 'vismed' },
+            });
+            if (vismedConn && vismedConn.clientId) {
+                const idEmpresaGestora = parseInt(vismedConn.clientId);
+                const vismedDoctor = await this.prisma.vismedDoctor.findUnique({
+                    where: { id: vismedDoctorId },
+                    include: { specialties: { include: { specialty: true } } },
+                });
+
+                if (vismedDoctor) {
+                    let idCategoriaServico = 0;
+                    if (vismedDoctor.specialties && vismedDoctor.specialties.length > 0) {
+                        idCategoriaServico = vismedDoctor.specialties[0].specialty.vismedId || 0;
+                    }
+                    if (!idCategoriaServico) {
+                        const anySpec = await this.prisma.vismedSpecialty.findFirst();
+                        if (anySpec) idCategoriaServico = anySpec.vismedId;
+                    }
+
+                    const startDate = new Date(startFormatted);
+                    const timeStr = startDate.toTimeString().substring(0, 5);
+                    const dateStr = startDate.toISOString().split('T')[0];
+                    const horariosProfissional = `${vismedDoctor.vismedId}-${timeStr}`;
+
+                    const vismedPayload = {
+                        tipo: 'particular',
+                        idcategoriaservico: idCategoriaServico,
+                        horarios_profissional: horariosProfissional,
+                        idempresagestora: idEmpresaGestora,
+                        data_agendamento: dateStr,
+                        nome: `${patient.name} ${patient.surname || ''}`.trim(),
+                        telefone: patient.phone || '',
+                        cpf: patient.cpf || undefined,
+                        data_nascimento: patient.birthDate || undefined,
+                        sexo: patient.gender === 'f' || patient.gender === '1' ? 1 : patient.gender === 'm' || patient.gender === '2' ? 2 : undefined,
+                    };
+
+                    await this.vismedService.createAppointment(vismedPayload, vismedConn.domain || undefined);
+                    vismedCreated = true;
+                    this.logger.log(`[VISMED→VISMED] Also created appointment in VisMed for ${patient.name}`);
+                }
+            }
+        } catch (vismedError) {
+            this.logger.warn(`[VISMED→VISMED] Failed to create in VisMed (Doctoralia booking still OK): ${vismedError.message}`);
+        }
+
+        return { success: true, doctoraliaBookingId, bookResult, vismedCreated };
     }
 
     async cancelOnDoctoraliaFromVismed(clinicId: string, doctoraliaBookingId: string, reason?: string) {
