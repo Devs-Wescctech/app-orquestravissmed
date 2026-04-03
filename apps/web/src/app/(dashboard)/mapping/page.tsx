@@ -203,6 +203,11 @@ export default function MappingHub() {
             await api.post('/mappings/insurance/approve', { mappingId });
             toast.success('Convênio aprovado com sucesso.');
             fetchData();
+            if (activeClinic?.id) {
+                api.post(`/sync/${activeClinic.id}/insurance`).then(() => {
+                    toast.success('Convênios sincronizados com profissionais na Doctoralia.');
+                }).catch(() => {});
+            }
         } catch (err: any) {
             toast.error(`Falha ao aprovar convênio: ${err.message}`);
         } finally {

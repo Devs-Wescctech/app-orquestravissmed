@@ -241,7 +241,7 @@ export class PushSyncService {
         });
 
         if (linkedInsuranceMappings.length === 0) {
-            this.logger.debug(`Doctor ${doctorName}: no linked insurance mappings to sync`);
+            this.logger.log(`Doctor ${doctorName}: [INS] Nenhum convênio LINKED para sincronizar. Aprove convênios pendentes na tela de Mapeamentos.`);
             return result;
         }
 
