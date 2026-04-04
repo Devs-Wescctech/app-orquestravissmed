@@ -231,6 +231,8 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 vismedDoctorId: vismedDoctorId || undefined,
                 status: vismedCreateResult ? 'BOOKED' : 'FAILED',
                 syncError: vismedCreateResult ? undefined : 'Failed to create in VisMed',
+                syncedToDoctoralia: true,
+                syncedToVismed: !!vismedCreateResult,
             },
         });
 
@@ -470,6 +472,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 endAt: new Date(new Date(startFormatted).getTime() + (duration || 30) * 60000),
                 duration: duration || 30,
                 addressServiceId: finalAddressServiceId,
+                syncedToDoctoralia: true,
                 processedAt: new Date(),
             },
         });
@@ -519,6 +522,11 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                     await this.vismedService.createAppointment(vismedPayload, vismedConn.domain || undefined);
                     vismedCreated = true;
                     this.logger.log(`[VISMED→VISMED] Also created appointment in VisMed for ${patient.name}`);
+
+                    await this.prisma.bookingSync.updateMany({
+                        where: { clinicId, doctoraliaBookingId },
+                        data: { syncedToVismed: true },
+                    });
                 }
             }
         } catch (vismedError) {

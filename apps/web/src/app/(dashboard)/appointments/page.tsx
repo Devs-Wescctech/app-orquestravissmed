@@ -38,6 +38,8 @@ interface BookingRecord {
     end_at?: string;
     patient?: { name?: string; surname?: string; phone?: string; email?: string };
     booked_by?: string;
+    syncedToVismed?: boolean;
+    syncedToDoctoralia?: boolean;
 }
 
 type ViewMode = 'day' | 'week' | 'month';
@@ -212,6 +214,8 @@ export default function AppointmentsPage() {
                 doctoraliaDoctorId: selectedDoctorId,
                 doctorName: b.doctorName,
                 booked_by: b.booked_by,
+                syncedToDoctoralia: true,
+                syncedToVismed: b.booked_by === 'integration',
             });
         }
         return merged.sort((a, b) => new Date(a.startAt).getTime() - new Date(b.startAt).getTime());
@@ -290,9 +294,10 @@ export default function AppointmentsPage() {
         }
     }, [viewMode, currentDate, rangeStart, rangeEnd]);
 
-    const totalBookings = allBookings.filter(b => b.status !== 'CANCELLED').length;
-    const vismedCount = allBookings.filter(b => b.origin === 'VISMED' && b.status !== 'CANCELLED').length;
-    const doctoraliaCount = allBookings.filter(b => b.origin === 'DOCTORALIA' && b.status !== 'CANCELLED').length;
+    const activeBookings = allBookings.filter(b => b.status !== 'CANCELLED');
+    const totalBookings = activeBookings.length;
+    const fullySynced = activeBookings.filter(b => b.syncedToVismed && b.syncedToDoctoralia).length;
+    const pendingSync = activeBookings.filter(b => !b.syncedToVismed || !b.syncedToDoctoralia).length;
 
     if (isLoading) {
         return (
@@ -337,12 +342,12 @@ export default function AppointmentsPage() {
             {/* ─── METRICS ─── */}
             <div className="grid grid-cols-3 gap-4">
                 {[
-                    { label: 'Total Agendamentos', value: totalBookings, color: 'text-slate-900' },
-                    { label: 'Via VisMed', value: vismedCount, color: 'text-emerald-600', dot: 'bg-emerald-500' },
-                    { label: 'Via Doctoralia', value: doctoraliaCount, color: 'text-blue-600', dot: 'bg-blue-500' },
+                    { label: 'Total Agendamentos', value: totalBookings, color: 'text-slate-900', icon: <CalendarDays className="h-5 w-5 text-slate-400" /> },
+                    { label: 'Sincronizados', value: fullySynced, color: 'text-emerald-600', icon: <ArrowRightLeft className="h-5 w-5 text-emerald-500" /> },
+                    { label: 'Pendentes', value: pendingSync, color: pendingSync > 0 ? 'text-amber-600' : 'text-slate-400', icon: <Clock className="h-5 w-5 text-amber-400" /> },
                 ].map((m) => (
                     <div key={m.label} className="bg-white/70 backdrop-blur-xl rounded-[32px] p-5 shadow-sm border border-slate-100/60 flex items-center gap-4 transition-all duration-300 hover:shadow-lg hover:-translate-y-0.5">
-                        {m.dot && <div className={`h-3 w-3 rounded-full ${m.dot} shrink-0`}></div>}
+                        {m.icon}
                         <div>
                             <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest">{m.label}</div>
                             <div className={`text-2xl font-black tracking-tighter ${m.color}`}>{m.value}</div>
@@ -487,8 +492,9 @@ export default function AppointmentsPage() {
                                     <div className="space-y-0.5">
                                         {dayBookings.slice(0, 3).map((b, idx) => {
                                             const isCancelled = b.status === 'CANCELLED';
-                                            const isVismed = b.origin === 'VISMED';
-                                            const dotColor = isCancelled ? 'bg-red-400' : b.status === 'MOVED' ? 'bg-amber-400' : isVismed ? 'bg-emerald-500' : 'bg-blue-500';
+                                            const isMoved = b.status === 'MOVED';
+                                            const bothSynced = b.syncedToVismed && b.syncedToDoctoralia;
+                                            const dotColor = isCancelled ? 'bg-red-400' : isMoved ? 'bg-amber-400' : bothSynced ? 'bg-emerald-500' : 'bg-amber-400';
                                             return (
                                                 <button
                                                     key={idx}
@@ -532,16 +538,16 @@ export default function AppointmentsPage() {
                                         {dayBookings.map((b, idx) => {
                                             const isCancelled = b.status === 'CANCELLED';
                                             const isMoved = b.status === 'MOVED';
-                                            const isVismed = b.origin === 'VISMED';
+                                            const bothSynced = b.syncedToVismed && b.syncedToDoctoralia;
                                             const bgColor = isCancelled ? 'bg-red-50 border-red-200'
                                                 : isMoved ? 'bg-amber-50 border-amber-200'
-                                                : isVismed ? 'bg-emerald-50 border-emerald-200'
-                                                : 'bg-blue-50 border-blue-200';
+                                                : bothSynced ? 'bg-emerald-50 border-emerald-200'
+                                                : 'bg-amber-50 border-amber-200';
                                             const textColor = isCancelled ? 'text-red-700'
                                                 : isMoved ? 'text-amber-700'
-                                                : isVismed ? 'text-emerald-700'
-                                                : 'text-blue-700';
-                                            const dotColor = isCancelled ? 'bg-red-400' : isMoved ? 'bg-amber-400' : isVismed ? 'bg-emerald-500' : 'bg-blue-500';
+                                                : bothSynced ? 'text-emerald-700'
+                                                : 'text-amber-700';
+                                            const dotColor = isCancelled ? 'bg-red-400' : isMoved ? 'bg-amber-400' : bothSynced ? 'bg-emerald-500' : 'bg-amber-400';
                                             return (
                                                 <button
                                                     key={idx}
@@ -555,7 +561,10 @@ export default function AppointmentsPage() {
                                                     <div className={`text-[10px] font-bold truncate ${textColor}`}>
                                                         {b.patientName}{b.patientSurname ? ` ${b.patientSurname}` : ''}
                                                     </div>
-                                                    <div className="text-[8px] font-black uppercase tracking-wider opacity-50 mt-0.5">{isVismed ? 'VisMed' : 'Doctoralia'}</div>
+                                                    <div className="flex items-center gap-1 mt-1">
+                                                        <span className={`text-[7px] font-black uppercase tracking-wider px-1 py-0.5 rounded ${b.syncedToVismed ? 'bg-emerald-100 text-emerald-600' : 'bg-slate-100 text-slate-400'}`}>V</span>
+                                                        <span className={`text-[7px] font-black uppercase tracking-wider px-1 py-0.5 rounded ${b.syncedToDoctoralia ? 'bg-blue-100 text-blue-600' : 'bg-slate-100 text-slate-400'}`}>D</span>
+                                                    </div>
                                                 </button>
                                             );
                                         })}
@@ -600,12 +609,12 @@ export default function AppointmentsPage() {
                                                 {hourBookings.map((b, idx) => {
                                                     const isCancelled = b.status === 'CANCELLED';
                                                     const isMoved = b.status === 'MOVED';
-                                                    const isVismed = b.origin === 'VISMED';
+                                                    const bothSynced = b.syncedToVismed && b.syncedToDoctoralia;
                                                     const bgColor = isCancelled ? 'bg-red-50 border-red-200 text-red-700'
                                                         : isMoved ? 'bg-amber-50 border-amber-200 text-amber-700'
-                                                        : isVismed ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
-                                                        : 'bg-blue-50 border-blue-200 text-blue-700';
-                                                    const dotColor = isCancelled ? 'bg-red-400' : isMoved ? 'bg-amber-400' : isVismed ? 'bg-emerald-500' : 'bg-blue-500';
+                                                        : bothSynced ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                                                        : 'bg-amber-50 border-amber-200 text-amber-700';
+                                                    const dotColor = isCancelled ? 'bg-red-400' : isMoved ? 'bg-amber-400' : bothSynced ? 'bg-emerald-500' : 'bg-amber-400';
                                                     return (
                                                         <button
                                                             key={idx}
@@ -615,7 +624,8 @@ export default function AppointmentsPage() {
                                                             <div className={`h-2.5 w-2.5 rounded-full ${dotColor}`}></div>
                                                             <span className="font-black">{formatTime(b.startAt)}</span>
                                                             <span className="max-w-[200px] truncate">{b.patientName}{b.patientSurname ? ` ${b.patientSurname}` : ''}</span>
-                                                            <span className="text-[8px] font-black uppercase tracking-wider opacity-50">{isVismed ? 'VM' : 'DC'}</span>
+                                                            <span className={`text-[7px] font-black uppercase px-1 py-0.5 rounded ${b.syncedToVismed ? 'bg-emerald-100 text-emerald-600' : 'bg-slate-100 text-slate-400'}`}>V</span>
+                                                            <span className={`text-[7px] font-black uppercase px-1 py-0.5 rounded ${b.syncedToDoctoralia ? 'bg-blue-100 text-blue-600' : 'bg-slate-100 text-slate-400'}`}>D</span>
                                                         </button>
                                                     );
                                                 })}
@@ -640,10 +650,9 @@ export default function AppointmentsPage() {
             {/* Legend bar */}
             <div className="flex items-center gap-6 px-2">
                 {[
-                    { color: 'bg-emerald-500', label: 'VisMed' },
-                    { color: 'bg-blue-500', label: 'Doctoralia' },
+                    { color: 'bg-emerald-500', label: 'Sincronizado (V+D)' },
+                    { color: 'bg-amber-400', label: 'Sincronização Pendente' },
                     { color: 'bg-red-400', label: 'Cancelado' },
-                    { color: 'bg-amber-400', label: 'Movido' },
                 ].map((l) => (
                     <div key={l.label} className="flex items-center gap-1.5">
                         <div className={`h-2.5 w-2.5 rounded-full ${l.color}`}></div>
@@ -662,18 +671,13 @@ export default function AppointmentsPage() {
 
                         <div className="flex items-center gap-4 mb-6">
                             <div className={`h-14 w-14 rounded-2xl flex items-center justify-center ${
-                                selectedBooking.origin === 'VISMED' ? 'bg-emerald-100 text-emerald-600' : 'bg-blue-100 text-blue-600'
+                                selectedBooking.syncedToVismed && selectedBooking.syncedToDoctoralia ? 'bg-emerald-100 text-emerald-600' : 'bg-amber-100 text-amber-600'
                             }`}>
-                                {selectedBooking.origin === 'VISMED' ? <Building2 className="h-7 w-7" /> : <Globe className="h-7 w-7" />}
+                                <ArrowRightLeft className="h-7 w-7" />
                             </div>
                             <div>
                                 <h2 className="text-xl font-black text-slate-900 tracking-tight">Detalhes do Agendamento</h2>
                                 <div className="flex items-center gap-2 mt-1">
-                                    <span className={`px-2.5 py-0.5 rounded-lg text-[9px] font-black uppercase tracking-wider ${
-                                        selectedBooking.origin === 'VISMED' ? 'bg-emerald-100 text-emerald-700' : 'bg-blue-100 text-blue-700'
-                                    }`}>
-                                        {selectedBooking.origin === 'VISMED' ? 'VisMed' : 'Doctoralia'}
-                                    </span>
                                     <span className={`px-2.5 py-0.5 rounded-lg text-[9px] font-black uppercase tracking-wider ${
                                         selectedBooking.status === 'CANCELLED' ? 'bg-red-100 text-red-700' :
                                         selectedBooking.status === 'MOVED' ? 'bg-amber-100 text-amber-700' :
@@ -681,7 +685,27 @@ export default function AppointmentsPage() {
                                     }`}>
                                         {selectedBooking.status}
                                     </span>
+                                    <span className={`text-[8px] font-black uppercase tracking-wider ${
+                                        selectedBooking.origin === 'VISMED' ? 'text-emerald-500' : 'text-blue-500'
+                                    }`}>
+                                        Origem: {selectedBooking.origin === 'VISMED' ? 'VisMed' : 'Doctoralia'}
+                                    </span>
                                 </div>
+                            </div>
+                        </div>
+
+                        <div className="flex items-center gap-3 mb-5">
+                            <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-wider border ${
+                                selectedBooking.syncedToVismed ? 'bg-emerald-50 border-emerald-200 text-emerald-700' : 'bg-slate-50 border-slate-200 text-slate-400'
+                            }`}>
+                                <Building2 className="h-3.5 w-3.5" />
+                                VisMed {selectedBooking.syncedToVismed ? '✓' : '✗'}
+                            </div>
+                            <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-wider border ${
+                                selectedBooking.syncedToDoctoralia ? 'bg-blue-50 border-blue-200 text-blue-700' : 'bg-slate-50 border-slate-200 text-slate-400'
+                            }`}>
+                                <Globe className="h-3.5 w-3.5" />
+                                Doctoralia {selectedBooking.syncedToDoctoralia ? '✓' : '✗'}
                             </div>
                         </div>
 

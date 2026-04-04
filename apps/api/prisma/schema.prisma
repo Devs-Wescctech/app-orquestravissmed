@@ -451,6 +451,8 @@ model BookingSync {
   notificationId        String?
   notificationName      String?
   rawPayload            Json?
+  syncedToVismed        Boolean           @default(false)
+  syncedToDoctoralia    Boolean           @default(false)
   syncError             String?
   processedAt           DateTime?
   createdAt             DateTime          @default(now())
