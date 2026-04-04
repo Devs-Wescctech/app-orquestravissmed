@@ -90,11 +90,20 @@ Both pipelines attempt BullMQ queue dispatch first, then fall back to direct inl
 ## Bidirectional Booking Sync (VisMed ↔ Doctoralia)
 - **BookingSyncService** (`apps/api/src/bookings/booking-sync.service.ts`): Core sync engine. Handles `slot-booked`, `booking-canceled`, `booking-moved` notifications from Doctoralia. Creates mirror appointments in VisMed. Uses atomic upsert for dedup to prevent race conditions on concurrent notifications.
 - **Webhook endpoint**: `POST /webhooks/doctoralia` — public push endpoint for Doctoralia notifications. Resolves clinic by facilityId matching or falls back to first connected clinic.
-- **Pull polling**: Every 5 minutes via `setInterval` in `onModuleInit`. Cleans up intervals in `onModuleDestroy`. First poll delayed 30s after startup.
-- **BookingSyncController** (`/booking-sync/*`): Auth-protected endpoints — `GET /records` (with `start/end` date filters), `GET /stats`, `POST /book-from-vismed` (accepts `doctoraliaDoctorId` and resolves mapping), `DELETE /cancel/:id`, `POST /poll`.
-- **BookingSync DB model**: Tracks all synced bookings with origin (VISMED/DOCTORALIA), status (BOOKED/CONFIRMED/CANCELLED/MOVED/FAILED/PROCESSING), patient data, timestamps. `doctoraliaBookingId` has unique index for dedup.
-- **Frontend**: Weekly calendar view at `/appointments`. Doctor sidebar, color-coded events (green=VisMed, blue=Doctoralia, red=Cancelled, amber=Moved). Create/cancel booking modals with simultaneous VisMed+Doctoralia sync.
+- **Pull polling**: Staggered per-clinic polling via `startStaggeredPolling()`. Each clinic gets its own interval (base 3min, staggered by 6s per clinic). First poll delayed 15s after startup. Falls back to single-loop polling if no connections found.
+- **BookingSyncController** (`/booking-sync/*`): Auth-protected endpoints — `GET /records` (with `start/end` date filters), `GET /stats`, `GET /health` (queue depth, rate limiter stats), `GET /metrics` (per-clinic throughput), `POST /retry-dead-letters`, `POST /book-from-vismed`, `DELETE /cancel/:id`, `POST /poll`.
+- **BookingSync DB model**: Tracks all synced bookings with origin (VISMED/DOCTORALIA), status (BOOKED/CONFIRMED/CANCELLED/MOVED/FAILED/PROCESSING), patient data, timestamps, sync flags (`syncedToVismed`, `syncedToDoctoralia`). `doctoraliaBookingId` has unique index for dedup.
+- **Frontend**: Weekly calendar view at `/appointments`. Doctor sidebar, unified V/D sync badges per appointment. Create/cancel booking modals with simultaneous VisMed+Doctoralia sync.
 - **Dedup mechanism**: `booked_by === 'integration'` skips reverse sync (prevents loops). Atomic upsert with PROCESSING status prevents duplicate VisMed appointments from concurrent webhook/poll.
+
+## Scalability Architecture (30 clinics × 400 bookings/day)
+- **PostgreSQL-backed job queue** (`SyncJob` table + `QueueService`): Replaces Redis/BullMQ dependency. Claims jobs with `FOR UPDATE SKIP LOCKED` for safe concurrency. Aggressive worker loop fills up to 10 concurrent slots per tick (1s interval). Supports priorities, exponential backoff (2^attempt seconds, max 5min), and dead-letter after 5 failed attempts. Stale lock cleanup every 60s (properly tracked and cleared on shutdown).
+- **Rate limiter** (`RateLimiterService`): Token bucket per provider. Doctoralia: 30 tokens, refill 10/s. VisMed: 20 tokens, refill 8/s. Auto-waits when bucket is empty.
+- **Staggered polling**: Each clinic polls independently on its own interval, spread 6s apart. Dynamically refreshes every 5min to pick up new/removed clinic connections without restart.
+- **Job deduplication**: Uses `dedupKey` (format: `clinicId:eventType:bookingId`) to prevent duplicate jobs from concurrent webhook + polling. Both `enqueue` and `enqueueBatch` check for existing PENDING/RUNNING jobs with same key.
+- **Webhook security**: Clinic resolution requires exact facilityId match — no fallback to first connection. Prevents cross-tenant data corruption.
+- **Monitoring**: `GET /booking-sync/health` (queue depth, active jobs, dead letters, rate limiter stats), `GET /booking-sync/metrics` (per-clinic throughput in last 24h), `POST /booking-sync/retry-dead-letters` (clinic-scoped only, requires clinicId).
+- **Key files**: `apps/api/src/bookings/queue.service.ts`, `apps/api/src/bookings/rate-limiter.service.ts`.
 
 ## Key Files
 - `apps/web/src/lib/api.ts` — HTTP client (fetches `/api/*` via Next.js proxy)

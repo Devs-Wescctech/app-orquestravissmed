@@ -1,5 +1,7 @@
 import { Controller, Post, Body, Get, Query, UseGuards, Req, Logger, ForbiddenException, Delete, Param } from '@nestjs/common';
 import { BookingSyncService } from './booking-sync.service';
+import { QueueService } from './queue.service';
+import { RateLimiterService } from './rate-limiter.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { PrismaService } from '../prisma/prisma.service';
 
@@ -24,6 +26,8 @@ export class BookingSyncController {
 
     constructor(
         private readonly bookingSyncService: BookingSyncService,
+        private readonly queueService: QueueService,
+        private readonly rateLimiter: RateLimiterService,
         private readonly prisma: PrismaService,
     ) {}
 
@@ -61,6 +65,60 @@ export class BookingSyncController {
     async getStats(@Req() req: any, @Query('clinicId') clinicId: string) {
         this.validateClinicAccess(req.user, clinicId);
         return this.bookingSyncService.getSyncStats(clinicId);
+    }
+
+    @Get('health')
+    async getHealth(@Req() req: any) {
+        const [queueMetrics, rateLimiterStats] = await Promise.all([
+            this.queueService.getMetrics(),
+            this.rateLimiter.getStats(),
+        ]);
+
+        const connectedClinics = await this.prisma.integrationConnection.count({
+            where: { provider: 'doctoralia', status: 'connected' },
+        });
+
+        return {
+            status: 'ok',
+            timestamp: new Date().toISOString(),
+            connectedClinics,
+            queue: queueMetrics,
+            rateLimiter: rateLimiterStats,
+        };
+    }
+
+    @Get('metrics')
+    async getClinicMetrics(
+        @Req() req: any,
+        @Query('clinicId') clinicId?: string,
+    ) {
+        if (clinicId) {
+            this.validateClinicAccess(req.user, clinicId);
+            return this.queueService.getClinicMetrics(clinicId);
+        }
+
+        const connections = await this.prisma.integrationConnection.findMany({
+            where: { provider: 'doctoralia', status: 'connected' },
+            select: { clinicId: true },
+        });
+
+        const metrics = await Promise.all(
+            connections.map(c => this.queueService.getClinicMetrics(c.clinicId)),
+        );
+
+        return { clinics: metrics };
+    }
+
+    @Post('retry-dead-letters')
+    async retryDeadLetters(
+        @Req() req: any,
+        @Body() body: { clinicId: string },
+    ) {
+        if (!body?.clinicId) {
+            throw new ForbiddenException('clinicId é obrigatório');
+        }
+        this.validateClinicAccess(req.user, body.clinicId);
+        return this.queueService.retryDeadLetters(body.clinicId);
     }
 
     @Post('book-from-vismed')

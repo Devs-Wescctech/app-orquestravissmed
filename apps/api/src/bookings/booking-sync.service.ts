@@ -2,96 +2,172 @@ import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/commo
 import { PrismaService } from '../prisma/prisma.service';
 import { DocplannerService } from '../integrations/docplanner.service';
 import { VismedService } from '../integrations/vismed/vismed.service';
+import { QueueService } from './queue.service';
+import { RateLimiterService } from './rate-limiter.service';
+
+const POLL_BASE_INTERVAL_MS = 3 * 60 * 1000;
+const STAGGER_PER_CLINIC_MS = 6000;
+const STARTUP_DELAY_MS = 15_000;
 
 @Injectable()
 export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
     private readonly logger = new Logger(BookingSyncService.name);
-    private pollingInterval: NodeJS.Timeout | null = null;
+    private clinicTimers: NodeJS.Timeout[] = [];
     private startupTimeout: NodeJS.Timeout | null = null;
-    private isPolling = false;
+    private isShuttingDown = false;
 
     constructor(
         private prisma: PrismaService,
         private docplannerService: DocplannerService,
         private vismedService: VismedService,
+        private queueService: QueueService,
+        private rateLimiter: RateLimiterService,
     ) {}
 
     onModuleInit() {
-        this.startPolling();
+        this.registerJobHandlers();
+        this.startStaggeredPolling();
     }
 
     onModuleDestroy() {
-        if (this.pollingInterval) {
-            clearInterval(this.pollingInterval);
-            this.pollingInterval = null;
-        }
+        this.isShuttingDown = true;
+        this.clinicTimers.forEach(t => clearInterval(t));
+        this.clinicTimers = [];
         if (this.startupTimeout) {
             clearTimeout(this.startupTimeout);
             this.startupTimeout = null;
         }
-        this.logger.log('Polling intervals cleared on module destroy');
+        this.logger.log('All polling intervals cleared on module destroy');
     }
 
-    private startPolling() {
-        const intervalMs = 5 * 60 * 1000;
-        this.logger.log(`Starting Doctoralia notification polling every ${intervalMs / 1000}s`);
-        this.pollingInterval = setInterval(() => this.pollNotifications(), intervalMs);
-        this.startupTimeout = setTimeout(() => this.pollNotifications(), 30_000);
+    private registerJobHandlers() {
+        this.queueService.registerHandler('slot-booked', async (payload, clinicId) => {
+            await this.handleSlotBooked(clinicId, payload.data, payload.raw);
+        });
+
+        this.queueService.registerHandler('booking-canceled', async (payload, clinicId) => {
+            await this.handleBookingCanceled(clinicId, payload.data, payload.raw);
+        });
+
+        this.queueService.registerHandler('booking-moved', async (payload, clinicId) => {
+            await this.handleBookingMoved(clinicId, payload.data, payload.raw);
+        });
     }
 
-    async pollNotifications() {
-        if (this.isPolling) {
-            this.logger.debug('Polling already in progress, skipping');
-            return;
-        }
-        this.isPolling = true;
+    private async startStaggeredPolling() {
+        this.startupTimeout = setTimeout(async () => {
+            await this.refreshPollingSchedule();
 
+            const refreshTimer = setInterval(() => {
+                if (!this.isShuttingDown) this.refreshPollingSchedule();
+            }, 5 * 60 * 1000);
+            this.clinicTimers.push(refreshTimer);
+        }, STARTUP_DELAY_MS);
+    }
+
+    private polledClinicIds = new Set<string>();
+
+    private async refreshPollingSchedule() {
         try {
             const connections = await this.prisma.integrationConnection.findMany({
                 where: { provider: 'doctoralia', status: 'connected' },
             });
 
+            const currentIds = new Set(connections.map(c => c.clinicId));
+
             for (const conn of connections) {
-                if (!conn.clientId || !conn.clientSecret) continue;
+                if (this.polledClinicIds.has(conn.clinicId)) continue;
 
-                try {
-                    const client = this.docplannerService.createClient(
-                        conn.domain || 'doctoralia.com.br',
-                        conn.clientId,
-                        conn.clientSecret,
-                    );
+                const index = this.polledClinicIds.size;
+                const stagger = index * STAGGER_PER_CLINIC_MS;
+                const interval = POLL_BASE_INTERVAL_MS + (index * 2000);
 
-                    await new Promise(r => setTimeout(r, 2000));
+                setTimeout(() => {
+                    if (this.isShuttingDown) return;
+                    this.pollClinic(conn);
 
-                    const res = await client.getNotifications(100);
-                    const notifications = res?._items || (Array.isArray(res) ? res : []);
+                    const timer = setInterval(() => {
+                        if (!this.isShuttingDown) this.pollClinic(conn);
+                    }, interval);
+                    this.clinicTimers.push(timer);
+                }, stagger);
 
-                    if (notifications.length === 0) {
-                        this.logger.debug(`[POLL] No notifications for clinic ${conn.clinicId}`);
-                        continue;
-                    }
+                this.polledClinicIds.add(conn.clinicId);
+                this.logger.log(`[POLL] Added staggered polling for clinic ${conn.clinicId} (stagger=${stagger}ms, interval=${interval}ms)`);
+            }
 
-                    this.logger.log(`[POLL] Processing ${notifications.length} notification(s) for clinic ${conn.clinicId}`);
+            if (connections.length === 0 && this.polledClinicIds.size === 0) {
+                this.logger.debug('No active Doctoralia connections found');
+            }
+        } catch (err: any) {
+            this.logger.error(`Failed to refresh polling schedule: ${err.message}`);
+        }
+    }
 
-                    for (const notification of notifications) {
-                        await this.processNotification(conn.clinicId, notification, client);
-                    }
-                } catch (err: any) {
-                    this.logger.warn(`[POLL] Error polling clinic ${conn.clinicId}: ${err.message}`);
-                }
+    private async pollClinic(conn: any) {
+        if (!conn.clientId || !conn.clientSecret) return;
+
+        try {
+            await this.rateLimiter.acquire('doctoralia');
+
+            const client = this.docplannerService.createClient(
+                conn.domain || 'doctoralia.com.br',
+                conn.clientId,
+                conn.clientSecret,
+            );
+
+            const res = await client.getNotifications(100);
+            const notifications = res?._items || (Array.isArray(res) ? res : []);
+
+            if (notifications.length === 0) {
+                this.logger.debug(`[POLL] No notifications for clinic ${conn.clinicId}`);
+                return;
+            }
+
+            this.logger.log(`[POLL] Enqueuing ${notifications.length} notification(s) for clinic ${conn.clinicId}`);
+
+            const jobs = notifications
+                .filter((n: any) => ['slot-booked', 'booking-canceled', 'booking-moved'].includes(n?.name))
+                .map((n: any) => {
+                    const bookingId = n?.data?.visit_booking?.id;
+                    return {
+                        clinicId: conn.clinicId,
+                        type: n.name,
+                        payload: { data: n.data, raw: n },
+                        priority: n.name === 'booking-canceled' ? 2 : 1,
+                        dedupKey: bookingId ? `${conn.clinicId}:${n.name}:${bookingId}` : undefined,
+                    };
+                });
+
+            if (jobs.length > 0) {
+                await this.queueService.enqueueBatch(jobs);
+            }
+        } catch (err: any) {
+            this.logger.warn(`[POLL] Error polling clinic ${conn.clinicId}: ${err.message}`);
+        }
+    }
+
+    private async pollAllClinics() {
+        try {
+            const connections = await this.prisma.integrationConnection.findMany({
+                where: { provider: 'doctoralia', status: 'connected' },
+            });
+            for (const conn of connections) {
+                await this.pollClinic(conn);
             }
         } catch (err: any) {
             this.logger.error(`[POLL] Global polling error: ${err.message}`);
-        } finally {
-            this.isPolling = false;
         }
+    }
+
+    async pollNotifications() {
+        return this.pollAllClinics();
     }
 
     async processWebhookNotification(body: any) {
         const notifName = body?.name;
         this.logger.log(`[WEBHOOK] Received notification: ${notifName}`);
 
-        const doctorData = body?.data?.doctor;
         const facilityData = body?.data?.facility;
 
         if (!facilityData?.id) {
@@ -104,53 +180,32 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         });
 
         const facilityIdStr = String(facilityData.id);
-        let conn = allConns.find(c => c.clientId === facilityIdStr);
-
-        if (!conn && allConns.length > 0) {
-            conn = allConns[0];
-        }
+        const conn = allConns.find(c => c.clientId === facilityIdStr);
 
         if (!conn) {
-            this.logger.warn('[WEBHOOK] No active Doctoralia connection found');
-            return { processed: false, reason: 'no_connection' };
+            this.logger.warn(`[WEBHOOK] No Doctoralia connection found for facilityId=${facilityIdStr}`);
+            return { processed: false, reason: 'no_matching_connection' };
         }
 
-        const client = this.docplannerService.createClient(
-            conn.domain || 'doctoralia.com.br',
-            conn.clientId!,
-            conn.clientSecret || '',
-        );
+        if (['slot-booked', 'booking-canceled', 'booking-moved'].includes(notifName)) {
+            const bookingId = body?.data?.visit_booking?.id;
+            const dedupKey = bookingId ? `${conn.clinicId}:${notifName}:${bookingId}` : undefined;
 
-        return this.processNotification(conn.clinicId, body, client);
-    }
+            await this.queueService.enqueue(conn.clinicId, notifName, {
+                data: body.data,
+                raw: body,
+            }, { priority: notifName === 'booking-canceled' ? 2 : 1, dedupKey });
 
-    private async processNotification(clinicId: string, notification: any, client: any) {
-        const name = notification?.name;
-        const data = notification?.data;
-
-        try {
-            switch (name) {
-                case 'slot-booked':
-                    return await this.handleSlotBooked(clinicId, data, notification);
-                case 'booking-canceled':
-                    return await this.handleBookingCanceled(clinicId, data, notification);
-                case 'booking-moved':
-                    return await this.handleBookingMoved(clinicId, data, notification);
-                default:
-                    this.logger.debug(`[NOTIFICATION] Ignoring notification type: ${name}`);
-                    return { processed: false, reason: `unsupported_type:${name}` };
-            }
-        } catch (err: any) {
-            this.logger.error(`[NOTIFICATION] Error processing ${name}: ${err.message}`);
-            return { processed: false, error: err.message };
+            return { processed: true, action: 'enqueued', type: notifName };
         }
+
+        return { processed: false, reason: `unsupported_type:${notifName}` };
     }
 
     private async handleSlotBooked(clinicId: string, data: any, rawNotification: any) {
         const booking = data?.visit_booking;
         if (!booking?.id) {
-            this.logger.warn('[SLOT-BOOKED] No booking ID in notification');
-            return { processed: false, reason: 'no_booking_id' };
+            throw new Error('No booking ID in slot-booked notification');
         }
 
         const bookingIdStr = String(booking.id);
@@ -216,10 +271,12 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         if (mapping) {
             vismedDoctorId = mapping.vismedId;
             try {
+                await this.rateLimiter.acquire('vismed');
                 vismedCreateResult = await this.createVismedAppointment(clinicId, mapping, booking, data);
                 this.logger.log(`[SLOT-BOOKED] Created VisMed appointment for booking ${bookingIdStr}`);
             } catch (err: any) {
                 this.logger.error(`[SLOT-BOOKED] Failed to create VisMed appointment for booking ${bookingIdStr}: ${err.message}`);
+                throw err;
             }
         } else {
             this.logger.warn(`[SLOT-BOOKED] No LINKED doctor mapping for doctoraliaDoctorId=${doctoraliaDoctorId}`);
@@ -410,7 +467,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             conn.clientSecret || '',
         );
 
-        await new Promise(r => setTimeout(r, 1000));
+        await this.rateLimiter.acquire('doctoralia');
 
         let finalAddressServiceId = addressServiceId;
         if (!finalAddressServiceId) {
@@ -441,6 +498,8 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         };
 
         const startFormatted = slotStart.includes('T') ? slotStart : `${slotStart}:00-03:00`;
+
+        await this.rateLimiter.acquire('doctoralia');
 
         const bookResult = await client.bookSlot(
             cd.facilityId,
@@ -485,6 +544,8 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 where: { clinicId, provider: 'vismed' },
             });
             if (vismedConn && vismedConn.clientId) {
+                await this.rateLimiter.acquire('vismed');
+
                 const idEmpresaGestora = parseInt(vismedConn.clientId);
                 const vismedDoctor = await this.prisma.vismedDoctor.findUnique({
                     where: { id: vismedDoctorId },
@@ -529,7 +590,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                     });
                 }
             }
-        } catch (vismedError) {
+        } catch (vismedError: any) {
             this.logger.warn(`[VISMED→VISMED] Failed to create in VisMed (Doctoralia booking still OK): ${vismedError.message}`);
         }
 
@@ -559,7 +620,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             conn.clientSecret || '',
         );
 
-        await new Promise(r => setTimeout(r, 1000));
+        await this.rateLimiter.acquire('doctoralia');
 
         await client.cancelBooking(
             syncRecord.doctoraliaFacilityId || '',
@@ -570,33 +631,24 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         );
 
         await this.prisma.bookingSync.update({
-            where: { id: syncRecord.id },
+            where: { doctoraliaBookingId },
             data: { status: 'CANCELLED', processedAt: new Date() },
         });
 
-        this.logger.log(`[CANCEL] Cancelled booking ${doctoraliaBookingId} on Doctoralia`);
-        return { success: true };
+        return { success: true, cancelled: true };
     }
 
-    async getBookingSyncRecords(clinicId: string, filters?: {
-        doctoraliaDoctorId?: string;
-        vismedDoctorId?: string;
-        startDate?: string;
-        endDate?: string;
-        origin?: string;
-        status?: string;
-    }) {
+    async getBookingSyncRecords(clinicId: string, filters: any = {}) {
         const where: any = { clinicId };
 
-        if (filters?.doctoraliaDoctorId) where.doctoraliaDoctorId = filters.doctoraliaDoctorId;
-        if (filters?.vismedDoctorId) where.vismedDoctorId = filters.vismedDoctorId;
-        if (filters?.origin) where.origin = filters.origin;
-        if (filters?.status) where.status = filters.status;
-
-        if (filters?.startDate || filters?.endDate) {
+        if (filters.doctoraliaDoctorId) where.doctoraliaDoctorId = filters.doctoraliaDoctorId;
+        if (filters.vismedDoctorId) where.vismedDoctorId = filters.vismedDoctorId;
+        if (filters.origin) where.origin = filters.origin;
+        if (filters.status) where.status = filters.status;
+        if (filters.startDate || filters.endDate) {
             where.startAt = {};
-            if (filters?.startDate) where.startAt.gte = new Date(filters.startDate);
-            if (filters?.endDate) where.startAt.lte = new Date(filters.endDate + 'T23:59:59');
+            if (filters.startDate) where.startAt.gte = new Date(filters.startDate);
+            if (filters.endDate) where.startAt.lte = new Date(filters.endDate + 'T23:59:59Z');
         }
 
         return this.prisma.bookingSync.findMany({
@@ -606,30 +658,12 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
     }
 
     async getSyncStats(clinicId: string) {
-        const [total, byOrigin, byStatus, recent] = await Promise.all([
+        const [total, booked, failed, cancelled] = await Promise.all([
             this.prisma.bookingSync.count({ where: { clinicId } }),
-            this.prisma.bookingSync.groupBy({
-                by: ['origin'],
-                where: { clinicId },
-                _count: true,
-            }),
-            this.prisma.bookingSync.groupBy({
-                by: ['status'],
-                where: { clinicId },
-                _count: true,
-            }),
-            this.prisma.bookingSync.findMany({
-                where: { clinicId },
-                orderBy: { createdAt: 'desc' },
-                take: 10,
-            }),
+            this.prisma.bookingSync.count({ where: { clinicId, status: 'BOOKED' } }),
+            this.prisma.bookingSync.count({ where: { clinicId, status: 'FAILED' } }),
+            this.prisma.bookingSync.count({ where: { clinicId, status: 'CANCELLED' } }),
         ]);
-
-        return {
-            total,
-            byOrigin: byOrigin.reduce((acc, r) => ({ ...acc, [r.origin]: r._count }), {}),
-            byStatus: byStatus.reduce((acc, r) => ({ ...acc, [r.status]: r._count }), {}),
-            recent,
-        };
+        return { total, booked, failed, cancelled };
     }
 }
