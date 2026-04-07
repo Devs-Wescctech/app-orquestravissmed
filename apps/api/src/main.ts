@@ -2,6 +2,23 @@ import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 
+process.on('uncaughtException', (err) => {
+  if (err.message?.includes('ECONNREFUSED') && err.message?.includes('6379')) {
+    return;
+  }
+  console.error('[VISMED-API] Uncaught Exception:', err);
+});
+
+process.on('unhandledRejection', (reason: any) => {
+  if (reason?.message?.includes('ECONNREFUSED') && reason?.message?.includes('6379')) {
+    return;
+  }
+  if (reason?.message?.includes('Connection is closed')) {
+    return;
+  }
+  console.error('[VISMED-API] Unhandled Rejection:', reason);
+});
+
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 

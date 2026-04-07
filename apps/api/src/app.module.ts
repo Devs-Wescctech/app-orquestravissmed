@@ -35,6 +35,7 @@ import { BookingsModule } from './bookings/bookings.module';
         reconnectOnError: () => false,
         enableOfflineQueue: false,
         lazyConnect: true,
+        enableReadyCheck: false,
       },
     }),
     SyncModule,
