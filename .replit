@@ -46,4 +46,4 @@ VISMED_API_PORT = "3000"
 [deployment]
 deploymentTarget = "vm"
 run = ["sh", "-c", "cd /home/runner/workspace/apps/api && node dist/main.js & cd /home/runner/workspace/apps/web && npm run start"]
-build = ["sh", "-c", "cd /home/runner/workspace/apps/api && npx tsc && cd /home/runner/workspace/apps/web && npm run build"]
+build = ["sh", "-c", "cd /home/runner/workspace/apps/api && npx tsc && npx prisma migrate deploy && npx ts-node prisma/seed.ts && cd /home/runner/workspace/apps/web && npm run build"]
