@@ -35,7 +35,7 @@ export class SlotSyncService {
         return { start, end };
     }
 
-    buildDaySlots(date: string, turnoM: string | null, turnoT: string | null, turnoN: string | null, addressServiceIds: number[], timezone: string = '-03:00', slotDurationMinutes: number = 30): any[] {
+    buildDaySlots(date: string, turnoM: string | null, turnoT: string | null, turnoN: string | null, addressServiceIds: number[], timezone: string = '-03:00', slotDurationMinutes: number = 30, insuranceProviderIds: number[] = []): any[] {
         const slots: any[] = [];
         const turnos = [turnoM, turnoT, turnoN];
 
@@ -46,14 +46,21 @@ export class SlotSyncService {
             const parsed = this.parseTurno(turno);
             if (!parsed) continue;
 
-            slots.push({
+            const slot: any = {
                 start: `${date}T${parsed.start}:00${timezone}`,
                 end: `${date}T${parsed.end}:00${timezone}`,
                 address_services: uniqueServiceIds.map(id => ({
                     address_service_id: String(id),
                     duration: slotDurationMinutes,
                 })),
-            });
+                insurance_accepted: insuranceProviderIds.length > 0 ? 'with-and-without-insurance' : 'without-insurance',
+            };
+
+            if (insuranceProviderIds.length > 0) {
+                slot.insurance_providers = insuranceProviderIds;
+            }
+
+            slots.push(slot);
         }
         return slots;
     }
@@ -209,9 +216,22 @@ export class SlotSyncService {
                 this.logger.warn(`Doctor ${doctor.name}: skipping invalid turno(s): ${invalidTurnos.map(t => `"${t}"`).join(', ')}`);
             }
 
+            let insuranceProviderIds: number[] = [];
+            if (clinicId) {
+                const linkedInsuranceMappings = await this.prisma.mapping.findMany({
+                    where: { clinicId, entityType: 'INSURANCE', status: 'LINKED', externalId: { not: null } },
+                });
+                insuranceProviderIds = linkedInsuranceMappings
+                    .map(m => parseInt(m.externalId!, 10))
+                    .filter(id => !isNaN(id));
+                if (insuranceProviderIds.length > 0) {
+                    this.logger.log(`Doctor ${doctor.name} address ${addrId}: including ${insuranceProviderIds.length} insurance provider(s): ${insuranceProviderIds.join(', ')}`);
+                }
+            }
+
             const allSlots: any[] = [];
             for (const date of dates) {
-                const daySlots = this.buildDaySlots(date, doctor.turnoM, doctor.turnoT, doctor.turnoN, addressServiceIds);
+                const daySlots = this.buildDaySlots(date, doctor.turnoM, doctor.turnoT, doctor.turnoN, addressServiceIds, '-03:00', 30, insuranceProviderIds);
                 allSlots.push(...daySlots);
             }
 
