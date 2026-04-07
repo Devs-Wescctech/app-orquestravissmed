@@ -45,5 +45,5 @@ VISMED_API_PORT = "3000"
 
 [deployment]
 deploymentTarget = "vm"
-run = ["sh", "-c", "cd apps/api && node dist/main.js & cd apps/web && npm run start"]
-build = ["sh", "-c", "cd apps/api && npx tsc && cd ../web && npm run build"]
+run = ["sh", "-c", "cd /home/runner/workspace/apps/api && node dist/main.js & cd /home/runner/workspace/apps/web && npm run start"]
+build = ["sh", "-c", "cd /home/runner/workspace/apps/api && npx tsc && cd /home/runner/workspace/apps/web && npm run build"]
