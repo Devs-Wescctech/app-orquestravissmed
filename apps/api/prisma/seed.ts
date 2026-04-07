@@ -70,6 +70,7 @@ async function main() {
                 clinicId: clinic1.id,
                 domain: 'doctoralia.com.br',
                 provider: 'doctoralia',
+                facilityId: '140548',
                 clientId: '17482_62csipuh254w84c4s4ck488o4scgs0gwcgccw4448cc8kwk8ck',
                 clientSecret: '4zdl23s0i1wkwoococ0ksk44oosk884k0ooks8gk4owso8gkw4',
                 status: 'connected',
@@ -77,6 +78,12 @@ async function main() {
             }
         });
         console.log('Doctoralia integration configured for Clinic 1.');
+    } else if (!integration.facilityId) {
+        await prisma.integrationConnection.update({
+            where: { id: integration.id },
+            data: { facilityId: '140548' }
+        });
+        console.log('Updated Clinic 1 Doctoralia integration with facilityId=140548.');
     }
 
     console.log('Seed complete!');

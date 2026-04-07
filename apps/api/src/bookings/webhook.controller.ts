@@ -1,4 +1,5 @@
-import { Controller, Post, Body, Get, Query, UseGuards, Req, Logger, ForbiddenException, Delete, Param } from '@nestjs/common';
+import { Controller, Post, Body, Get, Query, UseGuards, Req, Logger, ForbiddenException, Delete, Param, Res, HttpStatus } from '@nestjs/common';
+import type { Response } from 'express';
 import { BookingSyncService } from './booking-sync.service';
 import { QueueService } from './queue.service';
 import { RateLimiterService } from './rate-limiter.service';
@@ -12,10 +13,16 @@ export class WebhookController {
     constructor(private readonly bookingSyncService: BookingSyncService) {}
 
     @Post('doctoralia')
-    async handleDoctoraliaWebhook(@Body() body: any) {
+    async handleDoctoraliaWebhook(@Body() body: any, @Res() res: Response) {
         this.logger.log(`[WEBHOOK] Received: ${body?.name || 'unknown'}`);
         const result = await this.bookingSyncService.processWebhookNotification(body);
-        return { ok: true, ...result };
+
+        if (result.ok === false) {
+            this.logger.warn(`[WEBHOOK] Returning 500 — VisMed booking failed: ${result.reason}`);
+            return res.status(HttpStatus.INTERNAL_SERVER_ERROR).json(result);
+        }
+
+        return res.status(HttpStatus.OK).json({ ok: true, ...result });
     }
 }
 

@@ -141,7 +141,7 @@ export default function ClinicsManagement() {
             for (const integration of integrations) {
                 // For VisMed, if domain is provided but clientId is not explicit, we might need a better check
                 // but usually both are provided.
-                if (integration.clientId || integration.domain) {
+                if (integration.clientId || integration.domain || integration.facilityId) {
                     await api.put(`/clinics/${clinicId}`, { integrationArgs: integration });
                 }
             }
@@ -445,7 +445,15 @@ export default function ClinicsManagement() {
                                                 </button>
                                             </div>
 
-                                            <div className="grid grid-cols-1 sm:grid-cols-3 gap-6 pt-4 border-t border-slate-100">
+                                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-6 pt-4 border-t border-slate-100">
+                                                <div className="space-y-2">
+                                                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-[2px]">Facility ID</label>
+                                                    <input type="text" name="doctoralia_facilityId" key={selectedClinic.id + '-doc-facility'} defaultValue={selectedClinic.integrations?.find((i: any) => i.provider === 'doctoralia')?.facilityId || ''} placeholder="Ex: 140548" className="w-full h-12 rounded-xl border-2 border-slate-100 bg-white px-4 text-xs font-bold focus:border-primary outline-none transition-all" />
+                                                </div>
+                                                <div className="space-y-2">
+                                                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-[2px]">Domínio</label>
+                                                    <input type="text" name="doctoralia_domain" key={selectedClinic.id + '-doc-domain'} defaultValue={selectedClinic.integrations?.find((i: any) => i.provider === 'doctoralia')?.domain || 'doctoralia.com.br'} className="w-full h-12 rounded-xl border-2 border-slate-100 bg-white px-4 text-xs font-bold focus:border-primary outline-none transition-all" />
+                                                </div>
                                                 <div className="space-y-2">
                                                     <label className="text-[10px] font-black text-slate-400 uppercase tracking-[2px]">Client ID</label>
                                                     <input type="text" name="doctoralia_clientId" key={selectedClinic.id + '-doc-client'} defaultValue={selectedClinic.integrations?.find((i: any) => i.provider === 'doctoralia')?.clientId || ''} className="w-full h-12 rounded-xl border-2 border-slate-100 bg-white px-4 text-xs font-bold focus:border-primary outline-none transition-all" />
@@ -453,10 +461,6 @@ export default function ClinicsManagement() {
                                                 <div className="space-y-2">
                                                     <label className="text-[10px] font-black text-slate-400 uppercase tracking-[2px]">Client Secret</label>
                                                     <input type="password" name="doctoralia_clientSecret" key={selectedClinic.id + '-doc-secret'} defaultValue={selectedClinic.integrations?.find((i: any) => i.provider === 'doctoralia')?.clientSecret || ''} className="w-full h-12 rounded-xl border-2 border-slate-100 bg-white px-4 text-xs font-bold focus:border-primary outline-none transition-all" />
-                                                </div>
-                                                <div className="space-y-2">
-                                                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-[2px]">Domínio</label>
-                                                    <input type="text" name="doctoralia_domain" key={selectedClinic.id + '-doc-domain'} defaultValue={selectedClinic.integrations?.find((i: any) => i.provider === 'doctoralia')?.domain || 'doctoralia.com.br'} className="w-full h-12 rounded-xl border-2 border-slate-100 bg-white px-4 text-xs font-bold focus:border-primary outline-none transition-all" />
                                                 </div>
                                             </div>
                                         </div>

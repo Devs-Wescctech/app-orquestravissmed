@@ -72,8 +72,9 @@ model IntegrationConnection {
   clinicId     String
   provider     String   @default("doctoralia")
   domain       String?
+  facilityId   String?
   clientId     String?
-  clientSecret String? // SHOULD BE ENCRYPTED OR IN SECRET MANAGER, but for this MVP will be here
+  clientSecret String?
   status       String   @default("disconnected") // connected, disconnected, error
   lastTestAt   DateTime?
   createdAt    DateTime @default(now())

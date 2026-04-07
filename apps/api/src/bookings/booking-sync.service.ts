@@ -175,28 +175,41 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             return { processed: false, reason: 'no_facility_id' };
         }
 
-        const allConns = await this.prisma.integrationConnection.findMany({
-            where: { provider: 'doctoralia', status: 'connected' },
-        });
-
         const facilityIdStr = String(facilityData.id);
-        const conn = allConns.find(c => c.clientId === facilityIdStr);
+
+        const conn = await this.prisma.integrationConnection.findFirst({
+            where: { provider: 'doctoralia', status: 'connected', facilityId: facilityIdStr },
+        });
 
         if (!conn) {
             this.logger.warn(`[WEBHOOK] No Doctoralia connection found for facilityId=${facilityIdStr}`);
             return { processed: false, reason: 'no_matching_connection' };
         }
 
+        this.logger.log(`[WEBHOOK] Matched facilityId=${facilityIdStr} to clinic ${conn.clinicId}`);
+
         if (['slot-booked', 'booking-canceled', 'booking-moved'].includes(notifName)) {
-            const bookingId = body?.data?.visit_booking?.id;
-            const dedupKey = bookingId ? `${conn.clinicId}:${notifName}:${bookingId}` : undefined;
+            try {
+                let result: any;
+                if (notifName === 'slot-booked') {
+                    result = await this.handleSlotBooked(conn.clinicId, body.data, body);
+                } else if (notifName === 'booking-canceled') {
+                    result = await this.handleBookingCanceled(conn.clinicId, body.data, body);
+                } else if (notifName === 'booking-moved') {
+                    result = await this.handleBookingMoved(conn.clinicId, body.data, body);
+                }
 
-            await this.queueService.enqueue(conn.clinicId, notifName, {
-                data: body.data,
-                raw: body,
-            }, { priority: notifName === 'booking-canceled' ? 2 : 1, dedupKey });
+                this.logger.log(`[WEBHOOK] Processed ${notifName} synchronously: ${JSON.stringify(result)}`);
 
-            return { processed: true, action: 'enqueued', type: notifName };
+                if (notifName === 'slot-booked' && result && !result.vismedCreated && result.action !== 'skipped_integration_booking') {
+                    return { ok: false, processed: true, vismedCreated: false, reason: 'vismed_booking_failed' };
+                }
+
+                return { ok: true, processed: true, ...result };
+            } catch (err: any) {
+                this.logger.error(`[WEBHOOK] Error processing ${notifName} synchronously: ${err.message}`);
+                return { ok: false, processed: false, reason: err.message };
+            }
         }
 
         return { processed: false, reason: `unsupported_type:${notifName}` };
