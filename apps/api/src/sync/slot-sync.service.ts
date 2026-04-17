@@ -53,10 +53,10 @@ export class SlotSyncService {
                     address_service_id: String(id),
                     duration: slotDurationMinutes,
                 })),
-                insurance_accepted: insuranceProviderIds.length > 0 ? 'with-and-without-insurance' : 'without-insurance',
             };
 
             if (insuranceProviderIds.length > 0) {
+                slot.insurance_accepted = 'with-and-without-insurance';
                 slot.insurance_providers = insuranceProviderIds;
             }
 
