@@ -227,6 +227,21 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             where: { vismedId: Number(idProf) },
         });
 
+        // Resolve linked Doctoralia doctor so the appointment shows up when
+        // the dashboard filters by doctoraliaDoctorId.
+        let doctoraliaDoctorId: string | null = null;
+        let doctoraliaFacilityId: string | null = null;
+        if (doctor?.id) {
+            const link = await this.prisma.professionalUnifiedMapping.findFirst({
+                where: { vismedDoctorId: doctor.id, isActive: true },
+                include: { doctoraliaDoctor: true },
+            });
+            if (link?.doctoraliaDoctor) {
+                doctoraliaDoctorId = link.doctoraliaDoctor.doctoraliaDoctorId;
+                doctoraliaFacilityId = link.doctoraliaDoctor.doctoraliaFacilityId;
+            }
+        }
+
         const startAt = new Date(`${dataAg}T${horaIni}:00-03:00`);
         const endAt = horaFim
             ? new Date(`${dataAg}T${horaFim}:00-03:00`)
@@ -295,6 +310,8 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 clinicId,
                 vismedAppointmentId,
                 vismedDoctorId: doctor?.id || null,
+                doctoraliaDoctorId,
+                doctoraliaFacilityId,
                 origin: 'VISMED',
                 status,
                 patientName: String(patientName).slice(0, 200),
@@ -308,6 +325,8 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             update: {
                 status,
                 vismedDoctorId: doctor?.id || null,
+                doctoraliaDoctorId,
+                doctoraliaFacilityId,
                 startAt,
                 endAt,
                 duration: durationMin,
