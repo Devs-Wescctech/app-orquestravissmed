@@ -5,9 +5,9 @@ import { VismedService } from '../integrations/vismed/vismed.service';
 import { QueueService } from './queue.service';
 import { RateLimiterService } from './rate-limiter.service';
 
-const POLL_BASE_INTERVAL_MS = 3 * 60 * 1000;
-const STAGGER_PER_CLINIC_MS = 6000;
-const STARTUP_DELAY_MS = 15_000;
+const POLL_BASE_INTERVAL_MS = 30 * 1000;
+const STAGGER_PER_CLINIC_MS = 2000;
+const STARTUP_DELAY_MS = 5_000;
 
 @Injectable()
 export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
