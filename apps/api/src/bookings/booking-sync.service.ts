@@ -117,8 +117,209 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             if (connections.length === 0 && this.polledClinicIds.size === 0) {
                 this.logger.debug('No active Doctoralia connections found');
             }
+
+            // VisMed appointments polling (independent from Doctoralia)
+            const vismedConns = await this.prisma.integrationConnection.findMany({
+                where: { provider: 'vismed', status: 'connected' },
+            });
+
+            for (const vConn of vismedConns) {
+                if (this.polledVismedClinicIds.has(vConn.clinicId)) continue;
+
+                const index = this.polledVismedClinicIds.size;
+                const stagger = 3000 + index * STAGGER_PER_CLINIC_MS;
+                const interval = POLL_BASE_INTERVAL_MS + (index * 2000);
+
+                setTimeout(() => {
+                    if (this.isShuttingDown) return;
+                    this.pollVismedClinic(vConn);
+
+                    const timer = setInterval(() => {
+                        if (!this.isShuttingDown) this.pollVismedClinic(vConn);
+                    }, interval);
+                    this.clinicTimers.push(timer);
+                }, stagger);
+
+                this.polledVismedClinicIds.add(vConn.clinicId);
+                this.logger.log(`[VISMED-POLL] Added polling for clinic ${vConn.clinicId} (stagger=${stagger}ms, interval=${interval}ms)`);
+            }
         } catch (err: any) {
             this.logger.error(`Failed to refresh polling schedule: ${err.message}`);
+        }
+    }
+
+    private polledVismedClinicIds = new Set<string>();
+
+    async pollVismedClinic(conn: any) {
+        if (!conn.clientId) return;
+
+        try {
+            const idEmpresaGestora = Number(conn.clientId);
+            if (!idEmpresaGestora) {
+                this.logger.warn(`[VISMED-POLL] Invalid idEmpresaGestora for clinic ${conn.clinicId}`);
+                return;
+            }
+
+            const baseUrl = conn.domain || undefined;
+            const units = await this.prisma.vismedUnit.findMany({ where: { isActive: true } });
+            if (units.length === 0) {
+                this.logger.debug(`[VISMED-POLL] No active VismedUnit for clinic ${conn.clinicId}`);
+                return;
+            }
+
+            // Janela: hoje -7d até hoje +60d (formato DD/MM/YYYY exigido pela VisMed)
+            const today = new Date();
+            const start = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
+            const end = new Date(today.getTime() + 60 * 24 * 60 * 60 * 1000);
+            const fmt = (d: Date) => {
+                const dd = String(d.getDate()).padStart(2, '0');
+                const mm = String(d.getMonth() + 1).padStart(2, '0');
+                return `${dd}/${mm}/${d.getFullYear()}`;
+            };
+            const dataini = fmt(start);
+            const datafim = fmt(end);
+
+            let totalUpserts = 0;
+            for (const u of units) {
+                try {
+                    const agendamentos = await this.vismedService.getAgendamentos(
+                        u.vismedId,
+                        baseUrl,
+                        { dataini, datafim },
+                    );
+
+                    if (!Array.isArray(agendamentos)) continue;
+
+                    for (const a of agendamentos) {
+                        try {
+                            const upserted = await this.upsertVismedAppointment(conn.clinicId, a);
+                            if (upserted) totalUpserts++;
+                        } catch (innerErr: any) {
+                            this.logger.debug(`[VISMED-POLL] Skipping appointment: ${innerErr.message}`);
+                        }
+                    }
+                } catch (uErr: any) {
+                    this.logger.warn(`[VISMED-POLL] Unit ${u.vismedId} fetch failed: ${uErr.message}`);
+                }
+            }
+
+            this.logger.log(`[VISMED-POLL] Clinic ${conn.clinicId}: processed ${totalUpserts} VisMed appointments`);
+        } catch (err: any) {
+            this.logger.warn(`[VISMED-POLL] Error polling clinic ${conn.clinicId}: ${err.message}`);
+        }
+    }
+
+    private async upsertVismedAppointment(clinicId: string, a: any): Promise<boolean> {
+        const vismedAppointmentId = a?.idpacienteagendamento ? String(a.idpacienteagendamento) : null;
+        const dataAg = a?.dataagendamento;
+        const horaIni = a?.horarioagendamento;
+        const horaFim = a?.horarioagendamentofinal;
+        const idProf = a?.idprofissional;
+
+        if (!vismedAppointmentId || !dataAg || !horaIni || !idProf) return false;
+
+        const doctor = await this.prisma.vismedDoctor.findUnique({
+            where: { vismedId: Number(idProf) },
+        });
+
+        const startAt = new Date(`${dataAg}T${horaIni}:00-03:00`);
+        const endAt = horaFim
+            ? new Date(`${dataAg}T${horaFim}:00-03:00`)
+            : new Date(startAt.getTime() + 30 * 60 * 1000);
+
+        const cancelado = a?.cancelado === '1' || a?.cancelado === 1 || a?.cancelado === true;
+        const noShow = a?.naocompareceu === '1' || a?.naocompareceu === 1 || a?.naocompareceu === true;
+        const confirmado = a?.confirmado === '1' || a?.confirmado === 1 || a?.confirmado === true;
+
+        let status: 'BOOKED' | 'CANCELLED' | 'CONFIRMED' | 'NO_SHOW' = 'BOOKED';
+        if (cancelado) status = 'CANCELLED';
+        else if (noShow) status = 'NO_SHOW';
+        else if (confirmado) status = 'CONFIRMED';
+
+        const patientName = a?.nomepaciente || a?.nome || `Paciente VisMed #${a?.idpaciente ?? ''}`.trim();
+        const patientPhone = a?.telefonepaciente || a?.celularpaciente || a?.telefone1 || null;
+
+        const durationMin = Math.max(
+            5,
+            Math.round((endAt.getTime() - startAt.getTime()) / 60000),
+        );
+
+        // Reconcile with records previously created by the integration flow
+        // (bookOnDoctoraliaFromVismed creates origin=VISMED rows without vismedAppointmentId).
+        // Match by clinic + doctor + startAt window to attach the VisMed id instead of duplicating.
+        const existingByVismedId = await this.prisma.bookingSync.findUnique({
+            where: { clinicId_vismedAppointmentId: { clinicId, vismedAppointmentId } },
+        });
+
+        if (!existingByVismedId && doctor?.id) {
+            const windowMs = 60 * 1000;
+            const orphan = await this.prisma.bookingSync.findFirst({
+                where: {
+                    clinicId,
+                    vismedDoctorId: doctor.id,
+                    origin: 'VISMED',
+                    vismedAppointmentId: null,
+                    startAt: {
+                        gte: new Date(startAt.getTime() - windowMs),
+                        lte: new Date(startAt.getTime() + windowMs),
+                    },
+                },
+                orderBy: { createdAt: 'desc' },
+            });
+
+            if (orphan) {
+                await this.prisma.bookingSync.update({
+                    where: { id: orphan.id },
+                    data: {
+                        vismedAppointmentId,
+                        status,
+                        startAt,
+                        endAt,
+                        duration: durationMin,
+                        rawPayload: a,
+                        processedAt: new Date(),
+                    },
+                });
+                return true;
+            }
+        }
+
+        await this.prisma.bookingSync.upsert({
+            where: { clinicId_vismedAppointmentId: { clinicId, vismedAppointmentId } },
+            create: {
+                clinicId,
+                vismedAppointmentId,
+                vismedDoctorId: doctor?.id || null,
+                origin: 'VISMED',
+                status,
+                patientName: String(patientName).slice(0, 200),
+                patientPhone: patientPhone ? String(patientPhone) : null,
+                startAt,
+                endAt,
+                duration: durationMin,
+                rawPayload: a,
+                processedAt: new Date(),
+            },
+            update: {
+                status,
+                vismedDoctorId: doctor?.id || null,
+                startAt,
+                endAt,
+                duration: durationMin,
+                rawPayload: a,
+                processedAt: new Date(),
+            },
+        });
+
+        return true;
+    }
+
+    async pollAllVismedClinics() {
+        const conns = await this.prisma.integrationConnection.findMany({
+            where: { provider: 'vismed', status: 'connected' },
+        });
+        for (const c of conns) {
+            await this.pollVismedClinic(c);
         }
     }
 

@@ -433,6 +433,7 @@ model BookingSync {
   vismedDoctorId        String?
   doctoraliaDoctorId    String?
   doctoraliaBookingId   String?           @unique
+  vismedAppointmentId   String?
   doctoraliaFacilityId  String?
   doctoraliaAddressId   String?
   origin                BookingOrigin
@@ -459,10 +460,12 @@ model BookingSync {
   createdAt             DateTime          @default(now())
   updatedAt             DateTime          @updatedAt
 
+  @@unique([clinicId, vismedAppointmentId])
   @@index([clinicId])
   @@index([doctoraliaBookingId])
   @@index([startAt])
   @@index([clinicId, doctoraliaDoctorId, startAt])
+  @@index([clinicId, vismedDoctorId, startAt])
 }
 
 enum SyncJobStatus {

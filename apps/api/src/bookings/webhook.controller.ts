@@ -74,6 +74,17 @@ export class BookingSyncController {
         return this.bookingSyncService.getSyncStats(clinicId);
     }
 
+    @Post('poll-vismed')
+    async pollVismed(@Req() req: any, @Query('clinicId') clinicId: string) {
+        this.validateClinicAccess(req.user, clinicId);
+        const conn = await this.prisma.integrationConnection.findFirst({
+            where: { clinicId, provider: 'vismed', status: 'connected' },
+        });
+        if (!conn) return { ok: false, reason: 'Sem integração VisMed conectada' };
+        await this.bookingSyncService.pollVismedClinic(conn);
+        return { ok: true };
+    }
+
     @Get('health')
     async getHealth(@Req() req: any) {
         const [queueMetrics, rateLimiterStats] = await Promise.all([
