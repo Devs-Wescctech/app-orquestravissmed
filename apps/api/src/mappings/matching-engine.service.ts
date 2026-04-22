@@ -18,6 +18,20 @@ export class MatchingEngineService {
             .trim();
     }
 
+    async onApplicationBootstrap(): Promise<void> {
+        try {
+            const result = await this.prisma.specialtyServiceMapping.updateMany({
+                where: { confidenceScore: { lt: 0.90 }, requiresReview: false, isActive: true },
+                data: { requiresReview: true },
+            });
+            if (result.count > 0) {
+                this.logger.log(`[BOOT] Reclassified ${result.count} specialty mappings (score < 90%) as requiring manual review`);
+            }
+        } catch (e: any) {
+            this.logger.warn(`[BOOT] Failed to reclassify specialty mappings: ${e.message}`);
+        }
+    }
+
     async runMatchingForSpecialty(vismedSpecialtyId: string): Promise<boolean> {
         const specialty = await this.prisma.vismedSpecialty.findUnique({
             where: { id: vismedSpecialtyId }

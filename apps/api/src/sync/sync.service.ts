@@ -447,21 +447,26 @@ export class SyncService {
                 await this.logEvent(syncRunId, 'SERVICE_CATALOG', 'fetch_success', `Dicionário global: ${dictItems.length} serviços encontrados.`);
 
                 let savedSvcCount = 0;
-                for (const item of dictItems) {
-                    const svcId = String(item.id);
-                    const svcName = item.name || `Service #${svcId}`;
-                    try {
+                const BATCH = 200;
+                for (let i = 0; i < dictItems.length; i += BATCH) {
+                    const slice = dictItems.slice(i, i + BATCH);
+                    const ops = slice.map((item: any) => {
+                        const svcId = String(item.id);
+                        const svcName = item.name || `Service #${svcId}`;
                         const normName = svcName.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
-                        await this.prisma.doctoraliaService.upsert({
+                        return this.prisma.doctoraliaService.upsert({
                             where: { doctoraliaServiceId: svcId },
                             update: { name: svcName, normalizedName: normName },
-                            create: { doctoraliaServiceId: svcId, name: svcName, normalizedName: normName }
+                            create: { doctoraliaServiceId: svcId, name: svcName, normalizedName: normName },
                         });
-                        savedSvcCount++;
-                    } catch (itemErr: any) {
-                        this.logger.debug(`Falha ao salvar serviço ${svcId}: ${itemErr?.message}`);
+                    });
+                    try {
+                        await this.prisma.$transaction(ops);
+                        savedSvcCount += slice.length;
+                    } catch (batchErr: any) {
+                        this.logger.debug(`Falha em batch de ${slice.length} serviços: ${batchErr?.message}`);
                     }
-                    if (savedSvcCount % 500 === 0) {
+                    if (savedSvcCount % 1000 === 0 || savedSvcCount === dictItems.length) {
                         this.logger.log(`Dicionário de Serviços: ${savedSvcCount}/${dictItems.length} salvos...`);
                     }
                 }
