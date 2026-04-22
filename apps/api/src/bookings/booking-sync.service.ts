@@ -381,8 +381,13 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         );
 
         const isActive = rec.status === 'BOOKED' || rec.status === 'CONFIRMED';
-        const since = rec.startAt.toISOString();
-        const till = rec.endAt.toISOString();
+        // Doctoralia rejects ISO with `Z` and milliseconds. Format as YYYY-MM-DDTHH:mm:ss-03:00 (Brasília).
+        const formatBrt = (d: Date): string => {
+            const { dateStr, timeStr } = this.extractBrtDateTime(d);
+            return `${dateStr}T${timeStr}:00-03:00`;
+        };
+        const since = formatBrt(rec.startAt);
+        const till = formatBrt(rec.endAt);
 
         const isNotFound = (err: any) => /\b404\b/.test(String(err?.message || err));
         const isConflict = (err: any) => /\b409\b/.test(String(err?.message || err));
