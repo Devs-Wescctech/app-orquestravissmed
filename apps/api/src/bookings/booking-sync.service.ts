@@ -288,7 +288,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             });
 
             if (orphan) {
-                await this.prisma.bookingSync.update({
+                const updated = await this.prisma.bookingSync.update({
                     where: { id: orphan.id },
                     data: {
                         vismedAppointmentId,
@@ -300,11 +300,14 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                         processedAt: new Date(),
                     },
                 });
+                await this.syncDoctoraliaBreak(updated.id).catch((err) =>
+                    this.logger.warn(`[VISMED-POLL] break sync failed (orphan): ${err.message}`),
+                );
                 return true;
             }
         }
 
-        await this.prisma.bookingSync.upsert({
+        const upserted = await this.prisma.bookingSync.upsert({
             where: { clinicId_vismedAppointmentId: { clinicId, vismedAppointmentId } },
             create: {
                 clinicId,
@@ -335,7 +338,138 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             },
         });
 
+        await this.syncDoctoraliaBreak(upserted.id).catch((err) =>
+            this.logger.warn(`[VISMED-POLL] break sync failed: ${err.message}`),
+        );
+
         return true;
+    }
+
+    /**
+     * Reflects a VisMed appointment as a Doctoralia calendar_break so the slot
+     * disappears from Doctoralia. Active appointment -> POST/PATCH break.
+     * Cancelled / no-show -> DELETE break.
+     */
+    private async syncDoctoraliaBreak(bookingSyncId: string): Promise<void> {
+        const rec = await this.prisma.bookingSync.findUnique({ where: { id: bookingSyncId } });
+        if (!rec || rec.origin !== 'VISMED' || !rec.vismedDoctorId) return;
+
+        const mapping = await this.prisma.mapping.findFirst({
+            where: {
+                clinicId: rec.clinicId,
+                entityType: 'DOCTOR',
+                vismedId: rec.vismedDoctorId,
+                status: 'LINKED',
+            },
+        });
+        if (!mapping || !mapping.externalId) return;
+
+        const cd: any = mapping.conflictData || {};
+        const facilityId = cd.facilityId;
+        const addressId = cd.address?.id ? String(cd.address.id) : null;
+        if (!facilityId || !addressId) return;
+
+        const conn = await this.prisma.integrationConnection.findFirst({
+            where: { clinicId: rec.clinicId, provider: 'doctoralia' },
+        });
+        if (!conn || !conn.clientId) return;
+
+        const client = this.docplannerService.createClient(
+            conn.domain || 'doctoralia.com.br',
+            conn.clientId,
+            conn.clientSecret || '',
+        );
+
+        const isActive = rec.status === 'BOOKED' || rec.status === 'CONFIRMED';
+        const since = rec.startAt.toISOString();
+        const till = rec.endAt.toISOString();
+
+        const isNotFound = (err: any) => /\b404\b/.test(String(err?.message || err));
+        const isConflict = (err: any) => /\b409\b/.test(String(err?.message || err));
+
+        // Look up the remote break that matches our since/till and persist its id.
+        // Used to recover from 409 (duplicate) or 404 (stale local id).
+        const findRemoteBreakId = async (): Promise<string | null> => {
+            try {
+                await this.rateLimiter.acquire('doctoralia');
+                const list = await client.getCalendarBreaks(facilityId, mapping.externalId!, addressId, since);
+                const items: any[] = Array.isArray(list) ? list : list?._items || [list].filter(Boolean);
+                const target = new Date(since).getTime();
+                const match = items.find((b) => b?.since && Math.abs(new Date(b.since).getTime() - target) < 60_000);
+                return match?.id ? String(match.id) : null;
+            } catch {
+                return null;
+            }
+        };
+
+        if (!isActive) {
+            if (!rec.doctoraliaBreakId) return;
+            try {
+                await this.rateLimiter.acquire('doctoralia');
+                await client.deleteCalendarBreak(facilityId, mapping.externalId, addressId, rec.doctoraliaBreakId);
+                this.logger.log(`[VISMED-POLL] Deleted Doctoralia break ${rec.doctoraliaBreakId} (status=${rec.status})`);
+            } catch (err: any) {
+                if (!isNotFound(err)) throw err;
+                this.logger.debug(`[VISMED-POLL] Break ${rec.doctoraliaBreakId} already gone (404), clearing local id`);
+            }
+            await this.prisma.bookingSync.update({
+                where: { id: rec.id },
+                data: { doctoraliaBreakId: null, doctoraliaFacilityId: facilityId, doctoraliaAddressId: addressId },
+            });
+            return;
+        }
+
+        // Active appointment: ensure break exists and matches start/end
+        if (rec.doctoraliaBreakId) {
+            try {
+                await this.rateLimiter.acquire('doctoralia');
+                await client.moveCalendarBreak(facilityId, mapping.externalId, addressId, rec.doctoraliaBreakId, { since, till });
+                this.logger.log(`[VISMED-POLL] Moved Doctoralia break ${rec.doctoraliaBreakId}`);
+                return;
+            } catch (err: any) {
+                if (!isNotFound(err)) throw err;
+                this.logger.warn(`[VISMED-POLL] Break ${rec.doctoraliaBreakId} not found on move, will recreate`);
+                await this.prisma.bookingSync.update({
+                    where: { id: rec.id },
+                    data: { doctoraliaBreakId: null },
+                });
+            }
+        }
+
+        try {
+            await this.rateLimiter.acquire('doctoralia');
+            const created = await client.addCalendarBreak(facilityId, mapping.externalId, addressId, { since, till });
+            const breakId = created?.id ? String(created.id) : null;
+            if (breakId) {
+                await this.prisma.bookingSync.update({
+                    where: { id: rec.id },
+                    data: {
+                        doctoraliaBreakId: breakId,
+                        doctoraliaFacilityId: facilityId,
+                        doctoraliaAddressId: addressId,
+                    },
+                });
+                this.logger.log(`[VISMED-POLL] Created Doctoralia break ${breakId} for booking ${rec.id}`);
+            }
+        } catch (err: any) {
+            if (!isConflict(err)) throw err;
+            // 409 = a break already covers this slot. Find it and adopt its id so
+            // future polls can move/delete it.
+            const existingId = await findRemoteBreakId();
+            if (existingId) {
+                await this.prisma.bookingSync.update({
+                    where: { id: rec.id },
+                    data: {
+                        doctoraliaBreakId: existingId,
+                        doctoraliaFacilityId: facilityId,
+                        doctoraliaAddressId: addressId,
+                    },
+                });
+                this.logger.log(`[VISMED-POLL] Adopted existing Doctoralia break ${existingId} for booking ${rec.id} (409)`);
+            } else {
+                this.logger.warn(`[VISMED-POLL] Got 409 creating break for booking ${rec.id} but could not locate existing one`);
+            }
+        }
     }
 
     async pollAllVismedClinics() {

@@ -436,6 +436,7 @@ model BookingSync {
   vismedAppointmentId   String?
   doctoraliaFacilityId  String?
   doctoraliaAddressId   String?
+  doctoraliaBreakId     String?
   origin                BookingOrigin
   status                BookingSyncStatus @default(BOOKED)
   patientName           String
