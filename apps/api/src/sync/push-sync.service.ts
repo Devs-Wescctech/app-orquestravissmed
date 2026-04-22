@@ -124,7 +124,7 @@ export class PushSyncService {
             // 5. SLOT SYNC (turnos VisMed → slots Doctoralia) — always runs
             try {
                 if (vDoc.turnoM || vDoc.turnoT || vDoc.turnoN) {
-                    const slotResult = await this.slotSync.syncSlotsForDoctor(vDoc.id, client, syncRunId, 30);
+                    const slotResult = await this.slotSync.syncSlotsForDoctor(vDoc.id, client, syncRunId, 30, clinicId);
                     this.logger.log(`Doctor ${dDoc.name}: [SLOTS] ${slotResult.message}`);
                     if (slotResult.success) {
                         const doctorMapping = await this.prisma.mapping.findFirst({
