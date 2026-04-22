@@ -132,10 +132,15 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
 
                 setTimeout(() => {
                     if (this.isShuttingDown) return;
-                    this.pollVismedClinic(vConn);
+                    this.pollVismedClinic(vConn).catch(err =>
+                        this.logger.warn(`[VISMED-POLL] First run error: ${err?.message || err}`),
+                    );
 
                     const timer = setInterval(() => {
-                        if (!this.isShuttingDown) this.pollVismedClinic(vConn);
+                        if (this.isShuttingDown) return;
+                        this.pollVismedClinic(vConn).catch(err =>
+                            this.logger.warn(`[VISMED-POLL] Periodic error: ${err?.message || err}`),
+                        );
                     }, interval);
                     this.clinicTimers.push(timer);
                 }, stagger);
