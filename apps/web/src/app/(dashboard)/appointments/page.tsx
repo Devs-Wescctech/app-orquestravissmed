@@ -492,14 +492,14 @@ export default function AppointmentsPage() {
                                     <div className="space-y-0.5">
                                         {dayBookings.slice(0, 3).map((b, idx) => {
                                             const isCancelled = b.status === 'CANCELLED';
-                                            const isMoved = b.status === 'MOVED';
-                                            const bothSynced = b.syncedToVismed && b.syncedToDoctoralia;
-                                            const dotColor = isCancelled ? 'bg-red-400' : isMoved ? 'bg-amber-400' : bothSynced ? 'bg-emerald-500' : 'bg-amber-400';
+                                            const isVismed = b.origin === 'VISMED';
+                                            const dotColor = isCancelled ? 'bg-red-400' : isVismed ? 'bg-violet-500' : 'bg-blue-500';
                                             return (
                                                 <button
                                                     key={idx}
                                                     onClick={() => setSelectedBooking(b)}
                                                     className={`w-full text-left flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[9px] font-bold transition-all hover:bg-slate-100 ${isCancelled ? 'line-through opacity-50' : 'text-slate-600'}`}
+                                                    title={isVismed ? 'Origem: VisMed' : 'Origem: Doctoralia'}
                                                 >
                                                     <div className={`h-1.5 w-1.5 rounded-full shrink-0 ${dotColor}`}></div>
                                                     <span className="font-black text-slate-500">{formatTime(b.startAt)}</span>
@@ -508,7 +508,12 @@ export default function AppointmentsPage() {
                                             );
                                         })}
                                         {dayBookings.length > 3 && (
-                                            <span className="text-[8px] font-black text-slate-400 pl-1">+{dayBookings.length - 3} mais</span>
+                                            <button
+                                                onClick={() => { setCurrentDate(new Date(day + 'T00:00:00')); setViewMode('day'); }}
+                                                className="text-[8px] font-black text-primary pl-1 hover:underline"
+                                            >
+                                                +{dayBookings.length - 3} mais
+                                            </button>
                                         )}
                                     </div>
                                 </div>
@@ -537,34 +542,42 @@ export default function AppointmentsPage() {
                                     <div className="min-h-[400px] p-2 space-y-1">
                                         {dayBookings.map((b, idx) => {
                                             const isCancelled = b.status === 'CANCELLED';
-                                            const isMoved = b.status === 'MOVED';
-                                            const bothSynced = b.syncedToVismed && b.syncedToDoctoralia;
+                                            const isVismed = b.origin === 'VISMED';
                                             const bgColor = isCancelled ? 'bg-red-50 border-red-200'
-                                                : isMoved ? 'bg-amber-50 border-amber-200'
-                                                : bothSynced ? 'bg-emerald-50 border-emerald-200'
-                                                : 'bg-amber-50 border-amber-200';
+                                                : isVismed ? 'bg-violet-50 border-violet-200'
+                                                : 'bg-blue-50 border-blue-200';
                                             const textColor = isCancelled ? 'text-red-700'
-                                                : isMoved ? 'text-amber-700'
-                                                : bothSynced ? 'text-emerald-700'
-                                                : 'text-amber-700';
-                                            const dotColor = isCancelled ? 'bg-red-400' : isMoved ? 'bg-amber-400' : bothSynced ? 'bg-emerald-500' : 'bg-amber-400';
+                                                : isVismed ? 'text-violet-700'
+                                                : 'text-blue-700';
+                                            const dotColor = isCancelled ? 'bg-red-400' : isVismed ? 'bg-violet-500' : 'bg-blue-500';
+                                            const originLabel = isVismed ? 'VisMed' : 'Doctoralia';
+                                            const originBadge = isVismed
+                                                ? 'bg-violet-100 text-violet-700 border-violet-200'
+                                                : 'bg-blue-100 text-blue-700 border-blue-200';
                                             return (
                                                 <button
                                                     key={idx}
                                                     onClick={() => setSelectedBooking(b)}
                                                     className={`w-full text-left p-2 rounded-xl border transition-all hover:shadow-md hover:-translate-y-0.5 ${bgColor} ${isCancelled ? 'opacity-50 line-through' : ''}`}
+                                                    title={`Origem: ${originLabel}`}
                                                 >
-                                                    <div className="flex items-center gap-1.5 mb-1">
-                                                        <div className={`h-2 w-2 rounded-full ${dotColor}`}></div>
-                                                        <span className={`text-[10px] font-black ${textColor}`}>{formatTime(b.startAt)}</span>
+                                                    <div className="flex items-center justify-between gap-1.5 mb-1">
+                                                        <div className="flex items-center gap-1.5">
+                                                            <div className={`h-2 w-2 rounded-full ${dotColor}`}></div>
+                                                            <span className={`text-[10px] font-black ${textColor}`}>{formatTime(b.startAt)}</span>
+                                                        </div>
+                                                        <span className={`text-[7px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded border ${originBadge}`}>
+                                                            {originLabel}
+                                                        </span>
                                                     </div>
                                                     <div className={`text-[10px] font-bold truncate ${textColor}`}>
                                                         {b.patientName}{b.patientSurname ? ` ${b.patientSurname}` : ''}
                                                     </div>
-                                                    <div className="flex items-center gap-1 mt-1">
-                                                        <span className={`text-[7px] font-black uppercase tracking-wider px-1 py-0.5 rounded ${b.syncedToVismed ? 'bg-emerald-100 text-emerald-600' : 'bg-slate-100 text-slate-400'}`}>V</span>
-                                                        <span className={`text-[7px] font-black uppercase tracking-wider px-1 py-0.5 rounded ${b.syncedToDoctoralia ? 'bg-blue-100 text-blue-600' : 'bg-slate-100 text-slate-400'}`}>D</span>
-                                                    </div>
+                                                    {isVismed && (
+                                                        <div className="text-[8px] font-bold text-violet-500 mt-0.5">
+                                                            Slot bloqueado na Doctoralia
+                                                        </div>
+                                                    )}
                                                 </button>
                                             );
                                         })}
