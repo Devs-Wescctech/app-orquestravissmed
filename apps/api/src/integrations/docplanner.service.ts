@@ -146,7 +146,7 @@ export class DocplannerClient {
     }
 
     async getInsurancePlans(insuranceProviderId: string): Promise<any> {
-        return this.request('GET', `/api/v3/integration/insurance-providers/${insuranceProviderId}/insurance-plans`);
+        return this.request('GET', `/api/v3/integration/insurance-providers/${insuranceProviderId}/plans`);
     }
 
     async getAddressInsuranceProviders(facilityId: string, doctorId: string, addressId: string): Promise<any> {
