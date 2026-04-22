@@ -99,8 +99,11 @@ export class MatchingEngineService {
         }
 
         if (bestMatch && bestScore >= 0.60) {
-            const needsReview = bestScore < 0.70;
+            const needsReview = bestScore < 0.90;
             await this.createMapping(specialty.id, bestMatch.id, 'APPROXIMATE', bestScore, needsReview);
+            if (needsReview) {
+                this.logger.log(`Match abaixo de 90% (${(bestScore * 100).toFixed(1)}%): "${specialty.name}" → "${bestMatch.name}" — aguardando aprovação manual`);
+            }
             return true;
         }
 
