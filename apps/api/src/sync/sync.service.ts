@@ -493,23 +493,39 @@ export class SyncService {
                 await this.logEvent(syncRunId, 'INSURANCE', 'fetch_success', `Dicionário global: ${insProviders.length} insurance providers encontrados.`);
 
                 let savedCount = 0;
-                for (const ip of insProviders) {
+                const IP_BATCH = 500;
+                const validItems = insProviders.filter((ip: any) => {
                     const ipId = ip.insurance_provider_id || ip.id;
                     const ipName = ip.name || ip.insurance_provider_name;
-                    if (!ipId || !ipName) continue;
-                    try {
+                    return ipId && ipName;
+                });
+                for (let i = 0; i < validItems.length; i += IP_BATCH) {
+                    const slice = validItems.slice(i, i + IP_BATCH);
+                    const values: string[] = [];
+                    const params: any[] = [];
+                    let p = 1;
+                    for (const ip of slice) {
+                        const ipId = Number(ip.insurance_provider_id || ip.id);
+                        const ipName = ip.name || ip.insurance_provider_name;
                         const normName = (ipName || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
-                        await this.prisma.doctoraliaInsuranceProvider.upsert({
-                            where: { doctoraliaId: Number(ipId) },
-                            create: { doctoraliaId: Number(ipId), name: ipName, normalizedName: normName },
-                            update: { name: ipName, normalizedName: normName }
-                        });
-                        savedCount++;
-                    } catch (itemErr: any) {
-                        this.logger.debug(`Falha ao salvar insurance provider ${ipId}: ${itemErr?.message}`);
+                        values.push(`($${p++}::int, $${p++}, $${p++})`);
+                        params.push(ipId, ipName, normName);
                     }
-                    if (savedCount % 100 === 0) {
-                        this.logger.log(`Insurance Providers: ${savedCount}/${insProviders.length} salvos...`);
+                    const sql = `
+                        INSERT INTO "DoctoraliaInsuranceProvider" ("id", "doctoraliaId", "name", "normalizedName", "createdAt", "updatedAt")
+                        SELECT gen_random_uuid(), v.did, v.nm, v.norm, NOW(), NOW()
+                        FROM (VALUES ${values.join(',')}) AS v(did, nm, norm)
+                        ON CONFLICT ("doctoraliaId")
+                        DO UPDATE SET "name" = EXCLUDED."name", "normalizedName" = EXCLUDED."normalizedName", "updatedAt" = NOW()
+                    `;
+                    try {
+                        await this.prisma.$executeRawUnsafe(sql, ...params);
+                        savedCount += slice.length;
+                    } catch (batchErr: any) {
+                        this.logger.warn(`Falha em batch de ${slice.length} insurance providers (offset ${i}): ${batchErr?.message}`);
+                    }
+                    if (savedCount > 0 && (savedCount % 1000 === 0 || (i + IP_BATCH) >= validItems.length)) {
+                        this.logger.log(`Insurance Providers: ${savedCount}/${validItems.length} salvos...`);
                     }
                 }
                 totalProcessed += savedCount;
