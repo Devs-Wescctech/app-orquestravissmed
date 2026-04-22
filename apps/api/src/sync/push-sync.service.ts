@@ -284,11 +284,30 @@ export class PushSyncService {
         const toAdd = [...desiredProviderIds].filter(id => !currentProviderIds.has(id));
         const toRemove = [...currentProviderIds].filter(id => !desiredProviderIds.has(id));
 
+        const defaultPlanCache = new Map<string, string | null>();
+        const resolveDefaultPlanId = async (providerId: string): Promise<string | null> => {
+            if (defaultPlanCache.has(providerId)) return defaultPlanCache.get(providerId)!;
+            try {
+                const plansRes = await client.getInsurancePlans(providerId);
+                const items = plansRes?._items || [];
+                const firstId = items.length > 0 ? String(items[0].insurance_plan_id) : null;
+                defaultPlanCache.set(providerId, firstId);
+                return firstId;
+            } catch (error: any) {
+                this.logger.warn(`Doctor ${doctorName}: [INS] Falha ao listar planos do provider ${providerId}: ${error.message}`);
+                defaultPlanCache.set(providerId, null);
+                return null;
+            }
+        };
+
         for (const providerId of toAdd) {
             try {
-                await client.addAddressInsuranceProvider(facilityId, doctorId, addressId, providerId);
+                const planId = await resolveDefaultPlanId(providerId);
+                const plansArg = planId ? [{ insurance_plan_id: planId }] : undefined;
+                await client.addAddressInsuranceProvider(facilityId, doctorId, addressId, providerId, plansArg);
                 result.added++;
-                this.logger.log(`Doctor ${doctorName}: [INS] Added insurance provider ${providerId} to address ${addressId}`);
+                const planTxt = planId ? ` (plano ${planId})` : ' (sem plano disponível)';
+                this.logger.log(`Doctor ${doctorName}: [INS] Added insurance provider ${providerId} to address ${addressId}${planTxt}`);
             } catch (error: any) {
                 if (error?.status === 400 && error?.message?.includes('already assigned')) {
                     result.unchanged++;
@@ -309,10 +328,35 @@ export class PushSyncService {
             }
         }
 
+        // Garante pelo menos 1 plano para cada provider LINKED já existente (sem planos).
+        // Não sobrescreve seleções manuais já configuradas no Doctoralia.
+        let plansAdded = 0;
+        for (const provider of currentProviders) {
+            const providerId = String(provider.insurance_provider_id || provider.id);
+            if (!desiredProviderIds.has(providerId)) continue;
+
+            const existingPlans = provider.insurance_plans?._items || [];
+            if (existingPlans.length > 0) continue;
+
+            const planId = await resolveDefaultPlanId(providerId);
+            if (!planId) continue;
+
+            try {
+                await client.putAddressInsuranceProvider(
+                    facilityId, doctorId, addressId, providerId,
+                    [{ insurance_plan_id: planId }]
+                );
+                plansAdded++;
+                this.logger.log(`Doctor ${doctorName}: [INS] Plano ${planId} atribuído ao provider ${providerId} (estava sem plano)`);
+            } catch (error: any) {
+                this.logger.warn(`Doctor ${doctorName}: [INS] Falha ao definir plano padrão para provider ${providerId}: ${error.message}`);
+            }
+        }
+
         result.unchanged += [...desiredProviderIds].filter(id => currentProviderIds.has(id)).length;
 
-        if (result.added > 0 || result.removed > 0) {
-            const msg = `Doctor ${doctorName}: Insurance sync - added ${result.added}, removed ${result.removed}, unchanged ${result.unchanged}`;
+        if (result.added > 0 || result.removed > 0 || plansAdded > 0) {
+            const msg = `Doctor ${doctorName}: Insurance sync - added ${result.added}, removed ${result.removed}, plans auto-assigned ${plansAdded}, unchanged ${result.unchanged}`;
             this.logger.log(msg);
             if (syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'synced', msg);
         }
