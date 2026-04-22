@@ -447,26 +447,33 @@ export class SyncService {
                 await this.logEvent(syncRunId, 'SERVICE_CATALOG', 'fetch_success', `Dicionário global: ${dictItems.length} serviços encontrados.`);
 
                 let savedSvcCount = 0;
-                const BATCH = 200;
+                const BATCH = 500;
                 for (let i = 0; i < dictItems.length; i += BATCH) {
                     const slice = dictItems.slice(i, i + BATCH);
-                    const ops = slice.map((item: any) => {
+                    const values: string[] = [];
+                    const params: any[] = [];
+                    let p = 1;
+                    for (const item of slice) {
                         const svcId = String(item.id);
                         const svcName = item.name || `Service #${svcId}`;
                         const normName = svcName.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
-                        return this.prisma.doctoraliaService.upsert({
-                            where: { doctoraliaServiceId: svcId },
-                            update: { name: svcName, normalizedName: normName },
-                            create: { doctoraliaServiceId: svcId, name: svcName, normalizedName: normName },
-                        });
-                    });
+                        values.push(`($${p++}, $${p++}, $${p++}, NOW(), NOW())`);
+                        params.push(svcId, svcName, normName);
+                    }
+                    const sql = `
+                        INSERT INTO "DoctoraliaService" ("id", "doctoraliaServiceId", "name", "normalizedName", "createdAt", "updatedAt")
+                        SELECT gen_random_uuid(), v.sid, v.nm, v.norm, NOW(), NOW()
+                        FROM (VALUES ${values.join(',')}) AS v(sid, nm, norm, c, u)
+                        ON CONFLICT ("doctoraliaServiceId")
+                        DO UPDATE SET "name" = EXCLUDED."name", "normalizedName" = EXCLUDED."normalizedName", "updatedAt" = NOW()
+                    `;
                     try {
-                        await this.prisma.$transaction(ops);
+                        await this.prisma.$executeRawUnsafe(sql, ...params);
                         savedSvcCount += slice.length;
                     } catch (batchErr: any) {
-                        this.logger.debug(`Falha em batch de ${slice.length} serviços: ${batchErr?.message}`);
+                        this.logger.warn(`Falha em batch de ${slice.length} serviços (offset ${i}): ${batchErr?.message}`);
                     }
-                    if (savedSvcCount % 1000 === 0 || savedSvcCount === dictItems.length) {
+                    if (savedSvcCount > 0 && (savedSvcCount % 2000 === 0 || (i + BATCH) >= dictItems.length)) {
                         this.logger.log(`Dicionário de Serviços: ${savedSvcCount}/${dictItems.length} salvos...`);
                     }
                 }
