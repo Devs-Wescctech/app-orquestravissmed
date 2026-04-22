@@ -24,6 +24,24 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         private rateLimiter: RateLimiterService,
     ) {}
 
+    // Extrai data (YYYY-MM-DD) e hora (HH:mm) no fuso de Brasília independente do TZ do servidor.
+    // Brasil não observa horário de verão desde 2019, mas usar IANA garante robustez futura.
+    private extractBrtDateTime(date: Date): { dateStr: string; timeStr: string } {
+        const parts = new Intl.DateTimeFormat('en-CA', {
+            timeZone: 'America/Sao_Paulo',
+            year: 'numeric', month: '2-digit', day: '2-digit',
+            hour: '2-digit', minute: '2-digit', hour12: false,
+        }).formatToParts(date).reduce<Record<string, string>>((acc, p) => {
+            if (p.type !== 'literal') acc[p.type] = p.value;
+            return acc;
+        }, {});
+        const hour = parts.hour === '24' ? '00' : parts.hour;
+        return {
+            dateStr: `${parts.year}-${parts.month}-${parts.day}`,
+            timeStr: `${hour}:${parts.minute}`,
+        };
+    }
+
     onModuleInit() {
         this.registerJobHandlers();
         this.startStaggeredPolling();
@@ -411,11 +429,13 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         }
 
         const startDate = new Date(booking.start_at);
-        const timeStr = startDate.toTimeString().substring(0, 5);
-        const dateStr = startDate.toISOString().split('T')[0];
-
+        const { dateStr, timeStr } = this.extractBrtDateTime(startDate);
         const vismedProfId = vismedDoctor.vismedId;
         const horariosProfissional = `${vismedProfId}-${timeStr}`;
+
+        this.logger.log(
+            `[VISMED-CREATE] booking ${booking.id}: raw start_at=${booking.start_at} → BRT date=${dateStr} time=${timeStr} (horarios_profissional=${horariosProfissional})`
+        );
 
         const patient = booking.patient || {};
         const fullName = `${patient.name || ''} ${patient.surname || ''}`.trim() || 'PACIENTE DOCTORALIA';
@@ -576,9 +596,11 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                     }
 
                     const startDate = new Date(startFormatted);
-                    const timeStr = startDate.toTimeString().substring(0, 5);
-                    const dateStr = startDate.toISOString().split('T')[0];
+                    const { dateStr, timeStr } = this.extractBrtDateTime(startDate);
                     const horariosProfissional = `${vismedDoctor.vismedId}-${timeStr}`;
+                    this.logger.log(
+                        `[VISMED→VISMED] booking ${doctoraliaBookingId}: raw start=${startFormatted} → BRT date=${dateStr} time=${timeStr}`
+                    );
 
                     const vismedPayload = {
                         tipo: 'particular',
