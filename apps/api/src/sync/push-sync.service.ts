@@ -283,6 +283,14 @@ export class PushSyncService {
 
         const currentProviderIds = new Set(currentProviders.map((p: any) => String(p.insurance_provider_id || p.id)));
 
+        // Snapshot inicial: o que a Doctoralia REALMENTE tem para esse endereço (para debug visual)
+        const stateSnapshot = currentProviders.map((p: any) => {
+            const pid = String(p.insurance_provider_id || p.id);
+            const plans = p.insurance_plans?._items || [];
+            return `${pid}(${plans.length} planos)`;
+        }).join(', ') || 'vazio';
+        if (syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'state', `Doctor ${doctorName} addr ${addressId}: desejados=[${[...desiredProviderIds].join(',')}], Doctoralia atual=[${stateSnapshot}]`);
+
         const toAdd = [...desiredProviderIds].filter(id => !currentProviderIds.has(id));
         const toRemove = [...currentProviderIds].filter(id => !desiredProviderIds.has(id));
 
@@ -360,11 +368,9 @@ export class PushSyncService {
 
         result.unchanged += [...desiredProviderIds].filter(id => currentProviderIds.has(id)).length;
 
-        if (result.added > 0 || result.removed > 0 || plansAdded > 0) {
-            const msg = `Doctor ${doctorName}: Insurance sync - added ${result.added}, removed ${result.removed}, plans auto-assigned ${plansAdded}, unchanged ${result.unchanged}`;
-            this.logger.log(msg);
-            if (syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'synced', msg);
-        }
+        const finalMsg = `Doctor ${doctorName} addr ${addressId}: concluído - added=${result.added}, removed=${result.removed}, planos auto-atribuídos=${plansAdded}, unchanged=${result.unchanged}`;
+        this.logger.log(finalMsg);
+        if (syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'completed', finalMsg);
 
         return result;
     }
