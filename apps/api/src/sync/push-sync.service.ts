@@ -265,6 +265,7 @@ export class PushSyncService {
 
         if (linkedInsuranceMappings.length === 0) {
             this.logger.log(`Doctor ${doctorName}: [INS] Nenhum convênio LINKED para sincronizar. Aprove convênios pendentes na tela de Mapeamentos.`);
+            if (syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'skipped', `Doctor ${doctorName} addr ${addressId}: nenhum convênio LINKED na clínica`);
             return result;
         }
 
@@ -276,6 +277,7 @@ export class PushSyncService {
             currentProviders = res._items || [];
         } catch (error: any) {
             this.logger.warn(`Doctor ${doctorName}: failed to fetch current insurance providers for address ${addressId}: ${error.message}`);
+            if (syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'error', `Doctor ${doctorName} addr ${addressId}: falha ao buscar convênios atuais - ${error.message}`);
             return result;
         }
 
@@ -308,12 +310,15 @@ export class PushSyncService {
                 result.added++;
                 const planTxt = planId ? ` (plano ${planId})` : ' (sem plano disponível)';
                 this.logger.log(`Doctor ${doctorName}: [INS] Added insurance provider ${providerId} to address ${addressId}${planTxt}`);
+                if (syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'added', `Doctor ${doctorName} addr ${addressId}: convênio ${providerId} vinculado${planTxt}`);
             } catch (error: any) {
                 if (error?.status === 400 && error?.message?.includes('already assigned')) {
                     result.unchanged++;
                     this.logger.debug(`Doctor ${doctorName}: insurance provider ${providerId} already on address ${addressId}`);
+                    if (syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'unchanged', `Doctor ${doctorName} addr ${addressId}: convênio ${providerId} já vinculado`);
                 } else {
                     this.logger.warn(`Doctor ${doctorName}: [INS FAILED] Failed to add insurance provider ${providerId}: ${error.message}`);
+                    if (syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'error', `Doctor ${doctorName} addr ${addressId}: falha ao vincular convênio ${providerId} - ${error.message}`);
                 }
             }
         }
