@@ -112,6 +112,14 @@ export default function SyncDashboardPage() {
     const formatDate = (dateStr: string) =>
         new Date(dateStr).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' });
 
+    type RunState = 'completed' | 'running' | 'failed';
+    const getRunState = (run: { status: string; endedAt: string | null }): RunState => {
+        if (run.status === 'completed') return 'completed';
+        if (run.status === 'failed') return 'failed';
+        if (!run.endedAt) return 'running';
+        return 'failed';
+    };
+
     const formatDuration = (start: string, end: string | null) => {
         if (!end) return 'Em andamento...';
         const ms = new Date(end).getTime() - new Date(start).getTime();
@@ -466,16 +474,18 @@ export default function SyncDashboardPage() {
                                 <p className="text-[10px] font-black text-slate-300 uppercase tracking-[3px]">Sem atividades registradas</p>
                             </div>
                         ) : (
-                            status?.recentRuns.map((run) => (
+                            status?.recentRuns.map((run) => {
+                                const runState = getRunState(run);
+                                return (
                                 <div key={run.id} className="p-6 px-8 flex items-center justify-between hover:bg-slate-50/50 transition-all cursor-default group/item">
                                     <div className="flex items-center gap-5">
                                         <div className={`h-14 w-14 rounded-2xl flex items-center justify-center shrink-0 border-2 transition-all group-hover/item:scale-105 shadow-lg ${
-                                            run.status === 'completed' ? 'bg-white border-emerald-100 text-primary shadow-emerald-100/20' :
-                                            run.status === 'running' ? 'bg-white border-blue-100 text-blue-500 shadow-blue-100/20' :
+                                            runState === 'completed' ? 'bg-white border-emerald-100 text-primary shadow-emerald-100/20' :
+                                            runState === 'running' ? 'bg-white border-blue-100 text-blue-500 shadow-blue-100/20' :
                                             'bg-white border-rose-100 text-rose-500 shadow-rose-100/20'
                                         }`}>
-                                            {run.status === 'running' ? <Loader2 className="h-6 w-6 animate-spin" /> :
-                                                run.status === 'completed' ? <CheckCircle2 className="h-6 w-6" /> :
+                                            {runState === 'running' ? <Loader2 className="h-6 w-6 animate-spin" /> :
+                                                runState === 'completed' ? <CheckCircle2 className="h-6 w-6" /> :
                                                 <AlertTriangle className="h-6 w-6" />}
                                         </div>
                                         <div>
@@ -491,11 +501,11 @@ export default function SyncDashboardPage() {
                                     <div className="flex items-center gap-4">
                                         <div className="text-right">
                                             <span className={`px-3 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest shadow-sm ${
-                                                run.status === 'completed' ? 'bg-primary text-white' :
-                                                run.status === 'running' ? 'bg-blue-500 text-white' :
+                                                runState === 'completed' ? 'bg-primary text-white' :
+                                                runState === 'running' ? 'bg-blue-500 text-white' :
                                                 'bg-rose-500 text-white'
                                             }`}>
-                                                {run.status === 'completed' ? 'Sucesso' : run.status === 'running' ? 'Processando' : 'Falha'}
+                                                {runState === 'completed' ? 'Sucesso' : runState === 'running' ? 'Processando' : 'Falha'}
                                             </span>
                                             <p className="text-[10px] font-black text-slate-400 mt-2 flex items-center justify-end gap-1.5 uppercase tracking-widest">
                                                 <Clock className="h-3.5 w-3.5 opacity-50" />
@@ -510,7 +520,8 @@ export default function SyncDashboardPage() {
                                         </button>
                                     </div>
                                 </div>
-                            ))
+                                );
+                            })
                         )}
                     </div>
                 )}
