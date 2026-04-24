@@ -41,7 +41,10 @@ export class PushSyncService {
                                 specialty: {
                                     include: {
                                         mappings: {
-                                            where: { isActive: true },
+                                            // Apenas mappings JÁ APROVADOS são empurrados para a Doctoralia.
+                                            // Mappings com requiresReview=true (score 0.60-0.89) ficam de fora
+                                            // até serem confirmados manualmente em /mapping → Especialidades.
+                                            where: { isActive: true, requiresReview: false },
                                             include: { doctoraliaService: true },
                                             take: 1
                                         }
@@ -200,6 +203,23 @@ export class PushSyncService {
             }
         }
 
+        // Log explícito de mappings PENDENTES de aprovação que foram pulados (visibilidade operacional).
+        // Conta diretamente no banco quantas especialidades do médico estão com requiresReview=true.
+        const pendingSpecialtyIds = vismedSpecialties
+            .map(vs => vs.specialty?.id)
+            .filter((id: any) => typeof id === 'string');
+        if (pendingSpecialtyIds.length > 0) {
+            const pendingMappings = await this.prisma.specialtyServiceMapping.findMany({
+                where: { isActive: true, requiresReview: true, vismedSpecialtyId: { in: pendingSpecialtyIds } },
+                include: { vismedSpecialty: { select: { name: true } }, doctoraliaService: { select: { name: true } } },
+            });
+            if (pendingMappings.length > 0) {
+                const desc = pendingMappings.map(m => `"${m.vismedSpecialty?.name}" → "${m.doctoraliaService?.name}" (${Math.round(m.confidenceScore * 100)}%)`).join('; ');
+                this.logger.warn(`Doctor ${doctorName}: [SKIP PENDING] ${pendingMappings.length} mapping(s) aguardando aprovação manual em /mapping → Especialidades: ${desc}`);
+                await this.logEvent(syncRunId, 'SERVICE_PUSH', 'skipped_pending_review', `Doctor ${doctorName}: ${pendingMappings.length} mapping(s) ignorado(s) - aguarda aprovação manual: ${desc}`);
+            }
+        }
+
         this.logger.log(`Doctor ${doctorName}: VisMed expects ${expectedDictIds.size} service(s): [${matchedNames.join(', ')}]. Currently has ${currentServices.length} service(s).`);
 
         // ADD: Expected by VisMed but NOT currently assigned
@@ -234,10 +254,16 @@ export class PushSyncService {
         }
 
         // DELETE: Currently assigned but NOT expected by VisMed
-        // SAFETY: Only delete if ALL expected adds succeeded. If any add failed, keep existing
+        // SAFETY 1: Only delete if ALL expected adds succeeded. If any add failed, keep existing
         // services to avoid leaving the doctor with zero services (which breaks slots).
+        // SAFETY 2: Se VisMed não tem NENHUM mapping aprovado para esse médico (expectedDictIds vazio),
+        // NÃO deletar nada — caso contrário removeríamos todos os serviços atuais do médico em Doctoralia,
+        // quebrando os slots. Cenário típico: todos os mappings da especialidade estão pending review.
         if (failedDictIds.size > 0) {
             this.logger.log(`Doctor ${doctorName}: [SKIP DELETE] ${failedDictIds.size} service add(s) failed, keeping existing services to avoid service gap.`);
+        } else if (expectedDictIds.size === 0) {
+            this.logger.warn(`Doctor ${doctorName}: [SKIP DELETE] VisMed não tem nenhum mapping aprovado — preservando ${currentServices.length} serviço(s) atual(is) em Doctoralia para não quebrar slots. Aprove mappings em /mapping → Especialidades.`);
+            await this.logEvent(syncRunId, 'SERVICE_PUSH', 'skipped_no_approved_mapping', `Doctor ${doctorName}: deleção de ${currentServices.length} serviço(s) bloqueada — nenhum mapping de especialidade aprovado.`);
         } else {
             for (const [dictId, addrSvc] of currentByDictId.entries()) {
                 if (!expectedDictIds.has(dictId)) {

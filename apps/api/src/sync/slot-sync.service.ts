@@ -111,7 +111,10 @@ export class SlotSyncService {
                         specialty: {
                             include: {
                                 mappings: {
-                                    where: { isActive: true },
+                                    // Apenas mappings JÁ APROVADOS produzem slots na Doctoralia.
+                                    // Mappings com requiresReview=true (score 0.60-0.89) ficam de fora
+                                    // até serem confirmados manualmente em /mapping → Especialidades.
+                                    where: { isActive: true, requiresReview: false },
                                     include: { doctoraliaService: true },
                                     take: 1,
                                 }
@@ -447,7 +450,21 @@ export class SlotSyncService {
         }
 
         if (serviceIdsToAdd.length === 0) {
-            this.logger.warn(`Doctor ${doctor.name}: no specialty→service mappings found for auto-provisioning`);
+            // Diferencia: "não tem mapping nenhum" vs "tem mapping mas todos pending review"
+            const specialtyIds = doctorSpecialties.map((ps: any) => ps.specialty?.id).filter((id: any) => typeof id === 'string');
+            const pendingCount = specialtyIds.length > 0
+                ? await this.prisma.specialtyServiceMapping.count({
+                    where: { isActive: true, requiresReview: true, vismedSpecialtyId: { in: specialtyIds } },
+                })
+                : 0;
+            if (pendingCount > 0) {
+                this.logger.warn(`Doctor ${doctor.name}: ${pendingCount} mapping(s) aguardando aprovação manual em /mapping → Especialidades — slot provisioning pulado.`);
+                if (syncRunId) {
+                    await this.logEvent(syncRunId, 'SLOT_SYNC', 'skipped_pending_review', `Doctor ${doctor.name}: ${pendingCount} mapping(s) pending review — slot provisioning pulado.`);
+                }
+            } else {
+                this.logger.warn(`Doctor ${doctor.name}: no specialty→service mappings found for auto-provisioning`);
+            }
             return [];
         }
 
