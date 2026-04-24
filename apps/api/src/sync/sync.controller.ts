@@ -484,6 +484,111 @@ export class SyncController {
         };
     }
 
+    @Post(':clinicId/services/:doctoraliaDoctorId/attach-insurance')
+    @ApiOperation({ summary: 'Anexa convênios LINKED a cada address_service do médico (inspeciona shape e tenta PATCH)' })
+    async attachInsuranceToServices(
+        @Request() req: any,
+        @Param('clinicId') clinicId: string,
+        @Param('doctoraliaDoctorId') doctoraliaDoctorId: string,
+        @Query('dryRun') dryRun?: string,
+    ) {
+        this.validateUserClinicAccess(req.user, clinicId);
+        const dDoc = await this.validateDoctoraliaDoctorBelongsToClinic(doctoraliaDoctorId, clinicId);
+        const client = await this.getDoctoraliaClient(clinicId);
+        await new Promise(r => setTimeout(r, 1000));
+
+        const linkedIns = await this.prisma.mapping.findMany({
+            where: { clinicId, entityType: 'INSURANCE', status: 'LINKED', externalId: { not: null } },
+        });
+        if (linkedIns.length === 0) {
+            return { error: 'Nenhum convênio LINKED para sincronizar. Aprove convênios pendentes na tela de Mapeamentos.' };
+        }
+        const insurancePayload = linkedIns.map(m => ({ insurance_provider_id: String(m.externalId) }));
+        const isDryRun = dryRun === 'true' || dryRun === '1';
+
+        const run = await this.prisma.syncRun.create({
+            data: { clinicId, type: isDryRun ? 'inspect-service-shape' : 'attach-insurance-to-services', status: 'running', startedAt: new Date() }
+        });
+
+        const results: any[] = [];
+        try {
+        const addrsRes = await client.getAddresses(dDoc.doctoraliaFacilityId, doctoraliaDoctorId);
+        const addresses = addrsRes._items || [];
+
+        for (const addr of addresses) {
+            const addrId = String(addr.id);
+            let services: any[] = [];
+            try {
+                const svcRes = await client.getServices(dDoc.doctoraliaFacilityId, doctoraliaDoctorId, addrId);
+                services = svcRes._items || [];
+            } catch (e: any) {
+                results.push({ addressId: addrId, error: e.message });
+                continue;
+            }
+
+            for (const svc of services) {
+                const svcId = String(svc.id);
+
+                await this.prisma.syncEvent.create({
+                    data: {
+                        syncRunId: run.id, entityType: 'SERVICE_INSURANCE', action: 'inspect',
+                        externalId: svcId,
+                        message: `Doctor ${dDoc.name} addr ${addrId} svc ${svcId}: shape cru: ${JSON.stringify(svc).substring(0, 1800)}`
+                    }
+                });
+
+                if (isDryRun) {
+                    results.push({ addressId: addrId, serviceId: svcId, action: 'inspected_only', currentInsuranceProviders: svc.insurance_providers || svc.insurance_provider_id || null });
+                    continue;
+                }
+
+                const patchPayload: any = { insurance_providers: insurancePayload };
+                try {
+                    const result = await client.updateAddressService(
+                        dDoc.doctoraliaFacilityId, doctoraliaDoctorId, addrId, svcId, patchPayload
+                    );
+                    await this.prisma.syncEvent.create({
+                        data: {
+                            syncRunId: run.id, entityType: 'SERVICE_INSURANCE', action: 'patch_success',
+                            externalId: svcId,
+                            message: `Doctor ${dDoc.name} svc ${svcId}: PATCH OK - resposta: ${JSON.stringify(result).substring(0, 400)}`
+                        }
+                    });
+                    results.push({ addressId: addrId, serviceId: svcId, status: 'patched', payload: patchPayload });
+                } catch (e: any) {
+                    await this.prisma.syncEvent.create({
+                        data: {
+                            syncRunId: run.id, entityType: 'SERVICE_INSURANCE', action: 'patch_failed',
+                            externalId: svcId,
+                            message: `Doctor ${dDoc.name} svc ${svcId}: PATCH falhou (status ${e.status}) - ${(e.message || '').substring(0, 500)}`
+                        }
+                    });
+                    results.push({ addressId: addrId, serviceId: svcId, status: 'failed', error: e.message, httpStatus: e.status });
+                }
+            }
+        }
+
+        await this.prisma.syncRun.update({
+            where: { id: run.id },
+            data: { status: 'completed', endedAt: new Date(), totalRecords: results.length }
+        });
+
+        return { runId: run.id, dryRun: isDryRun, doctoraliaDoctorId, insurancePayload, results };
+        } catch (err: any) {
+            await this.prisma.syncRun.update({
+                where: { id: run.id },
+                data: { status: 'failed', endedAt: new Date(), totalRecords: results.length },
+            }).catch(() => {});
+            await this.prisma.syncEvent.create({
+                data: {
+                    syncRunId: run.id, entityType: 'SERVICE_INSURANCE', action: 'fatal_error',
+                    message: `Erro fatal no attach-insurance: ${(err.message || '').substring(0, 800)}`
+                }
+            }).catch(() => {});
+            throw err;
+        }
+    }
+
     @Get(':clinicId/insurance/:doctoraliaDoctorId')
     @ApiOperation({ summary: 'Get current insurance providers for a doctor address' })
     async getInsuranceProviders(
