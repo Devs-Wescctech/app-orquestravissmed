@@ -206,6 +206,12 @@ export class SlotSyncService {
             const addressServiceIds = deduplicatedServices.map((s: any) => Number(s.id));
             this.logger.log(`Doctor ${doctor.name} address ${addrId}: using ${addressServiceIds.length} unique address_service_ids (from ${addressServices.length} total): ${addressServiceIds.join(', ')}`);
 
+            // DEBUG: log detalhado do que a Doctoralia retornou para os serviços do endereço
+            const debugSvcs = deduplicatedServices.map((s: any) =>
+                `id=${s.id} service_id=${s.service_id} name="${s.service_name || s.name || '?'}" duration=${s.duration || s.default_duration || '?'}`
+            ).join(' | ');
+            if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'services_inspection', `Doctor ${doctor.name} addr ${addrId}: Doctoralia retornou ${deduplicatedServices.length} address_service(s): ${debugSvcs}`);
+
             const invalidTurnos: string[] = [];
             for (const t of [doctor.turnoM, doctor.turnoT, doctor.turnoN]) {
                 if (t && t.trim() !== '-' && t.trim() !== '' && !this.parseTurno(t)) {
