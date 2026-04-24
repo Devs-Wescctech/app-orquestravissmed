@@ -83,11 +83,18 @@ export class PushSyncService {
                 continue;
             }
 
+            // Conta convênios LINKED da clínica para decidir o insurance_support do endereço.
+            // CRÍTICO: 'private' faz a página pública mostrar "só aceita pacientes particulares".
+            // Valores aceitos pela API: 'private', 'insurance', 'private_and_insurance'.
+            const linkedInsuranceCount = await this.prisma.mapping.count({
+                where: { clinicId, entityType: 'INSURANCE', status: 'LINKED' },
+            });
+            const desiredInsuranceSupport = linkedInsuranceCount > 0 ? 'private_and_insurance' : 'private';
+
             for (const addr of doctoraliaAddresses) {
                 const addrId = String(addr.id);
 
                 // 2. UPDATE ADDRESS USING CLINIC CONFIG
-                // Sempre envia PATCH com insurance_support: 'private' (field obrigatório da API v3, snake_case)
                 try {
                     let street = '';
                     if (clinic.addressStreet) {
@@ -98,7 +105,7 @@ export class PushSyncService {
                     }
 
                     const addressPayload: any = {
-                        insurance_support: addr.insurance_support || 'private',
+                        insurance_support: desiredInsuranceSupport,
                     };
 
                     // Only send fields that have data (avoid sending empty strings)
@@ -107,8 +114,8 @@ export class PushSyncService {
                     if (clinic.addressZipCode) addressPayload.post_code = clinic.addressZipCode;
 
                     await client.updateAddress(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, addressPayload);
-                    this.logger.log(`Doctor ${dDoc.name}: [ADDR] Updated address ${addrId} with clinic config`);
-                    await this.logEvent(syncRunId, 'ADDRESS_PUSH', 'updated', `Doctor ${dDoc.name}: Endereço ${addrId} atualizado com dados da clínica`);
+                    this.logger.log(`Doctor ${dDoc.name}: [ADDR] Updated address ${addrId} with clinic config (insurance_support=${desiredInsuranceSupport})`);
+                    await this.logEvent(syncRunId, 'ADDRESS_PUSH', 'updated', `Doctor ${dDoc.name}: Endereço ${addrId} atualizado (insurance_support=${desiredInsuranceSupport})`);
                 } catch (error: any) {
                     this.logger.warn(`Doctor ${dDoc.name}: [ADDR FAILED] Address ${addrId}: ${error.message}`);
                     await this.logEvent(syncRunId, 'ADDRESS_PUSH', 'error', `Doctor ${dDoc.name}: Falha ao atualizar endereço ${addrId} - ${error.message}`);
