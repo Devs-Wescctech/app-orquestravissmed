@@ -177,6 +177,35 @@ export class SyncController {
         const successCount = allHistoryRuns.filter(r => r.status === 'completed').length;
         const successRate = allHistoryRuns.length > 0 ? Math.round((successCount / allHistoryRuns.length) * 100) : 0;
 
+        // Insurance health: conta warnings de regressão no último syncRun completed
+        let insuranceRegressionWarnings = 0;
+        const insuranceRegressionDetails: Array<{ message: string; timestamp: Date }> = [];
+        // Considera o último syncRun ('full' OU 'insurance' avulso) que tenha eventos de INSURANCE_PUSH
+        const lastInsRun = await this.prisma.syncRun.findFirst({
+            where: {
+                clinicId,
+                status: 'completed',
+                type: { in: ['full', 'insurance'] },
+                events: { some: { entityType: 'INSURANCE_PUSH' } },
+            },
+            orderBy: { startedAt: 'desc' },
+            select: { id: true },
+        });
+        if (lastInsRun) {
+            const regressionEvents = await this.prisma.syncEvent.findMany({
+                where: {
+                    syncRunId: lastInsRun.id,
+                    entityType: 'INSURANCE_PUSH',
+                    action: 'regression_warning',
+                },
+                orderBy: { timestamp: 'desc' },
+                select: { message: true, timestamp: true },
+            });
+            insuranceRegressionWarnings = regressionEvents.length;
+            insuranceRegressionDetails.push(...regressionEvents.slice(0, 10));
+        }
+        if (insuranceRegressionWarnings > 0 && overallHealth === 'healthy') overallHealth = 'warning';
+
         return {
             health: overallHealth,
             isRunning,
@@ -194,7 +223,14 @@ export class SyncController {
                 message: lastFailed.events?.find((e: any) => e.action === 'error')?.message || 'Erro desconhecido',
             } : null,
             doctors: { mapped: doctorMappings },
-            insurance: { linked: linkedInsurance, pending: pendingInsurance, unlinked: unlinkedInsurance, total: insuranceMappings.length },
+            insurance: {
+                linked: linkedInsurance,
+                pending: pendingInsurance,
+                unlinked: unlinkedInsurance,
+                total: insuranceMappings.length,
+                regressionWarnings: insuranceRegressionWarnings,
+                regressionDetails: insuranceRegressionDetails,
+            },
             vismed: {
                 connected: vismedConnected,
                 stats: vismedStats,
@@ -435,6 +471,11 @@ export class SyncController {
         this.validateUserClinicAccess(req.user, clinicId);
         const client = await this.getDoctoraliaClient(clinicId);
 
+        // Cria um SyncRun para que warnings de regressão sejam rastreados e apareçam no dashboard
+        const syncRun = await this.prisma.syncRun.create({
+            data: { clinicId, type: 'insurance', status: 'running', totalRecords: 0 },
+        });
+
         const mappings = await this.prisma.professionalUnifiedMapping.findMany({
             where: { isActive: true },
             include: {
@@ -450,36 +491,55 @@ export class SyncController {
         const clinicDoctorIds = new Set(clinicDoctorMappings.map(m => m.vismedId).filter(Boolean));
 
         const results: any[] = [];
+        let totalRegressionWarnings = 0;
 
-        for (const mapping of mappings) {
-            if (!clinicDoctorIds.has(mapping.vismedDoctorId)) continue;
-            const dDoc = mapping.doctoraliaDoctor;
-            if (!dDoc) continue;
+        try {
+            for (const mapping of mappings) {
+                if (!clinicDoctorIds.has(mapping.vismedDoctorId)) continue;
+                const dDoc = mapping.doctoraliaDoctor;
+                if (!dDoc) continue;
 
-            let addresses: any[] = [];
-            try {
-                const res = await client.getAddresses(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId);
-                addresses = res._items || [];
-            } catch (e: any) {
-                results.push({ doctor: dDoc.name, error: e.message });
-                continue;
-            }
-
-            for (const addr of addresses) {
-                const addrId = String(addr.id);
+                let addresses: any[] = [];
                 try {
-                    const syncResult = await this.pushSync.syncInsuranceProviders(
-                        null, client, clinicId, dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, dDoc.name
-                    );
-                    results.push({ doctor: dDoc.name, addressId: addrId, ...syncResult });
+                    const res = await client.getAddresses(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId);
+                    addresses = res._items || [];
                 } catch (e: any) {
-                    results.push({ doctor: dDoc.name, addressId: addrId, error: e.message });
+                    results.push({ doctor: dDoc.name, error: e.message });
+                    continue;
+                }
+
+                for (const addr of addresses) {
+                    const addrId = String(addr.id);
+                    try {
+                        const syncResult = await this.pushSync.syncInsuranceProviders(
+                            syncRun.id, client, clinicId, dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, dDoc.name
+                        );
+                        if ((syncResult as any).providersWithoutPlans > 0) {
+                            totalRegressionWarnings += (syncResult as any).providersWithoutPlans;
+                        }
+                        results.push({ doctor: dDoc.name, addressId: addrId, ...syncResult });
+                    } catch (e: any) {
+                        results.push({ doctor: dDoc.name, addressId: addrId, error: e.message });
+                    }
                 }
             }
+
+            await this.prisma.syncRun.update({
+                where: { id: syncRun.id },
+                data: { status: 'completed', endedAt: new Date(), totalRecords: results.length },
+            });
+        } catch (err: any) {
+            await this.prisma.syncRun.update({
+                where: { id: syncRun.id },
+                data: { status: 'failed', endedAt: new Date() },
+            });
+            throw err;
         }
 
         return {
+            syncRunId: syncRun.id,
             total: results.length,
+            regressionWarnings: totalRegressionWarnings,
             results,
         };
     }

@@ -263,10 +263,12 @@ model SyncEvent {
   syncRun     SyncRun  @relation(fields: [syncRunId], references: [id], onDelete: Cascade)
   syncRunId   String
   entityType  String
-  action      String   // created, updated, conflict, error
+  action      String   // created, updated, conflict, error, regression_warning
   externalId  String?
   message     String?
   timestamp   DateTime @default(now())
+
+  @@index([syncRunId, entityType])
 }
 
 model AuditLog {

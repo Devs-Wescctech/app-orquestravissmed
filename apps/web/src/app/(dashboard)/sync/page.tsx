@@ -19,7 +19,11 @@ interface SyncStatus {
     lastSync: { id: string; startedAt: string; endedAt: string | null; totalRecords: number } | null;
     lastError: { id: string; startedAt: string; message: string } | null;
     doctors: { mapped: number };
-    insurance: { linked: number; pending: number; unlinked: number; total: number };
+    insurance: {
+        linked: number; pending: number; unlinked: number; total: number;
+        regressionWarnings?: number;
+        regressionDetails?: Array<{ message: string; createdAt: string }>;
+    };
     vismed: {
         connected: boolean;
         stats: { units: number; doctors: number; specialties: number; insurances: number };
@@ -329,6 +333,35 @@ export default function SyncDashboardPage() {
                     <div>
                         <p className="text-sm font-black text-amber-800">{status?.insurance.pending} convênio(s) aguardando confirmação manual</p>
                         <p className="text-xs text-amber-600 mt-1">Somente correspondências com 100% de match são vinculadas automaticamente. Acesse a Central de Mapeamento para revisar.</p>
+                    </div>
+                </div>
+            )}
+
+            {(status?.insurance.regressionWarnings || 0) > 0 && (
+                <div className="bg-amber-50 border-2 border-amber-300 rounded-[24px] p-6 flex items-start gap-4 shadow-sm">
+                    <div className="h-10 w-10 bg-amber-200 rounded-2xl flex items-center justify-center shrink-0">
+                        <AlertTriangle className="h-5 w-5 text-amber-700" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                        <p className="text-sm font-black text-amber-900">
+                            {status?.insurance.regressionWarnings} convênio(s) ficaram sem plano vinculado na última sincronização
+                        </p>
+                        <p className="text-xs text-amber-700 mt-1">
+                            Sem plano vinculado, a página pública do médico mostra "Não disponível para agendamentos online".
+                            Rode a sincronização novamente — o sistema tenta vincular o primeiro plano automaticamente.
+                        </p>
+                        {(status?.insurance.regressionDetails || []).length > 0 && (
+                            <details className="mt-3">
+                                <summary className="text-xs font-bold text-amber-800 cursor-pointer hover:text-amber-900">
+                                    Ver detalhes ({status?.insurance.regressionDetails?.length})
+                                </summary>
+                                <ul className="mt-2 space-y-1 text-[11px] text-amber-700 max-h-48 overflow-auto">
+                                    {(status?.insurance.regressionDetails || []).map((d, i) => (
+                                        <li key={i} className="font-mono break-all">{d.message}</li>
+                                    ))}
+                                </ul>
+                            </details>
+                        )}
                     </div>
                 </div>
             )}

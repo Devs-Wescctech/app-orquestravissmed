@@ -367,7 +367,42 @@ export class PushSyncService {
 
         result.unchanged += [...desiredProviderIds].filter(id => currentProviderIds.has(id)).length;
 
-        const finalMsg = `Doctor ${doctorName} addr ${addressId}: concluído - added=${result.added}, removed=${result.removed}, planos auto-atribuídos=${plansAdded}, unchanged=${result.unchanged}`;
+        // Verificação pós-push (anti-regressão): re-busca providers e conta os LINKED sem plano.
+        // Convênios sem plano fazem a UI mostrar "Não disponível para agendamentos online".
+        // Pequeno delay evita falso-positivo por propagação interna do Doctoralia logo após PUT.
+        let providersWithoutPlans = 0;
+        const providersMissingPlanIds: string[] = [];
+        try {
+            await new Promise(r => setTimeout(r, 500));
+            const verify = await client.getAddressInsuranceProviders(facilityId, doctorId, addressId);
+            const verifyItems = verify._items || [];
+            for (const p of verifyItems) {
+                const pid = String(p.insurance_provider_id || p.id);
+                if (!desiredProviderIds.has(pid)) continue;
+                const plans = p.insurance_plans?._items || [];
+                if (plans.length === 0) {
+                    providersWithoutPlans++;
+                    providersMissingPlanIds.push(pid);
+                }
+            }
+        } catch (error: any) {
+            this.logger.warn(`Doctor ${doctorName}: [INS] Pós-push: falha ao re-verificar providers - ${error.message}`);
+        }
+
+        if (providersWithoutPlans > 0 && syncRunId) {
+            await this.logEvent(
+                syncRunId,
+                'INSURANCE_PUSH',
+                'regression_warning',
+                `Doctor ${doctorName} addr ${addressId}: ${providersWithoutPlans} convênio(s) sem plano após push (IDs: ${providersMissingPlanIds.join(',')}). UI pública mostrará "Não disponível para agendamentos online".`
+            );
+            this.logger.warn(`Doctor ${doctorName} addr ${addressId}: REGRESSION WARNING - ${providersWithoutPlans} provider(s) sem plano: ${providersMissingPlanIds.join(',')}`);
+        }
+
+        (result as any).providersWithoutPlans = providersWithoutPlans;
+        (result as any).providersMissingPlanIds = providersMissingPlanIds;
+
+        const finalMsg = `Doctor ${doctorName} addr ${addressId}: concluído - added=${result.added}, removed=${result.removed}, planos auto-atribuídos=${plansAdded}, unchanged=${result.unchanged}, sem-plano=${providersWithoutPlans}`;
         this.logger.log(finalMsg);
         if (syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'completed', finalMsg);
 
