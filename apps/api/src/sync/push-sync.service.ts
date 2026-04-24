@@ -283,42 +283,18 @@ export class PushSyncService {
 
         const currentProviderIds = new Set(currentProviders.map((p: any) => String(p.insurance_provider_id || p.id)));
 
-        // Snapshot inicial: o que a Doctoralia REALMENTE tem para esse endereço (para debug visual)
-        const stateSnapshot = currentProviders.map((p: any) => {
-            const pid = String(p.insurance_provider_id || p.id);
-            const plans = p.insurance_plans?._items || [];
-            return `${pid}(${plans.length} planos)`;
-        }).join(', ') || 'vazio';
+        const stateSnapshot = [...currentProviderIds].join(',') || 'vazio';
         if (syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'state', `Doctor ${doctorName} addr ${addressId}: desejados=[${[...desiredProviderIds].join(',')}], Doctoralia atual=[${stateSnapshot}]`);
 
         const toAdd = [...desiredProviderIds].filter(id => !currentProviderIds.has(id));
         const toRemove = [...currentProviderIds].filter(id => !desiredProviderIds.has(id));
 
-        const defaultPlanCache = new Map<string, string | null>();
-        const resolveDefaultPlanId = async (providerId: string): Promise<string | null> => {
-            if (defaultPlanCache.has(providerId)) return defaultPlanCache.get(providerId)!;
-            try {
-                const plansRes = await client.getInsurancePlans(providerId);
-                const items = plansRes?._items || [];
-                const firstId = items.length > 0 ? String(items[0].insurance_plan_id) : null;
-                defaultPlanCache.set(providerId, firstId);
-                return firstId;
-            } catch (error: any) {
-                this.logger.warn(`Doctor ${doctorName}: [INS] Falha ao listar planos do provider ${providerId}: ${error.message}`);
-                defaultPlanCache.set(providerId, null);
-                return null;
-            }
-        };
-
         for (const providerId of toAdd) {
             try {
-                const planId = await resolveDefaultPlanId(providerId);
-                const plansArg = planId ? [{ insurance_plan_id: planId }] : undefined;
-                await client.addAddressInsuranceProvider(facilityId, doctorId, addressId, providerId, plansArg);
+                await client.addAddressInsuranceProvider(facilityId, doctorId, addressId, providerId);
                 result.added++;
-                const planTxt = planId ? ` (plano ${planId})` : ' (sem plano disponível)';
-                this.logger.log(`Doctor ${doctorName}: [INS] Added insurance provider ${providerId} to address ${addressId}${planTxt}`);
-                if (syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'added', `Doctor ${doctorName} addr ${addressId}: convênio ${providerId} vinculado${planTxt}`);
+                this.logger.log(`Doctor ${doctorName}: [INS] Added insurance provider ${providerId} to address ${addressId}`);
+                if (syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'added', `Doctor ${doctorName} addr ${addressId}: convênio ${providerId} vinculado`);
             } catch (error: any) {
                 if (error?.status === 400 && error?.message?.includes('already assigned')) {
                     result.unchanged++;
@@ -341,34 +317,9 @@ export class PushSyncService {
             }
         }
 
-        // Garante pelo menos 1 plano para cada provider LINKED já existente (sem planos).
-        // Não sobrescreve seleções manuais já configuradas no Doctoralia.
-        let plansAdded = 0;
-        for (const provider of currentProviders) {
-            const providerId = String(provider.insurance_provider_id || provider.id);
-            if (!desiredProviderIds.has(providerId)) continue;
-
-            const existingPlans = provider.insurance_plans?._items || [];
-            if (existingPlans.length > 0) continue;
-
-            const planId = await resolveDefaultPlanId(providerId);
-            if (!planId) continue;
-
-            try {
-                await client.putAddressInsuranceProvider(
-                    facilityId, doctorId, addressId, providerId,
-                    [{ insurance_plan_id: planId }]
-                );
-                plansAdded++;
-                this.logger.log(`Doctor ${doctorName}: [INS] Plano ${planId} atribuído ao provider ${providerId} (estava sem plano)`);
-            } catch (error: any) {
-                this.logger.warn(`Doctor ${doctorName}: [INS] Falha ao definir plano padrão para provider ${providerId}: ${error.message}`);
-            }
-        }
-
         result.unchanged += [...desiredProviderIds].filter(id => currentProviderIds.has(id)).length;
 
-        const finalMsg = `Doctor ${doctorName} addr ${addressId}: concluído - added=${result.added}, removed=${result.removed}, planos auto-atribuídos=${plansAdded}, unchanged=${result.unchanged}`;
+        const finalMsg = `Doctor ${doctorName} addr ${addressId}: concluído - added=${result.added}, removed=${result.removed}, unchanged=${result.unchanged}`;
         this.logger.log(finalMsg);
         if (syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'completed', finalMsg);
 

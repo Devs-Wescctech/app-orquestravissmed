@@ -153,19 +153,13 @@ export class DocplannerClient {
         return this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/insurance-providers`);
     }
 
-    async addAddressInsuranceProvider(facilityId: string, doctorId: string, addressId: string, insuranceProviderId: string, insurancePlans?: { insurance_plan_id: string }[]): Promise<any> {
-        const payload: any = { insurance_provider_id: String(insuranceProviderId) };
-        if (insurancePlans && insurancePlans.length > 0) {
-            payload.insurance_plans = insurancePlans;
-        }
+    async addAddressInsuranceProvider(facilityId: string, doctorId: string, addressId: string, insuranceProviderId: string, _insurancePlans?: { insurance_plan_id: string }[]): Promise<any> {
+        const payload = { insurance_provider_id: String(insuranceProviderId) };
         return this.request('POST', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/insurance-providers`, payload);
     }
 
-    async putAddressInsuranceProvider(facilityId: string, doctorId: string, addressId: string, insuranceProviderId: string, insurancePlans?: { insurance_plan_id: string }[]): Promise<any> {
-        const payload: any = { insurance_provider_id: String(insuranceProviderId) };
-        if (insurancePlans && insurancePlans.length > 0) {
-            payload.insurance_plans = insurancePlans;
-        }
+    async putAddressInsuranceProvider(facilityId: string, doctorId: string, addressId: string, insuranceProviderId: string, _insurancePlans?: { insurance_plan_id: string }[]): Promise<any> {
+        const payload = { insurance_provider_id: String(insuranceProviderId) };
         return this.request('PUT', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/insurance-providers`, payload);
     }
 
