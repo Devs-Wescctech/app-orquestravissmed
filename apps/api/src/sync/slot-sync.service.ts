@@ -56,16 +56,16 @@ export class SlotSyncService {
             };
 
             if (insuranceProviderIds.length > 0) {
-                const mode = (process.env.SLOT_INSURANCE_MODE || 'with-and-without-insurance').toLowerCase();
+                const mode = (process.env.SLOT_INSURANCE_MODE || 'with-insurance-only').toLowerCase();
                 if (mode === 'without-insurance-only') {
                     slot.insurance_accepted = 'without-insurance-only';
-                } else if (mode === 'with-insurance-only') {
-                    slot.insurance_accepted = 'with-insurance-only';
+                } else if (mode === 'with-and-without-insurance') {
+                    slot.insurance_accepted = 'with-and-without-insurance';
                     slot.insurance_providers = insuranceProviderIds;
                 } else if (mode === 'none') {
                     slot.insurance_providers = insuranceProviderIds;
                 } else {
-                    slot.insurance_accepted = 'with-and-without-insurance';
+                    slot.insurance_accepted = 'with-insurance-only';
                     slot.insurance_providers = insuranceProviderIds;
                 }
             }
