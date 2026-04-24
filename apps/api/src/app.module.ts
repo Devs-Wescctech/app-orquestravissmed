@@ -6,6 +6,7 @@ import { UsersModule } from './users/users.module';
 import { ClinicsModule } from './clinics/clinics.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { ConfigModule } from '@nestjs/config';
+import { ScheduleModule } from '@nestjs/schedule';
 import { BullModule } from '@nestjs/bullmq';
 import { IntegrationsModule } from './integrations/integrations.module';
 import { SyncModule } from './sync/sync.module';
@@ -17,6 +18,7 @@ import { BookingsModule } from './bookings/bookings.module';
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
+    ScheduleModule.forRoot(),
     PrismaModule,
     AuthModule,
     UsersModule,
