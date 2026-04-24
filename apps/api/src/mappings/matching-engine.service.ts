@@ -18,6 +18,32 @@ export class MatchingEngineService {
             .trim();
     }
 
+    private static readonly SPECIALTY_NOISE_TOKENS = new Set([
+        'primeira', 'consulta', 'consultas', 'retorno', 'retornos', 'atendimento', 'atendimentos',
+        'avaliacao', 'avaliacoes', 'sessao', 'sessoes', 'exame', 'exames', 'procedimento', 'procedimentos',
+        'de', 'da', 'do', 'dos', 'das', 'em', 'e', 'a', 'o', 'para', 'com', 'no', 'na', 'pelo', 'pela',
+    ]);
+
+    private tokenizeSpecialty(name: string): string[] {
+        return this.normalizeString(name)
+            .split(/[\s\-_,/.()]+/)
+            .filter(t => t.length >= 3 && !MatchingEngineService.SPECIALTY_NOISE_TOKENS.has(t));
+    }
+
+    private scoreSpecialtyTokenContainment(vismedTokens: string[], svcTokens: string[]): number {
+        // Deduplicate to avoid inflated scores when a token repeats in either list
+        const vSet = new Set(vismedTokens);
+        const sSet = new Set(svcTokens);
+        if (vSet.size === 0 || sSet.size === 0) return 0;
+        let intersection = 0;
+        for (const t of vSet) if (sSet.has(t)) intersection++;
+        if (intersection === 0) return 0;
+        const coverage = intersection / vSet.size;          // ∈ [0,1]
+        const reverseCoverage = intersection / sSet.size;   // ∈ [0,1]
+        const score = (coverage * 0.5) + (reverseCoverage * 0.5);
+        return Math.min(1, Math.max(0, score));
+    }
+
     async onApplicationBootstrap(): Promise<void> {
         try {
             const result = await this.prisma.specialtyServiceMapping.updateMany({
@@ -30,6 +56,73 @@ export class MatchingEngineService {
         } catch (e: any) {
             this.logger.warn(`[BOOT] Failed to reclassify specialty mappings: ${e.message}`);
         }
+    }
+
+    /**
+     * Recomputes the confidence score of every active specialty mapping using the current
+     * matching algorithms (token-containment + dice fuzzy) and reclassifies them:
+     *   - score >= 0.90 -> requiresReview = false (auto)
+     *   - 0.60 <= score < 0.90 -> requiresReview = true (pending manual approval)
+     *   - score < 0.60 -> isActive = false (deactivated)
+     * Returns counters for the action taken.
+     */
+    async recomputeAllSpecialtyScores(actorUserId?: string): Promise<{ total: number; auto: number; review: number; deactivated: number; preserved: number; skipped: number }> {
+        // Snapshot only candidates for recompute (APPROXIMATE + active). EXACT/SYNONYM/MANUAL
+        // are filtered at the SQL layer so they're never read into the loop and never written.
+        const candidates = await this.prisma.specialtyServiceMapping.findMany({
+            where: { isActive: true, matchType: 'APPROXIMATE' },
+            include: { vismedSpecialty: true, doctoraliaService: true },
+        });
+
+        const preservedCount = await this.prisma.specialtyServiceMapping.count({
+            where: { isActive: true, matchType: { in: ['EXACT', 'SYNONYM', 'MANUAL'] } },
+        });
+
+        this.logger.log(`[RECOMPUTE] start actor=${actorUserId ?? 'unknown'} candidates=${candidates.length} preserved=${preservedCount}`);
+
+        let auto = 0, review = 0, deactivated = 0, skipped = 0;
+
+        for (const m of candidates) {
+            const vismedName = m.vismedSpecialty?.name;
+            const svcName = m.doctoraliaService?.name;
+            if (!vismedName || !svcName) { skipped++; continue; }
+
+            const normVismed = this.normalizeString(vismedName);
+            const normSvc = this.normalizeString(svcName);
+
+            let newScore = 0;
+            if (normVismed === normSvc) {
+                newScore = 1.0;
+            } else {
+                const vTok = this.tokenizeSpecialty(vismedName);
+                const sTok = this.tokenizeSpecialty(svcName);
+                const tokenScore = this.scoreSpecialtyTokenContainment(vTok, sTok);
+                const diceScore = stringSimilarity.compareTwoStrings(normVismed, normSvc);
+                newScore = Math.min(1, Math.max(0, Math.max(tokenScore, diceScore)));
+            }
+
+            // Race-safe: only update if the row is STILL APPROXIMATE+active. If a concurrent
+            // request flipped it to MANUAL/SYNONYM/EXACT or deactivated it, updateMany returns
+            // count=0 and we skip — never overwriting a manual decision made during recompute.
+            const data = newScore < 0.60
+                ? { isActive: false, requiresReview: false, confidenceScore: newScore }
+                : { confidenceScore: newScore, requiresReview: newScore < 0.90 };
+
+            const res = await this.prisma.specialtyServiceMapping.updateMany({
+                where: { id: m.id, isActive: true, matchType: 'APPROXIMATE' },
+                data,
+            });
+
+            if (res.count === 0) { skipped++; continue; }
+
+            if (newScore < 0.60) deactivated++;
+            else if (newScore < 0.90) review++;
+            else auto++;
+        }
+
+        const total = candidates.length + preservedCount;
+        this.logger.log(`[RECOMPUTE] done actor=${actorUserId ?? 'unknown'} total=${total} auto=${auto} review=${review} deactivated=${deactivated} preserved=${preservedCount} skipped=${skipped}`);
+        return { total, auto, review, deactivated, preserved: preservedCount, skipped };
     }
 
     async runMatchingForSpecialty(vismedSpecialtyId: string): Promise<boolean> {
@@ -65,16 +158,28 @@ export class MatchingEngineService {
             return true;
         }
 
-        // Layer 1.5: Contains Match
-        // Ex: "cardiologia" is contained in "primeira consulta cardiologia" → score 0.90
-        const containsMatch = dServices.find(s => {
-            const normSvc = this.normalizeString(s.name);
-            return normSvc.includes(normSpecialty) || normSpecialty.includes(normSvc);
-        });
-        if (containsMatch) {
-            await this.createMapping(specialty.id, containsMatch.id, 'APPROXIMATE', 0.90, false);
-            this.logger.log(`Contains-match: "${specialty.name}" → "${containsMatch.name}"`);
-            return true;
+        // Layer 1.5: Word-Token Containment Match (com guarda-rails contra falsos positivos)
+        // Avalia tokens do nome inteiro, ignora ruído (primeira/consulta/de/etc.) e exige
+        // que o termo VisMed apareça como PALAVRA INTEIRA no serviço Doctoralia (não substring).
+        // Score real (não inflado) — auto-aprova se >= 0.90, vira review se 0.60-0.89.
+        const vismedTokens = this.tokenizeSpecialty(specialty.name);
+        if (vismedTokens.length > 0) {
+            let bestTokenScore = 0;
+            let bestTokenSvc: any = null;
+            for (const s of dServices) {
+                const sTok = this.tokenizeSpecialty(s.name);
+                const sc = this.scoreSpecialtyTokenContainment(vismedTokens, sTok);
+                if (sc > bestTokenScore) {
+                    bestTokenScore = sc;
+                    bestTokenSvc = s;
+                }
+            }
+            if (bestTokenSvc && bestTokenScore >= 0.60) {
+                const needsReview = bestTokenScore < 0.90;
+                await this.createMapping(specialty.id, bestTokenSvc.id, 'APPROXIMATE', bestTokenScore, needsReview);
+                this.logger.log(`Token-contain match (${(bestTokenScore * 100).toFixed(1)}%): "${specialty.name}" → "${bestTokenSvc.name}"${needsReview ? ' — PENDING MANUAL REVIEW' : ''}`);
+                return true;
+            }
         }
 
         // Layer 3: Synonym Match

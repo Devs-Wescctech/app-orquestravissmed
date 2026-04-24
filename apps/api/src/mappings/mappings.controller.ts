@@ -1,13 +1,18 @@
 import { Controller, Get, Post, Body, Param, Query, UseGuards, Request } from '@nestjs/common';
 import { MappingsService } from './mappings.service';
+import { MatchingEngineService } from './matching-engine.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
-import { MappingEntityType } from '@prisma/client';
+import { Roles } from '../auth/roles.decorator';
+import { MappingEntityType, Role } from '@prisma/client';
 
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('mappings')
 export class MappingsController {
-    constructor(private readonly mappingsService: MappingsService) { }
+    constructor(
+        private readonly mappingsService: MappingsService,
+        private readonly matchingEngine: MatchingEngineService,
+    ) { }
 
     @Get()
     findAll(
@@ -85,6 +90,12 @@ export class MappingsController {
         @Body() body: { vismedSpecialtyId: string; doctoraliaServiceId: string; }
     ) {
         return this.mappingsService.rejectSpecialtyMatch(body.vismedSpecialtyId, body.doctoraliaServiceId, req.user.id);
+    }
+
+    @Post('specialties/recompute-scores')
+    @Roles(Role.SUPER_ADMIN)
+    recomputeAllSpecialtyScores(@Request() req: any) {
+        return this.matchingEngine.recomputeAllSpecialtyScores(req.user?.id);
     }
 
     @Post('specialties/manual')
