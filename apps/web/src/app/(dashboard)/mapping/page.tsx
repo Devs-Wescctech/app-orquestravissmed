@@ -68,6 +68,7 @@ export default function MappingHub() {
     const [professionals, setProfessionals] = useState<VismedProfessional[]>([]);
     const [units, setUnits] = useState<VismedUnit[]>([]);
     const [specialtyMatches, setSpecialtyMatches] = useState<SpecialtyMatch[]>([]);
+    const [specialtyFilter, setSpecialtyFilter] = useState<'all' | 'pending' | 'approved'>('pending');
     const [legacyMappings, setLegacyMappings] = useState<any[]>([]);
     const [specStats, setSpecStats] = useState<any>(null);
 
@@ -551,8 +552,27 @@ export default function MappingHub() {
                     </div>
 
                     <div className="bg-white/70 backdrop-blur-xl rounded-[32px] shadow-sm border border-slate-100/80 overflow-hidden">
-                        <div className="p-8 border-b border-slate-100/60 flex justify-between items-center bg-white/40">
+                        <div className="p-8 border-b border-slate-100/60 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-4 bg-white/40">
                             <h3 className="text-[12px] font-black text-slate-900 uppercase tracking-[2px]">Motor de Equivalência de Serviços (IA)</h3>
+                            <div className="inline-flex rounded-2xl bg-slate-100/70 p-1">
+                                {([
+                                    { key: 'all', label: 'Todos', count: specialtyMatches.length },
+                                    { key: 'pending', label: 'Pendentes', count: specialtyMatches.filter(x => x.requiresReview).length },
+                                    { key: 'approved', label: 'Aprovados', count: specialtyMatches.filter(x => !x.requiresReview).length },
+                                ] as const).map(opt => (
+                                    <button
+                                        key={opt.key}
+                                        onClick={() => setSpecialtyFilter(opt.key)}
+                                        className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${
+                                            specialtyFilter === opt.key
+                                                ? 'bg-white text-slate-900 shadow-sm'
+                                                : 'text-slate-400 hover:text-slate-600'
+                                        }`}
+                                    >
+                                        {opt.label} ({opt.count})
+                                    </button>
+                                ))}
+                            </div>
                         </div>
                         <div className="overflow-x-auto">
                             <table className="w-full text-sm text-left border-separate border-spacing-0">
@@ -571,19 +591,38 @@ export default function MappingHub() {
                                                 <p className="text-[10px] font-black text-slate-300 uppercase tracking-[4px]">Processando motor de busca...</p>
                                             </div>
                                         </td></tr>
-                                    ) : specialtyMatches.length === 0 ? (
-                                        <tr><td colSpan={3} className="px-10 py-32 text-center text-slate-400 font-bold uppercase tracking-widest text-xs opacity-50">Aguardando gatilho do motor de IA...</td></tr>
-                                    ) : specialtyMatches.map(m => (
-                                        <tr key={m.id} className="group hover:bg-emerald-50/20 transition-all duration-500">
+                                    ) : (() => {
+                                        const filtered = specialtyMatches
+                                            .filter(m => specialtyFilter === 'all' ? true : specialtyFilter === 'pending' ? m.requiresReview : !m.requiresReview)
+                                            .sort((a, b) => {
+                                                // Pendentes primeiro, depois por score crescente dentro do grupo
+                                                if (a.requiresReview !== b.requiresReview) return a.requiresReview ? -1 : 1;
+                                                return a.confidenceScore - b.confidenceScore;
+                                            });
+                                        if (filtered.length === 0) {
+                                            return <tr><td colSpan={3} className="px-10 py-32 text-center text-slate-400 font-bold uppercase tracking-widest text-xs opacity-50">
+                                                {specialtyFilter === 'pending' ? 'Nenhum mapping aguardando revisão' : specialtyFilter === 'approved' ? 'Nenhum mapping auto-aprovado' : 'Aguardando gatilho do motor de IA...'}
+                                            </td></tr>;
+                                        }
+                                        return filtered.map(m => (
+                                        <tr key={m.id} className={`group transition-all duration-500 ${m.requiresReview ? 'bg-amber-50/40 hover:bg-amber-50/70' : 'hover:bg-emerald-50/20'}`}>
                                             <td className="px-10 py-6">
                                                 <div className="font-black text-base text-slate-900 leading-tight group-hover:text-primary transition-colors tracking-tight">{m.vismedSpecialty?.name ?? '—'}</div>
                                                 <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mt-2">{m.vismedSpecialty?.normalizedName ?? 'NORMALIZED'}</div>
                                             </td>
                                             <td className="px-10 py-6 text-center">
                                                 <div className="flex flex-col items-center gap-4">
-                                                    <span className="inline-flex items-center px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest border border-primary/20 bg-primary/5 text-primary">
-                                                        Sincronizado ({Math.round(m.confidenceScore * 100)}%)
-                                                    </span>
+                                                    {m.requiresReview ? (
+                                                        <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest border border-amber-300 bg-amber-100 text-amber-700">
+                                                            <AlertTriangle className="h-3 w-3" />
+                                                            Aguarda Aprovação ({Math.round(m.confidenceScore * 100)}%)
+                                                        </span>
+                                                    ) : (
+                                                        <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest border border-primary/20 bg-primary/5 text-primary">
+                                                            <CheckCircle2 className="h-3 w-3" />
+                                                            Aprovado ({Math.round(m.confidenceScore * 100)}%)
+                                                        </span>
+                                                    )}
                                                     {m.requiresReview && (
                                                         <div className="flex gap-3 animate-in fade-in zoom-in duration-300">
                                                             <button onClick={() => handleApprove(m.vismedSpecialtyId, m.doctoraliaServiceId)} disabled={isResolving}
@@ -613,7 +652,8 @@ export default function MappingHub() {
                                                 </div>
                                             </td>
                                         </tr>
-                                    ))}
+                                        ));
+                                    })()}
                                 </tbody>
                             </table>
                         </div>
