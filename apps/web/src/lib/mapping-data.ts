@@ -14,9 +14,10 @@ export async function fetchProfessionalMappings(clinicId: string) {
 
 export async function fetchSpecialtyMatches(clinicId: string, requiresReview?: boolean) {
   try {
-    const response = await api.get('/mappings/specialties/matches', { 
-      params: { clinicId, requiresReview } 
-    });
+    const params: Record<string, string> = {};
+    if (clinicId) params.clinicId = clinicId;
+    if (typeof requiresReview === 'boolean') params.requiresReview = String(requiresReview);
+    const response = await api.get('/mappings/specialties/matches', { params });
     return response.data || [];
   } catch (error) {
     console.error('fetchSpecialtyMatches error:', error);

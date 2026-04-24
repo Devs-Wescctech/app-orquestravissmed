@@ -67,7 +67,11 @@ export class MappingsController {
 
     @Get('specialties/matches')
     getSpecialtyMatches(@Query('requiresReview') requiresReview?: string) {
-        const reviewFilter = requiresReview ? requiresReview === 'true' : undefined;
+        // Aceita apenas 'true' ou 'false' como filtro explícito; qualquer outra coisa
+        // (ausente, vazio, "undefined", "null", etc.) significa "sem filtro" → retorna todos.
+        const reviewFilter = requiresReview === 'true' ? true
+            : requiresReview === 'false' ? false
+            : undefined;
         return this.mappingsService.getSpecialtyMatches(reviewFilter);
     }
 
