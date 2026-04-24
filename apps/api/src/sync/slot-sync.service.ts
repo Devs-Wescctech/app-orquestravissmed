@@ -223,7 +223,8 @@ export class SlotSyncService {
             }
 
             let insuranceProviderIds: number[] = [];
-            if (clinicId) {
+            const omitInsurance = process.env.OMIT_INSURANCE_FROM_SLOTS === 'true';
+            if (clinicId && !omitInsurance) {
                 const linkedInsuranceMappings = await this.prisma.mapping.findMany({
                     where: { clinicId, entityType: 'INSURANCE', status: 'LINKED', externalId: { not: null } },
                 });
@@ -233,6 +234,9 @@ export class SlotSyncService {
                 if (insuranceProviderIds.length > 0) {
                     this.logger.log(`Doctor ${doctor.name} address ${addrId}: including ${insuranceProviderIds.length} insurance provider(s): ${insuranceProviderIds.join(', ')}`);
                 }
+            } else if (omitInsurance) {
+                this.logger.log(`Doctor ${doctor.name} address ${addrId}: OMIT_INSURANCE_FROM_SLOTS=true, slot será enviado sem insurance_providers (modo legado)`);
+                if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'insurance_omitted', `Doctor ${doctor.name} addr ${addrId}: insurance_providers OMITIDO do payload (flag legacy)`);
             }
 
             const allSlots: any[] = [];
@@ -260,9 +264,15 @@ export class SlotSyncService {
             }
 
             try {
-                this.logger.log(`Doctor ${doctor.name}: sending ${allSlots.length} work periods to address ${addrId} for ${dates.length} days. Sample: ${JSON.stringify(allSlots[0])}`);
+                const sampleSlot = JSON.stringify(allSlots[0]);
+                this.logger.log(`Doctor ${doctor.name}: sending ${allSlots.length} work periods to address ${addrId} for ${dates.length} days. Sample: ${sampleSlot}`);
+                if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'payload_sent', `Doctor ${doctor.name} addr ${addrId}: enviando ${allSlots.length} slots. Amostra: ${sampleSlot.substring(0, 400)}`);
+
                 const putResponse = await client.replaceSlots(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, { slots: allSlots });
-                this.logger.log(`Doctor ${doctor.name}: PUT slots response: ${JSON.stringify(putResponse)}`);
+                const respStr = JSON.stringify(putResponse);
+                this.logger.log(`Doctor ${doctor.name}: PUT slots response: ${respStr}`);
+                if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'doctoralia_response', `Doctor ${doctor.name} addr ${addrId}: resposta Doctoralia: ${respStr.substring(0, 400)}`);
+
                 totalSlots += allSlots.length;
                 this.logger.log(`Doctor ${doctor.name}: synced ${allSlots.length} work periods to address ${addrId} for ${dates.length} days`);
                 if (syncRunId) {
