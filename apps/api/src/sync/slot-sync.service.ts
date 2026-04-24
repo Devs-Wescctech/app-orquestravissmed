@@ -35,7 +35,7 @@ export class SlotSyncService {
         return { start, end };
     }
 
-    buildDaySlots(date: string, turnoM: string | null, turnoT: string | null, turnoN: string | null, addressServiceIds: number[], timezone: string = '-03:00', slotDurationMinutes: number = 30, insuranceProviderIds: number[] = []): any[] {
+    buildDaySlots(date: string, turnoM: string | null, turnoT: string | null, turnoN: string | null, addressServiceIds: number[], timezone: string = '-03:00', slotDurationMinutes: number = 30, insuranceProviderIds: number[] = [], insurancePlanIds: number[] = []): any[] {
         const slots: any[] = [];
         const turnos = [turnoM, turnoT, turnoN];
 
@@ -62,11 +62,17 @@ export class SlotSyncService {
                 } else if (mode === 'with-and-without-insurance') {
                     slot.insurance_accepted = 'with-and-without-insurance';
                     slot.insurance_providers = insuranceProviderIds;
+                    if (insurancePlanIds.length > 0) slot.insurance_plans = insurancePlanIds;
                 } else if (mode === 'none') {
                     slot.insurance_providers = insuranceProviderIds;
+                    if (insurancePlanIds.length > 0) slot.insurance_plans = insurancePlanIds;
                 } else {
                     slot.insurance_accepted = 'with-insurance-only';
                     slot.insurance_providers = insuranceProviderIds;
+                    // CRITICAL: insurance_plans é OBRIGATÓRIO para a UI pública marcar a Unimed como
+                    // "agendável online" (isBookable:true). Sem ele, o convênio aparece com a tag
+                    // "(Não disponível para agendamentos online)" mesmo com providers vinculados.
+                    if (insurancePlanIds.length > 0) slot.insurance_plans = insurancePlanIds;
                 }
             }
 
@@ -180,6 +186,10 @@ export class SlotSyncService {
         startDate.setDate(startDate.getDate() + 1);
         const dates = this.generateDateRange(startDate, daysAhead);
 
+        // Cache de plan_id por provider_id (escopo: este médico). Evita N+1 quando o mesmo provider
+        // aparece em múltiplos endereços. Valor -1 significa "consultado e sem planos disponíveis".
+        const planCache = new Map<number, number>();
+
         for (const addr of doctoraliaAddresses) {
             const addrId = String(addr.id);
             addressesAttempted++;
@@ -233,6 +243,7 @@ export class SlotSyncService {
             }
 
             let insuranceProviderIds: number[] = [];
+            let insurancePlanIds: number[] = [];
             const omitInsurance = process.env.OMIT_INSURANCE_FROM_SLOTS === 'true';
             if (clinicId && !omitInsurance) {
                 const linkedInsuranceMappings = await this.prisma.mapping.findMany({
@@ -241,8 +252,48 @@ export class SlotSyncService {
                 insuranceProviderIds = linkedInsuranceMappings
                     .map(m => parseInt(m.externalId!, 10))
                     .filter(id => !isNaN(id));
+
+                // CRITICAL: para cada provider, busca o primeiro plano disponível na Doctoralia.
+                // O slot precisa de `insurance_plans` para a página pública marcar o convênio
+                // como "agendável online" (isBookable:true). Sem isso, a UI mostra a tag
+                // "(Não disponível para agendamentos online)" mesmo com providers vinculados.
+                // Cache evita N+1: o mesmo provider é consultado uma vez por sync (independe de quantos endereços/médicos).
+                const seenPlans = new Set<number>();
+                for (const providerId of insuranceProviderIds) {
+                    if (planCache.has(providerId)) {
+                        const cached = planCache.get(providerId)!;
+                        if (cached > 0 && !seenPlans.has(cached)) {
+                            insurancePlanIds.push(cached);
+                            seenPlans.add(cached);
+                        }
+                        continue;
+                    }
+                    try {
+                        const plansRes = await client.getInsurancePlans(String(providerId));
+                        const firstPlan = plansRes?._items?.[0];
+                        if (firstPlan?.id) {
+                            const planIdNum = parseInt(String(firstPlan.id), 10);
+                            if (!isNaN(planIdNum)) {
+                                planCache.set(providerId, planIdNum);
+                                if (!seenPlans.has(planIdNum)) {
+                                    insurancePlanIds.push(planIdNum);
+                                    seenPlans.add(planIdNum);
+                                }
+                            } else {
+                                planCache.set(providerId, -1);
+                            }
+                        } else {
+                            planCache.set(providerId, -1);
+                            this.logger.warn(`Doctor ${doctor.name} address ${addrId}: provider ${providerId} sem planos disponíveis — slot pode aparecer como "não agendável online"`);
+                        }
+                    } catch (err: any) {
+                        // não cacheia erro: pode ser transitório, próxima execução tenta de novo
+                        this.logger.warn(`Doctor ${doctor.name} address ${addrId}: falha ao buscar planos do provider ${providerId}: ${err.message}`);
+                    }
+                }
+
                 if (insuranceProviderIds.length > 0) {
-                    this.logger.log(`Doctor ${doctor.name} address ${addrId}: including ${insuranceProviderIds.length} insurance provider(s): ${insuranceProviderIds.join(', ')}`);
+                    this.logger.log(`Doctor ${doctor.name} address ${addrId}: including ${insuranceProviderIds.length} insurance provider(s): ${insuranceProviderIds.join(', ')} with ${insurancePlanIds.length} plan(s): ${insurancePlanIds.join(', ')}`);
                 }
             } else if (omitInsurance) {
                 this.logger.log(`Doctor ${doctor.name} address ${addrId}: OMIT_INSURANCE_FROM_SLOTS=true, slot será enviado sem insurance_providers (modo legado)`);
@@ -251,7 +302,7 @@ export class SlotSyncService {
 
             const allSlots: any[] = [];
             for (const date of dates) {
-                const daySlots = this.buildDaySlots(date, doctor.turnoM, doctor.turnoT, doctor.turnoN, addressServiceIds, '-03:00', 30, insuranceProviderIds);
+                const daySlots = this.buildDaySlots(date, doctor.turnoM, doctor.turnoT, doctor.turnoN, addressServiceIds, '-03:00', 30, insuranceProviderIds, insurancePlanIds);
                 allSlots.push(...daySlots);
             }
 
