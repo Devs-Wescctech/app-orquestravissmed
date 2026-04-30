@@ -460,6 +460,9 @@ model BookingSync {
   syncedToDoctoralia    Boolean           @default(false)
   cancelledBy           String?           // VISMED | DOCTORALIA | INTEGRATION (anti-loop)
   cancelledAt           DateTime?
+  lastMoveBy            String?           // VISMED | DOCTORALIA | INTEGRATION (anti-eco reschedule)
+  lastMoveAt            DateTime?
+  lastMoveTargetStartAt DateTime?         // horário para o qual movemos (eco se vier igual <5min)
   syncError             String?
   processedAt           DateTime?
   createdAt             DateTime          @default(now())

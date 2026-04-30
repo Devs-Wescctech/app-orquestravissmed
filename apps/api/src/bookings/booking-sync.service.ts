@@ -273,6 +273,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
 
         const previousStatus = existingByVismedId?.status ?? null;
         const previousCancelledBy = existingByVismedId?.cancelledBy ?? null;
+        const previousStartAt = existingByVismedId?.startAt ?? null;
 
         if (!existingByVismedId && doctor?.id) {
             const windowMs = 60 * 1000;
@@ -311,6 +312,59 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                         this.logger.warn(`[CANCEL-SYNC] propagate vismed→doctoralia failed (orphan): ${err.message}`),
                     );
                 }
+                return true;
+            }
+
+            // Reconcile reschedule órfão (Doctoralia→VisMed): caso o crash ocorra entre
+            // createVismedAppointment e o update do vismedAppointmentId, este novo agendamento
+            // chega no poll sem casar com nenhum BookingSync. Procuramos por um registro
+            // recém-marcado como "in-progress" (lastMoveBy='DOCTORALIA' + lastMoveTargetStartAt
+            // próximo) e ainda sem vismedAppointmentId atualizado.
+            // Janelas conservadoras (15min/±30s) para reduzir risco de match cruzado entre
+            // reschedules concorrentes do mesmo doutor.
+            const reschedOrphanWhere = {
+                clinicId,
+                vismedDoctorId: doctor.id,
+                lastMoveBy: 'DOCTORALIA',
+                lastMoveAt: { gte: new Date(Date.now() - 15 * 60 * 1000) },
+                lastMoveTargetStartAt: {
+                    gte: new Date(startAt.getTime() - 30 * 1000),
+                    lte: new Date(startAt.getTime() + 30 * 1000),
+                },
+                NOT: { vismedAppointmentId },
+            };
+            const reschedCandidates = await this.prisma.bookingSync.findMany({
+                where: reschedOrphanWhere,
+                orderBy: { lastMoveAt: 'desc' },
+                take: 2,
+            });
+            if (reschedCandidates.length > 1) {
+                this.logger.warn(
+                    `[VISMED-POLL] reschedule-orphan AMBIGUO: ${reschedCandidates.length} candidatos para vismedAppointmentId=${vismedAppointmentId} doctor=${doctor.id} startAt=${startAt.toISOString()} — pegando o mais recente (id=${reschedCandidates[0].id})`,
+                );
+            }
+            const reschedOrphan = reschedCandidates[0] ?? null;
+            if (reschedOrphan) {
+                this.logger.log(
+                    `[VISMED-POLL] reschedule-orphan reconcile: BookingSync ${reschedOrphan.id} (apptIdAntigo=${reschedOrphan.vismedAppointmentId}) ↔ novo vismedAppointmentId=${vismedAppointmentId}`,
+                );
+                const updated = await this.prisma.bookingSync.update({
+                    where: { id: reschedOrphan.id },
+                    data: {
+                        vismedAppointmentId,
+                        status,
+                        startAt,
+                        endAt,
+                        duration: durationMin,
+                        rawPayload: a,
+                        syncedToVismed: true,
+                        syncError: null,
+                        processedAt: new Date(),
+                    },
+                });
+                await this.syncDoctoraliaBreak(updated.id).catch((err) =>
+                    this.logger.warn(`[VISMED-POLL] break sync failed (reschedule-orphan): ${err.message}`),
+                );
                 return true;
             }
         }
@@ -354,11 +408,23 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         // O helper é idempotente: faz no-op se já foi cancelado por nós/Doctoralia ou
         // se já está marcado como sincronizado. Em caso de falha anterior (syncedToDoctoralia=false),
         // a próxima rodada de poll re-tentará automaticamente.
-        // (previousStatus/previousCancelledBy mantidos só para diagnóstico futuro)
         void previousStatus; void previousCancelledBy;
         if (status === 'CANCELLED') {
             await this.propagateVismedCancellationToDoctoralia(upserted.id).catch((err) =>
                 this.logger.warn(`[CANCEL-SYNC] propagate vismed→doctoralia failed: ${err.message}`),
+            );
+        }
+
+        // Detecta reagendamento: mesmo agendamento mudou de horário (sem ter sido cancelado).
+        // Propaga para a Doctoralia via moveBooking. Anti-eco fica dentro do helper.
+        const startChanged = previousStartAt && previousStartAt.getTime() !== startAt.getTime();
+        const isLiveStatus = status === 'BOOKED' || status === 'CONFIRMED';
+        if (startChanged && isLiveStatus) {
+            this.logger.log(
+                `[RESCHEDULE-SYNC] VisMed apptId=${vismedAppointmentId} mudou de ${previousStartAt!.toISOString()} → ${startAt.toISOString()}`,
+            );
+            await this.propagateVismedRescheduleToDoctoralia(upserted.id, previousStartAt!).catch((err) =>
+                this.logger.warn(`[RESCHEDULE-SYNC] propagate vismed→doctoralia failed: ${err.message}`),
             );
         }
 
@@ -527,6 +593,268 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 data: { syncError: `cancel→vismed: ${msg}`.slice(0, 500) },
             });
         }
+    }
+
+    private static readonly RESCHEDULE_ECO_WINDOW_MS = 5 * 60 * 1000;
+
+    /**
+     * Detecta eco de reagendamento: se nós acabamos de mover este booking para esse
+     * mesmo horário-alvo há menos de 5 minutos, a "mudança" detectada agora é apenas
+     * a outra ponta do espelho repetindo o estado.
+     */
+    private isRescheduleEco(rec: { lastMoveAt: Date | null; lastMoveTargetStartAt: Date | null }, novoStartAt: Date): boolean {
+        if (!rec.lastMoveAt || !rec.lastMoveTargetStartAt) return false;
+        const fresh = Date.now() - rec.lastMoveAt.getTime() < BookingSyncService.RESCHEDULE_ECO_WINDOW_MS;
+        const sameTarget = rec.lastMoveTargetStartAt.getTime() === novoStartAt.getTime();
+        return fresh && sameTarget;
+    }
+
+    /**
+     * Propaga reagendamento VisMed → Doctoralia via DocplannerClient.moveBooking.
+     * Premissas:
+     *  - médico NÃO muda (assumido pelo produto).
+     *  - se booking não existe mais na Doctoralia (404), marcamos sincronizado e seguimos.
+     *  - antes da chamada, verifica anti-eco (mudança causada por nós próprios).
+     */
+    private async propagateVismedRescheduleToDoctoralia(syncId: string, previousStartAt: Date): Promise<void> {
+        const rec = await this.prisma.bookingSync.findUnique({ where: { id: syncId } });
+        if (!rec) return;
+        if (rec.status === 'CANCELLED') return;
+        if (!rec.doctoraliaBookingId || !rec.doctoraliaFacilityId || !rec.doctoraliaDoctorId || !rec.doctoraliaAddressId) {
+            this.logger.debug(`[RESCHEDULE-SYNC] booking ${syncId} sem vínculo Doctoralia, nada a propagar`);
+            return;
+        }
+        if (this.isRescheduleEco(rec, rec.startAt)) {
+            this.logger.debug(`[RESCHEDULE-SYNC] eco detectado vismed→doctoralia (booking ${syncId}), skip`);
+            return;
+        }
+        if (rec.startAt.getTime() < Date.now() - 60_000) {
+            this.logger.warn(`[RESCHEDULE-SYNC] novo horário ${rec.startAt.toISOString()} é no passado, abortando propagação`);
+            await this.prisma.bookingSync.update({
+                where: { id: syncId },
+                data: { syncError: `reschedule→doctoralia: novo horário no passado`.slice(0, 500) },
+            });
+            return;
+        }
+        if (!rec.addressServiceId) {
+            this.logger.warn(`[RESCHEDULE-SYNC] booking ${syncId} sem addressServiceId, não dá para mover na Doctoralia`);
+            await this.prisma.bookingSync.update({
+                where: { id: syncId },
+                data: { syncError: `reschedule→doctoralia: missing addressServiceId`.slice(0, 500) },
+            });
+            return;
+        }
+
+        const conn = await this.prisma.integrationConnection.findFirst({
+            where: { clinicId: rec.clinicId, provider: 'doctoralia', status: 'connected' },
+        });
+        if (!conn || !conn.clientId) {
+            this.logger.warn(`[RESCHEDULE-SYNC] sem conexão Doctoralia para clínica ${rec.clinicId}`);
+            return;
+        }
+
+        const client = this.docplannerService.createClient(
+            conn.domain || 'doctoralia.com.br',
+            conn.clientId,
+            conn.clientSecret || '',
+        );
+
+        const { dateStr, timeStr } = this.extractBrtDateTime(rec.startAt);
+        const startStr = `${dateStr}T${timeStr}:00-03:00`;
+        const duration = rec.duration ?? Math.max(5, Math.round((rec.endAt.getTime() - rec.startAt.getTime()) / 60000));
+        const addressServiceId = parseInt(rec.addressServiceId, 10);
+        if (!addressServiceId) {
+            this.logger.warn(`[RESCHEDULE-SYNC] addressServiceId inválido (${rec.addressServiceId})`);
+            return;
+        }
+
+        // Anti-eco PREVENTIVO: marca a intenção antes da chamada externa, assim o webhook
+        // booking-moved que volta como confirmação já encontra o flag.
+        await this.prisma.bookingSync.update({
+            where: { id: syncId },
+            data: {
+                lastMoveBy: 'VISMED',
+                lastMoveAt: new Date(),
+                lastMoveTargetStartAt: rec.startAt,
+            },
+        });
+
+        try {
+            this.logger.log(
+                `[RESCHEDULE-SYNC] VisMed→Doctoralia: moveBooking ${rec.doctoraliaBookingId} de ${previousStartAt.toISOString()} → ${rec.startAt.toISOString()}`,
+            );
+            await client.moveBooking(rec.doctoraliaFacilityId, rec.doctoraliaDoctorId, rec.doctoraliaAddressId, rec.doctoraliaBookingId, {
+                address_service_id: addressServiceId,
+                duration,
+                start: startStr,
+            });
+            await this.prisma.bookingSync.update({
+                where: { id: syncId },
+                data: {
+                    status: 'BOOKED',
+                    syncedToDoctoralia: true,
+                    syncError: null,
+                    processedAt: new Date(),
+                },
+            });
+            this.logger.log(`[RESCHEDULE-SYNC] OK booking ${rec.doctoraliaBookingId} movido na Doctoralia`);
+        } catch (err: any) {
+            const msg = err?.message || String(err);
+            const status = err?.status || err?.response?.status;
+            const is404 = status === 404 || /\b404\b/.test(msg) || /not.*found/i.test(msg);
+            if (is404) {
+                this.logger.log(`[RESCHEDULE-SYNC] booking ${rec.doctoraliaBookingId} não existe mais na Doctoralia (404), marcando como sincronizado`);
+                await this.prisma.bookingSync.update({
+                    where: { id: syncId },
+                    data: {
+                        status: 'BOOKED',
+                        syncedToDoctoralia: true,
+                        syncError: null,
+                        processedAt: new Date(),
+                    },
+                });
+                return;
+            }
+            this.logger.error(`[RESCHEDULE-SYNC] FALHA ao mover ${rec.doctoraliaBookingId} na Doctoralia: ${msg}`);
+            await this.prisma.bookingSync.update({
+                where: { id: syncId },
+                data: {
+                    syncedToDoctoralia: false,
+                    syncError: `reschedule→doctoralia: ${msg}`.slice(0, 500),
+                },
+            });
+        }
+    }
+
+    /**
+     * Propaga reagendamento Doctoralia → VisMed. Como a VisMed NÃO tem endpoint de
+     * mover, fazemos: (1) cria novo agendamento no horário novo, (2) cancela o velho.
+     * Ordem: criar primeiro evita perder o booking se a criação falhar (no pior caso
+     * temos duplicação temporária com o mesmo médico — anti-eco do cancel pega o velho).
+     */
+    private async propagateDoctoraliaRescheduleToVismed(syncId: string, previousVismedAppointmentId: string | null): Promise<void> {
+        const rec = await this.prisma.bookingSync.findUnique({ where: { id: syncId } });
+        if (!rec) return;
+        if (rec.status === 'CANCELLED') return;
+        if (!rec.vismedDoctorId) {
+            this.logger.debug(`[RESCHEDULE-SYNC] booking ${syncId} sem vismedDoctorId, nada a propagar`);
+            return;
+        }
+        if (this.isRescheduleEco(rec, rec.startAt)) {
+            this.logger.debug(`[RESCHEDULE-SYNC] eco detectado doctoralia→vismed (booking ${syncId}), skip`);
+            return;
+        }
+        if (rec.startAt.getTime() < Date.now() - 60_000) {
+            this.logger.warn(`[RESCHEDULE-SYNC] novo horário ${rec.startAt.toISOString()} é no passado, abortando propagação`);
+            await this.prisma.bookingSync.update({
+                where: { id: syncId },
+                data: { syncError: `reschedule→vismed: novo horário no passado`.slice(0, 500) },
+            });
+            return;
+        }
+
+        const conn = await this.prisma.integrationConnection.findFirst({
+            where: { clinicId: rec.clinicId, provider: 'vismed', status: 'connected' },
+        });
+        if (!conn || !conn.clientId) {
+            this.logger.warn(`[RESCHEDULE-SYNC] sem conexão VisMed para clínica ${rec.clinicId}`);
+            return;
+        }
+
+        // Reusa o construtor de payload do createVismedAppointment, simulando o objeto booking.
+        const fakeBooking: any = {
+            id: rec.doctoraliaBookingId || `local-${rec.id}`,
+            start_at: rec.startAt.toISOString(),
+            patient: {
+                name: rec.patientName,
+                surname: rec.patientSurname,
+                phone: rec.patientPhone,
+                nin: rec.patientCpf,
+                birth_date: rec.patientBirthDate,
+                gender: rec.patientGender,
+            },
+        };
+        const fakeMapping: any = { vismedId: rec.vismedDoctorId };
+
+        // Anti-eco PREVENTIVO + sinaliza intenção de move (em caso de crash, próximo poll
+        // pode reconciliar). Marca syncError como 'in-progress' para diagnóstico.
+        await this.prisma.bookingSync.update({
+            where: { id: syncId },
+            data: {
+                lastMoveBy: 'DOCTORALIA',
+                lastMoveAt: new Date(),
+                lastMoveTargetStartAt: rec.startAt,
+                syncError: `reschedule→vismed: in-progress (apptIdAntigo=${previousVismedAppointmentId ?? 'null'})`.slice(0, 500),
+            },
+        });
+
+        let novoIdpacienteagendamento: string | null = null;
+        try {
+            this.logger.log(
+                `[RESCHEDULE-SYNC] Doctoralia→VisMed: criando novo agendamento em ${rec.startAt.toISOString()} (substitui apptId=${previousVismedAppointmentId})`,
+            );
+            const created = await this.createVismedAppointment(rec.clinicId, fakeMapping, fakeBooking, null);
+            const novoId = (created as any)?.idpacienteagendamento || (created as any)?.id || (created as any)?.idPacienteAgendamento;
+            if (novoId) novoIdpacienteagendamento = String(novoId);
+            this.logger.log(`[RESCHEDULE-SYNC] Novo agendamento VisMed criado: id=${novoIdpacienteagendamento ?? '(não retornado)'}`);
+        } catch (err: any) {
+            const msg = err?.message || String(err);
+            this.logger.error(`[RESCHEDULE-SYNC] FALHA ao criar novo agendamento VisMed: ${msg}`);
+            await this.prisma.bookingSync.update({
+                where: { id: syncId },
+                data: {
+                    syncedToVismed: false,
+                    syncError: `reschedule→vismed (create): ${msg}`.slice(0, 500),
+                },
+            });
+            return; // não cancela o velho se a criação falhou
+        }
+
+        // PASSO 1: persiste o novo vismedAppointmentId IMEDIATAMENTE após o create,
+        // antes de cancelar o velho. Se cair entre create e este update, ainda perdemos
+        // a referência — mitigado pelo orphan reconcile (vide upsertVismedAppointment).
+        if (novoIdpacienteagendamento) {
+            await this.prisma.bookingSync.update({
+                where: { id: syncId },
+                data: { vismedAppointmentId: novoIdpacienteagendamento },
+            });
+        }
+
+        // PASSO 2: cancela o agendamento antigo. Falha aqui é menos grave — o novo
+        // agendamento já existe — mas mantemos o erro persistido em syncError para
+        // intervenção manual / monitoramento (não há retry automático do cancel ainda).
+        let pendingCancelError: string | null = null;
+        if (previousVismedAppointmentId) {
+            try {
+                await this.vismedService.cancelarAgendamento(previousVismedAppointmentId, conn.domain || undefined);
+                this.logger.log(`[RESCHEDULE-SYNC] Agendamento VisMed antigo ${previousVismedAppointmentId} cancelado`);
+            } catch (err: any) {
+                const msg = err?.message || String(err);
+                const status = err?.status || err?.response?.status;
+                const is404 = status === 404 || /\b404\b/.test(msg) || /not.*found|inexist/i.test(msg);
+                if (!is404) {
+                    this.logger.error(
+                        `[RESCHEDULE-SYNC] *** AGENDAMENTO ANTIGO NÃO CANCELADO *** apptId=${previousVismedAppointmentId} clinicId=${rec.clinicId}: ${msg} — INTERVENÇÃO MANUAL pode ser necessária (novo agendamento já criado em ${rec.startAt.toISOString()})`,
+                    );
+                    pendingCancelError = `reschedule→vismed: novo agendamento OK mas cancel do antigo (id=${previousVismedAppointmentId}) falhou: ${msg}`;
+                }
+            }
+        }
+
+        // PASSO 3: marca como sincronizado. Mantém syncError se houver problema pendente.
+        const finalErrorBits: string[] = [];
+        if (!novoIdpacienteagendamento) finalErrorBits.push('novo agendamento criado mas API não retornou id');
+        if (pendingCancelError) finalErrorBits.push(pendingCancelError);
+        await this.prisma.bookingSync.update({
+            where: { id: syncId },
+            data: {
+                status: 'BOOKED',
+                syncedToVismed: !!novoIdpacienteagendamento,
+                syncError: finalErrorBits.length ? finalErrorBits.join(' | ').slice(0, 500) : null,
+                processedAt: new Date(),
+            },
+        });
+        this.logger.log(`[RESCHEDULE-SYNC] OK reagendamento Doctoralia→VisMed concluído para booking ${syncId}`);
     }
 
     /**
@@ -940,21 +1268,51 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             where: { doctoraliaBookingId: String(booking.id) },
         });
 
-        if (existing) {
+        if (!existing) {
+            this.logger.warn(`[BOOKING-MOVED] booking ${booking.id} não encontrado no BookingSync, ignorando`);
+            return { processed: false, reason: 'not_found' };
+        }
+
+        const previousVismedAppointmentId = existing.vismedAppointmentId;
+        const newStartAt = new Date(booking.start_at);
+        const newEndAt = new Date(booking.end_at);
+
+        // Idempotência: notificação repetida com mesmo horário → no-op (apenas refresh do payload).
+        if (existing.startAt.getTime() === newStartAt.getTime()) {
             await this.prisma.bookingSync.update({
                 where: { id: existing.id },
-                data: {
-                    status: 'MOVED',
-                    startAt: new Date(booking.start_at),
-                    endAt: new Date(booking.end_at),
-                    doctoraliaDoctorId: String(data.doctor?.id || existing.doctoraliaDoctorId),
-                    doctoraliaAddressId: String(data.address?.id || existing.doctoraliaAddressId),
-                    rawPayload: rawNotification,
-                    processedAt: new Date(),
-                },
+                data: { rawPayload: rawNotification, processedAt: new Date() },
             });
-            this.logger.log(`[BOOKING-MOVED] Updated booking ${booking.id} to new time ${booking.start_at}`);
+            this.logger.debug(`[BOOKING-MOVED] booking ${booking.id} sem mudança de horário (${booking.start_at}), no-op`);
+            return { processed: true, action: 'booking_moved', noop: true };
         }
+
+        const updated = await this.prisma.bookingSync.update({
+            where: { id: existing.id },
+            data: {
+                status: 'BOOKED', // estado vivo após o move; helper marcará novamente após propagação
+                startAt: newStartAt,
+                endAt: newEndAt,
+                doctoraliaDoctorId: String(data.doctor?.id || existing.doctoraliaDoctorId),
+                doctoraliaAddressId: String(data.address?.id || existing.doctoraliaAddressId),
+                rawPayload: rawNotification,
+                processedAt: new Date(),
+            },
+        });
+        this.logger.log(
+            `[BOOKING-MOVED] booking ${booking.id} movido para ${booking.start_at} (vismedApptIdAntigo=${previousVismedAppointmentId})`,
+        );
+
+        // Anti-eco: se nós acabamos de mover esse booking para esse mesmo horário (VisMed→Doctoralia),
+        // a Doctoralia vai emitir booking-moved como confirmação — não devemos repetir do nosso lado.
+        if (this.isRescheduleEco(updated, newStartAt)) {
+            this.logger.debug(`[RESCHEDULE-SYNC] eco da Doctoralia para booking ${updated.id}, skip propagação para VisMed`);
+            return { processed: true, action: 'booking_moved', echoed: true };
+        }
+
+        await this.propagateDoctoraliaRescheduleToVismed(updated.id, previousVismedAppointmentId).catch((err) =>
+            this.logger.warn(`[RESCHEDULE-SYNC] propagate doctoralia→vismed failed: ${err.message}`),
+        );
 
         return { processed: true, action: 'booking_moved' };
     }
