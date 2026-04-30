@@ -458,6 +458,8 @@ model BookingSync {
   rawPayload            Json?
   syncedToVismed        Boolean           @default(false)
   syncedToDoctoralia    Boolean           @default(false)
+  cancelledBy           String?           // VISMED | DOCTORALIA | INTEGRATION (anti-loop)
+  cancelledAt           DateTime?
   syncError             String?
   processedAt           DateTime?
   createdAt             DateTime          @default(now())

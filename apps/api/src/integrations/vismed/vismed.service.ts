@@ -52,6 +52,53 @@ export class VismedService {
         });
     }
 
+    private postFormData(path: string, fields: Record<string, string | number>, baseUrl?: string): Promise<any> {
+        return new Promise((resolve, reject) => {
+            const url = this.buildApiUrl(path, baseUrl);
+            const boundary = `----vismed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+            const parts: string[] = [];
+            for (const [k, v] of Object.entries(fields)) {
+                parts.push(`--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${String(v)}\r\n`);
+            }
+            parts.push(`--${boundary}--\r\n`);
+            const body = Buffer.from(parts.join(''), 'utf8');
+
+            this.logger.log(`[VISMED-API] POST (multipart) ${url} fields=${Object.keys(fields).join(',')}`);
+
+            const parsed = new URL(url);
+            const options: https.RequestOptions = {
+                hostname: parsed.hostname,
+                port: parsed.port || 443,
+                path: parsed.pathname + parsed.search,
+                method: 'POST',
+                headers: {
+                    'Content-Type': `multipart/form-data; boundary=${boundary}`,
+                    'Content-Length': body.length,
+                },
+            };
+
+            const req = https.request(options, (res) => {
+                let data = '';
+                res.on('data', (chunk) => { data += chunk; });
+                res.on('end', () => {
+                    if (res.statusCode && res.statusCode >= 400) {
+                        return reject(new Error(`HTTP ${res.statusCode}: ${data}`));
+                    }
+                    try {
+                        const json = JSON.parse(data);
+                        resolve(json);
+                    } catch (e) {
+                        resolve({ raw: data, statusCode: res.statusCode });
+                    }
+                });
+            });
+
+            req.on('error', (e) => { reject(e); });
+            req.write(body);
+            req.end();
+        });
+    }
+
     private postData(path: string, body: Record<string, any>, baseUrl?: string): Promise<any> {
         return new Promise((resolve, reject) => {
             const url = this.buildApiUrl(path, baseUrl);
@@ -180,6 +227,19 @@ export class VismedService {
             return await this.requestData(path, actualBase);
         } catch (error) {
             this.logger.error(`Erro ao buscar agendamentos VisMed: ${error.message}`);
+            throw error;
+        }
+    }
+
+    async cancelarAgendamento(idPacienteAgendamento: number | string, baseUrl?: string): Promise<any> {
+        try {
+            const id = String(idPacienteAgendamento).trim();
+            if (!id) throw new Error('idPacienteAgendamento vazio');
+            this.logger.log(`Cancelando agendamento VisMed id=${id}`);
+            const actualBase = baseUrl || 'https://app.vissmed.com.br/api-vissmed-4';
+            return await this.postFormData('delete-agendamento', { id }, actualBase);
+        } catch (error) {
+            this.logger.error(`Erro ao cancelar agendamento VisMed id=${idPacienteAgendamento}: ${error.message}`);
             throw error;
         }
     }

@@ -271,6 +271,9 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             where: { clinicId_vismedAppointmentId: { clinicId, vismedAppointmentId } },
         });
 
+        const previousStatus = existingByVismedId?.status ?? null;
+        const previousCancelledBy = existingByVismedId?.cancelledBy ?? null;
+
         if (!existingByVismedId && doctor?.id) {
             const windowMs = 60 * 1000;
             const orphan = await this.prisma.bookingSync.findFirst({
@@ -303,6 +306,11 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 await this.syncDoctoraliaBreak(updated.id).catch((err) =>
                     this.logger.warn(`[VISMED-POLL] break sync failed (orphan): ${err.message}`),
                 );
+                if (status === 'CANCELLED') {
+                    await this.propagateVismedCancellationToDoctoralia(updated.id).catch((err) =>
+                        this.logger.warn(`[CANCEL-SYNC] propagate vismed→doctoralia failed (orphan): ${err.message}`),
+                    );
+                }
                 return true;
             }
         }
@@ -342,7 +350,183 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             this.logger.warn(`[VISMED-POLL] break sync failed: ${err.message}`),
         );
 
+        // Sempre que o status for CANCELLED, tentar propagar para a Doctoralia.
+        // O helper é idempotente: faz no-op se já foi cancelado por nós/Doctoralia ou
+        // se já está marcado como sincronizado. Em caso de falha anterior (syncedToDoctoralia=false),
+        // a próxima rodada de poll re-tentará automaticamente.
+        // (previousStatus/previousCancelledBy mantidos só para diagnóstico futuro)
+        void previousStatus; void previousCancelledBy;
+        if (status === 'CANCELLED') {
+            await this.propagateVismedCancellationToDoctoralia(upserted.id).catch((err) =>
+                this.logger.warn(`[CANCEL-SYNC] propagate vismed→doctoralia failed: ${err.message}`),
+            );
+        }
+
         return true;
+    }
+
+    /**
+     * Cancela na Doctoralia um booking que foi cancelado na VisMed.
+     * Idempotente: trata 404 como sucesso (já cancelado).
+     */
+    private async propagateVismedCancellationToDoctoralia(syncId: string): Promise<void> {
+        const rec = await this.prisma.bookingSync.findUnique({ where: { id: syncId } });
+        if (!rec) return;
+        if (rec.status !== 'CANCELLED') return;
+        // Anti-loop: se o cancelamento original veio da Doctoralia ou de nós cancelando lá,
+        // não devemos chamar cancelBooking de novo na Doctoralia.
+        if (rec.cancelledBy === 'DOCTORALIA' || rec.cancelledBy === 'INTEGRATION') {
+            this.logger.debug(`[CANCEL-SYNC] booking ${syncId} já cancelado por ${rec.cancelledBy}, skip eco vismed→doctoralia`);
+            return;
+        }
+        // Já sincronizado com sucesso no passado: nada a fazer.
+        if (rec.syncedToDoctoralia && rec.cancelledBy === 'VISMED') {
+            this.logger.debug(`[CANCEL-SYNC] booking ${syncId} já propagado para Doctoralia, skip`);
+            return;
+        }
+        if (!rec.doctoraliaBookingId || !rec.doctoraliaFacilityId || !rec.doctoraliaDoctorId || !rec.doctoraliaAddressId) {
+            this.logger.debug(`[CANCEL-SYNC] booking ${syncId} sem vínculo Doctoralia, nada a cancelar lá`);
+            await this.prisma.bookingSync.update({
+                where: { id: syncId },
+                data: { cancelledBy: 'VISMED', cancelledAt: rec.cancelledAt ?? new Date() },
+            });
+            return;
+        }
+
+        const conn = await this.prisma.integrationConnection.findFirst({
+            where: { clinicId: rec.clinicId, provider: 'doctoralia', status: 'connected' },
+        });
+        if (!conn || !conn.clientId) {
+            this.logger.warn(`[CANCEL-SYNC] sem conexão Doctoralia para clínica ${rec.clinicId}`);
+            return;
+        }
+
+        const client = this.docplannerService.createClient(
+            conn.domain || 'doctoralia.com.br',
+            conn.clientId,
+            conn.clientSecret || '',
+        );
+
+        try {
+            this.logger.log(
+                `[CANCEL-SYNC] VisMed→Doctoralia: cancelando booking ${rec.doctoraliaBookingId} (clinic=${rec.clinicId}, vismedApptId=${rec.vismedAppointmentId})`,
+            );
+            await client.cancelBooking(
+                rec.doctoraliaFacilityId,
+                rec.doctoraliaDoctorId,
+                rec.doctoraliaAddressId,
+                rec.doctoraliaBookingId,
+                'Cancelado via integração VisMed↔Doctoralia',
+            );
+            await this.prisma.bookingSync.update({
+                where: { id: syncId },
+                data: {
+                    cancelledBy: 'VISMED',
+                    cancelledAt: rec.cancelledAt ?? new Date(),
+                    syncedToDoctoralia: true,
+                    syncError: null,
+                    processedAt: new Date(),
+                },
+            });
+            this.logger.log(`[CANCEL-SYNC] OK booking ${rec.doctoraliaBookingId} cancelado na Doctoralia`);
+        } catch (err: any) {
+            const msg = err?.message || String(err);
+            const status = err?.status || err?.response?.status;
+            const is404 = status === 404 || /\b404\b/.test(msg) || /not.*found/i.test(msg);
+            if (is404) {
+                this.logger.log(`[CANCEL-SYNC] booking ${rec.doctoraliaBookingId} já não existe na Doctoralia (404), marcando como sincronizado`);
+                await this.prisma.bookingSync.update({
+                    where: { id: syncId },
+                    data: {
+                        cancelledBy: 'VISMED',
+                        cancelledAt: rec.cancelledAt ?? new Date(),
+                        syncedToDoctoralia: true,
+                        syncError: null,
+                        processedAt: new Date(),
+                    },
+                });
+                return;
+            }
+            this.logger.error(`[CANCEL-SYNC] FALHA ao cancelar ${rec.doctoraliaBookingId} na Doctoralia: ${msg}`);
+            await this.prisma.bookingSync.update({
+                where: { id: syncId },
+                data: { syncError: `cancel→doctoralia: ${msg}`.slice(0, 500) },
+            });
+        }
+    }
+
+    /**
+     * Cancela na VisMed um booking que foi cancelado na Doctoralia.
+     * Idempotente: trata 404/inexistente como sucesso.
+     */
+    private async propagateDoctoraliaCancellationToVismed(syncId: string): Promise<void> {
+        const rec = await this.prisma.bookingSync.findUnique({ where: { id: syncId } });
+        if (!rec) return;
+        if (rec.status !== 'CANCELLED') return;
+        // Anti-loop: se o cancelamento original veio da VisMed ou de nós cancelando lá,
+        // não devemos chamar delete-agendamento de novo na VisMed.
+        if (rec.cancelledBy === 'VISMED' || rec.cancelledBy === 'INTEGRATION') {
+            this.logger.debug(`[CANCEL-SYNC] booking ${syncId} já cancelado por ${rec.cancelledBy}, skip eco doctoralia→vismed`);
+            return;
+        }
+        if (rec.syncedToVismed && rec.cancelledBy === 'DOCTORALIA') {
+            this.logger.debug(`[CANCEL-SYNC] booking ${syncId} já propagado para VisMed, skip`);
+            return;
+        }
+        if (!rec.vismedAppointmentId) {
+            this.logger.debug(`[CANCEL-SYNC] booking ${syncId} sem vismedAppointmentId, nada a cancelar lá`);
+            await this.prisma.bookingSync.update({
+                where: { id: syncId },
+                data: { cancelledBy: 'DOCTORALIA', cancelledAt: rec.cancelledAt ?? new Date() },
+            });
+            return;
+        }
+
+        const conn = await this.prisma.integrationConnection.findFirst({
+            where: { clinicId: rec.clinicId, provider: 'vismed', status: 'connected' },
+        });
+        const baseUrl = conn?.domain || undefined;
+
+        try {
+            this.logger.log(
+                `[CANCEL-SYNC] Doctoralia→VisMed: cancelando agendamento ${rec.vismedAppointmentId} (clinic=${rec.clinicId}, doctoraliaBookingId=${rec.doctoraliaBookingId})`,
+            );
+            await this.vismedService.cancelarAgendamento(rec.vismedAppointmentId, baseUrl);
+            await this.prisma.bookingSync.update({
+                where: { id: syncId },
+                data: {
+                    cancelledBy: 'DOCTORALIA',
+                    cancelledAt: rec.cancelledAt ?? new Date(),
+                    syncedToVismed: true,
+                    syncError: null,
+                    processedAt: new Date(),
+                },
+            });
+            this.logger.log(`[CANCEL-SYNC] OK agendamento ${rec.vismedAppointmentId} cancelado na VisMed`);
+        } catch (err: any) {
+            const msg = err?.message || String(err);
+            const status = err?.status || err?.response?.status;
+            const is404 = status === 404 || /\b404\b/.test(msg) || /not.*found|inexist/i.test(msg);
+            if (is404) {
+                this.logger.log(`[CANCEL-SYNC] agendamento ${rec.vismedAppointmentId} já não existe na VisMed, marcando como sincronizado`);
+                await this.prisma.bookingSync.update({
+                    where: { id: syncId },
+                    data: {
+                        cancelledBy: 'DOCTORALIA',
+                        cancelledAt: rec.cancelledAt ?? new Date(),
+                        syncedToVismed: true,
+                        syncError: null,
+                        processedAt: new Date(),
+                    },
+                });
+                return;
+            }
+            this.logger.error(`[CANCEL-SYNC] FALHA ao cancelar ${rec.vismedAppointmentId} na VisMed: ${msg}`);
+            await this.prisma.bookingSync.update({
+                where: { id: syncId },
+                data: { syncError: `cancel→vismed: ${msg}`.slice(0, 500) },
+            });
+        }
     }
 
     /**
@@ -699,8 +883,12 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             where: { doctoraliaBookingId: String(booking.id) },
         });
 
+        let syncId: string;
+        const previousStatus = existing?.status ?? null;
+        const previousCancelledBy = existing?.cancelledBy ?? null;
+
         if (existing) {
-            await this.prisma.bookingSync.update({
+            const updated = await this.prisma.bookingSync.update({
                 where: { id: existing.id },
                 data: {
                     status: 'CANCELLED',
@@ -708,9 +896,10 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                     processedAt: new Date(),
                 },
             });
+            syncId = updated.id;
             this.logger.log(`[BOOKING-CANCELED] Marked booking ${booking.id} as CANCELLED`);
         } else {
-            await this.prisma.bookingSync.create({
+            const created = await this.prisma.bookingSync.create({
                 data: {
                     clinicId,
                     doctoraliaDoctorId: String(data.doctor?.id || ''),
@@ -729,7 +918,16 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                     processedAt: new Date(),
                 },
             });
+            syncId = created.id;
         }
+
+        // Propaga para VisMed. O helper é idempotente:
+        //  - faz no-op se já foi cancelado por nós/VisMed (anti-loop)
+        //  - retenta se uma tentativa anterior falhou (syncedToVismed=false)
+        void previousStatus; void previousCancelledBy;
+        await this.propagateDoctoraliaCancellationToVismed(syncId).catch((err) =>
+            this.logger.warn(`[CANCEL-SYNC] propagate doctoralia→vismed failed: ${err.message}`),
+        );
 
         return { processed: true, action: 'booking_canceled' };
     }
