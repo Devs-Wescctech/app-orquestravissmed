@@ -438,6 +438,142 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         return true;
     }
 
+    /**
+     * Espelho de tryAdoptVismedReplacement no lado Doctoralia. Quando a Doctoralia
+     * faz cancel+create internamente em um moveBooking, o doctoraliaBookingId antigo
+     * fica CANCELLED e um novo aparece ATIVO no horário-alvo. Tentamos adotar esse
+     * novo id (rebind no rec existente) em vez de propagar o "cancel" para a VisMed.
+     * Retorna true se adotou (pular cancelamento).
+     */
+    private async tryAdoptDoctoraliaReplacement(
+        rec: {
+            id: string;
+            clinicId: string;
+            doctoraliaDoctorId: string | null;
+            doctoraliaAddressId: string | null;
+            doctoraliaBookingId: string | null;
+            patientName: string | null;
+            patientPhone: string | null;
+            lastMoveAt: Date | null;
+            lastMoveTargetStartAt: Date | null;
+        },
+        liveActive: any[],
+    ): Promise<boolean> {
+        if (!rec.doctoraliaBookingId || !rec.lastMoveTargetStartAt || !rec.lastMoveAt) return false;
+        const tolMs = 2 * 60 * 1000;
+        const targetMs = rec.lastMoveTargetStartAt.getTime();
+        const oldDocId = rec.doctoraliaBookingId;
+
+        // Helper para fingerprint de paciente.
+        const normPhone = (p: any): string => {
+            const digits = String(p || '').replace(/\D/g, '');
+            // Telefone forte: exige pelo menos 9 dígitos (DDD+8 ou número móvel BR completo).
+            if (digits.length < 9) return '';
+            return digits.slice(-9);
+        };
+        const normName = (n: any): string => {
+            const s = String(n || '').trim().toLowerCase();
+            if (!s || s.length < 4) return '';
+            // Rejeita qualquer placeholder iniciado por "paciente" (paciente, paciente teste,
+            // paciente123, pacientex, etc.).
+            if (/^paciente/.test(s)) return '';
+            return s;
+        };
+        const recPhone = normPhone(rec.patientPhone);
+        const recName = normName(rec.patientName);
+
+        // Adoção EXIGE fingerprint forte (telefone últimos 9 dígitos ou nome
+        // não-genérico). Sem isso, abortamos e deixamos o grace + fluxo normal
+        // de cancel decidirem — evita rebind a booking de outro paciente que
+        // coincidentemente caiu no mesmo slot.
+        if (!recPhone && !recName) {
+            this.logger.debug(
+                `[RECONCILE-CANCEL] adopt-skip ${oldDocId}: rec sem fingerprint forte de paciente`,
+            );
+            return false;
+        }
+
+        const candidate = liveActive.find((b: any) => {
+            const bid = b?.id ? String(b.id) : null;
+            if (!bid || bid === oldDocId) return false;
+            const startStr = b?.start_at || b?.startAt;
+            if (!startStr) return false;
+            const t = new Date(startStr).getTime();
+            if (Math.abs(t - targetMs) > tolMs) return false;
+            const candPhone = normPhone(b?.patient?.phone);
+            const candName = normName(b?.patient?.name);
+            const phoneMatch = !!recPhone && !!candPhone && recPhone === candPhone;
+            const nameMatch =
+                !!recName &&
+                !!candName &&
+                (candName.includes(recName) || recName.includes(candName));
+            return phoneMatch || nameMatch;
+        });
+        if (!candidate) return false;
+
+        const newDocId = String(candidate.id);
+
+        try {
+            await this.prisma.$transaction(async tx => {
+                const fresh = await tx.bookingSync.findUnique({ where: { id: rec.id } });
+                if (!fresh) throw new Error('rec desapareceu');
+                if (fresh.doctoraliaBookingId !== oldDocId) {
+                    throw new Error(`doctoraliaBookingId mudou (${oldDocId} → ${fresh.doctoraliaBookingId})`);
+                }
+                if (fresh.status !== 'BOOKED' && fresh.status !== 'CONFIRMED' && fresh.status !== 'PROCESSING') {
+                    throw new Error(`status mudou (${fresh.status})`);
+                }
+                // Re-verifica colisão DENTRO da tx e só remove se o registro
+                // colisor parecer mesmo um órfão recém-criado pelo webhook
+                // booking-moved (sem vismedAppointmentId, status ativo, criado
+                // depois de lastMoveAt).
+                const collision = await tx.bookingSync.findFirst({
+                    where: {
+                        clinicId: rec.clinicId,
+                        doctoraliaBookingId: newDocId,
+                        id: { not: rec.id },
+                    },
+                });
+                if (collision) {
+                    const isOrphanFromMove =
+                        !collision.vismedAppointmentId &&
+                        (collision.status === 'BOOKED' || collision.status === 'CONFIRMED' || collision.status === 'PROCESSING') &&
+                        rec.lastMoveAt !== null &&
+                        collision.createdAt.getTime() >= rec.lastMoveAt.getTime() - 60 * 1000;
+                    if (!isOrphanFromMove) {
+                        throw new Error(
+                            `colisão com BookingSync ${collision.id} não-órfão (vismedApptId=${collision.vismedAppointmentId}, status=${collision.status})`,
+                        );
+                    }
+                    await tx.bookingSync.delete({ where: { id: collision.id } });
+                }
+                await tx.bookingSync.update({
+                    where: { id: rec.id },
+                    data: {
+                        doctoraliaBookingId: newDocId,
+                        syncedToDoctoralia: true,
+                        syncError: null,
+                        processedAt: new Date(),
+                        lastMoveBy: null,
+                        lastMoveAt: null,
+                        lastMoveTargetStartAt: null,
+                    },
+                });
+            });
+        } catch (err: any) {
+            this.logger.debug(
+                `[RECONCILE-CANCEL] adopt-replacement abortado para ${oldDocId}: ${err.message}`,
+            );
+            return false;
+        }
+
+        this.logger.log(
+            `[RECONCILE-CANCEL] ADOPTED replacement: BookingSync ${rec.id} ` +
+                `doctoraliaBookingId ${oldDocId} → ${newDocId}`,
+        );
+        return true;
+    }
+
     private async reconcileUnlinkedWithDoctoralia(clinicId: string) {
         const unlinked = await this.prisma.bookingSync.findMany({
             where: {
@@ -600,12 +736,10 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                         toBrtIso(maxEndDate),
                     );
 
-                    const liveBookings = res?._items || (Array.isArray(res) ? res : []);
-                    const liveIds = new Set(
-                        (Array.isArray(liveBookings) ? liveBookings : [])
-                            .filter((b: any) => !this.isDoctoraliaCancelled(b))
-                            .map((b: any) => String(b.id)),
-                    );
+                    const liveBookings = (res?._items || (Array.isArray(res) ? res : [])) as any[];
+                    const liveActive = (Array.isArray(liveBookings) ? liveBookings : [])
+                        .filter((b: any) => !this.isDoctoraliaCancelled(b));
+                    const liveIds = new Set(liveActive.map((b: any) => String(b.id)));
 
                     const cancelledIds = new Set(
                         (Array.isArray(liveBookings) ? liveBookings : [])
@@ -619,19 +753,34 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                         if (liveIds.has(rec.doctoraliaBookingId)) continue;
 
                         // Anti-race: depois de um moveBooking nosso (VisMed→Doctoralia), a Doctoralia
-                        // troca o ID do booking. O ID antigo some da listagem ANTES do webhook
-                        // booking-moved chegar com o novo ID. Sem esse grace, o reconcile interpreta
-                        // como cancelamento e cancela na VisMed o que acabamos de mover. Aguarda 3min.
-                        const RECONCILE_MOVE_GRACE_MS = 3 * 60 * 1000;
-                        if (
-                            rec.lastMoveBy === 'VISMED' &&
-                            rec.lastMoveAt &&
-                            Date.now() - rec.lastMoveAt.getTime() < RECONCILE_MOVE_GRACE_MS
-                        ) {
-                            this.logger.debug(
-                                `[RECONCILE-CANCEL] Booking ${rec.doctoraliaBookingId} dentro da janela de grace pós-moveBooking VisMed→Doctoralia, aguardando webhook booking-moved`,
-                            );
-                            continue;
+                        // faz cancel+create internamente — o ID antigo fica CANCELLED e um novo ID
+                        // ativo aparece no horário-alvo. Sem proteção, propagamos esse "cancel" para
+                        // a VisMed e excluímos o agendamento que o usuário acabou de remarcar.
+                        if (rec.lastMoveBy === 'VISMED' && rec.lastMoveAt) {
+                            // Tenta adoção apenas se temos target — sem target não dá pra
+                            // identificar o replacement com segurança.
+                            if (rec.lastMoveTargetStartAt) {
+                                const adopted = await this.tryAdoptDoctoraliaReplacement(
+                                    rec,
+                                    liveActive,
+                                ).catch(err => {
+                                    this.logger.warn(
+                                        `[RECONCILE-CANCEL] adopt-replacement falhou para ${rec.doctoraliaBookingId}: ${err.message}`,
+                                    );
+                                    return false;
+                                });
+                                if (adopted) continue;
+                            }
+
+                            // Grace de 10 min sempre vale enquanto lastMoveAt for recente —
+                            // webhook booking-moved da Doctoralia pode atrasar bastante.
+                            const RECONCILE_MOVE_GRACE_MS = 10 * 60 * 1000;
+                            if (Date.now() - rec.lastMoveAt.getTime() < RECONCILE_MOVE_GRACE_MS) {
+                                this.logger.debug(
+                                    `[RECONCILE-CANCEL] SKIP ${rec.doctoraliaBookingId} — VISMED move há ${Math.round((Date.now() - rec.lastMoveAt.getTime()) / 1000)}s, sem replacement (grace ${RECONCILE_MOVE_GRACE_MS / 1000}s)`,
+                                );
+                                continue;
+                            }
                         }
 
                         if (!cancelledIds.has(rec.doctoraliaBookingId)) {
@@ -646,8 +795,14 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                         );
 
                         try {
-                            await this.prisma.bookingSync.update({
-                                where: { id: rec.id },
+                            const updated = await this.prisma.bookingSync.updateMany({
+                                where: {
+                                    id: rec.id,
+                                    // Guard otimista: só cancela se doctoraliaBookingId não foi
+                                    // adotado/rebind por outro poll concorrente.
+                                    doctoraliaBookingId: rec.doctoraliaBookingId,
+                                    status: { in: ['BOOKED', 'CONFIRMED', 'PROCESSING'] },
+                                },
                                 data: {
                                     status: 'CANCELLED',
                                     cancelledBy: 'DOCTORALIA',
@@ -656,6 +811,12 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                                     processedAt: new Date(),
                                 },
                             });
+                            if (updated.count === 0) {
+                                this.logger.debug(
+                                    `[RECONCILE-CANCEL] ${rec.doctoraliaBookingId} já mudou (adopt/cancel concorrente), pulando propagação`,
+                                );
+                                continue;
+                            }
                             await this.propagateDoctoraliaCancellationToVismed(rec.id);
                         } catch (err: any) {
                             this.logger.warn(`[RECONCILE-CANCEL] propagate failed for ${rec.doctoraliaBookingId}, will retry next cycle: ${err.message}`);
