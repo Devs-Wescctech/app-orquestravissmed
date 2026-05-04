@@ -213,6 +213,10 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             await this.reconcileUnlinkedWithDoctoralia(conn.clinicId).catch(err =>
                 this.logger.warn(`[RECONCILE] Error: ${err.message}`),
             );
+
+            await this.reconcileCancelledOnDoctoralia(conn.clinicId).catch(err =>
+                this.logger.warn(`[RECONCILE-CANCEL] Error: ${err.message}`),
+            );
         } catch (err: any) {
             this.logger.warn(`[VISMED-POLL] Error polling clinic ${conn.clinicId}: ${err.message}`);
         }
@@ -324,6 +328,113 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         }
     }
 
+    private async reconcileCancelledOnDoctoralia(clinicId: string) {
+        const linked = await this.prisma.bookingSync.findMany({
+            where: {
+                clinicId,
+                doctoraliaBookingId: { not: null },
+                status: { in: ['BOOKED', 'CONFIRMED', 'PROCESSING'] },
+                startAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
+            },
+        });
+
+        if (linked.length === 0) return;
+
+        const docConn = await this.prisma.integrationConnection.findFirst({
+            where: { clinicId, provider: 'doctoralia', status: 'connected' },
+        });
+        if (!docConn?.clientId) return;
+
+        const client = this.docplannerService.createClient(
+            docConn.domain || 'doctoralia.com.br',
+            docConn.clientId,
+            docConn.clientSecret || '',
+        );
+
+        const doctorIds = [...new Set(linked.map(r => r.doctoraliaDoctorId!).filter(Boolean))];
+
+        for (const doctorId of doctorIds) {
+            const doctorLinked = linked.filter(r => r.doctoraliaDoctorId === doctorId);
+            if (doctorLinked.length === 0) continue;
+
+            const minStartDate = new Date(Math.min(...doctorLinked.map(r => r.startAt.getTime())) - 24 * 60 * 60 * 1000);
+            const maxEndDate = new Date(Math.max(...doctorLinked.map(r => r.startAt.getTime())) + 24 * 60 * 60 * 1000);
+            const toBrtIso = (d: Date) => {
+                const offset = -3;
+                const local = new Date(d.getTime() + offset * 60 * 60 * 1000);
+                return local.toISOString().replace(/\.\d{3}Z$/, '-03:00');
+            };
+
+            const addresses = await this.prisma.bookingSync.findMany({
+                where: { clinicId, doctoraliaDoctorId: doctorId, doctoraliaAddressId: { not: null } },
+                select: { doctoraliaAddressId: true, doctoraliaFacilityId: true },
+                distinct: ['doctoraliaAddressId'],
+            });
+
+            for (const addr of addresses) {
+                if (!addr.doctoraliaAddressId || !addr.doctoraliaFacilityId) continue;
+
+                try {
+                    await this.rateLimiter.acquire('doctoralia');
+                    const res = await client.getBookings(
+                        addr.doctoraliaFacilityId,
+                        doctorId,
+                        addr.doctoraliaAddressId,
+                        toBrtIso(minStartDate),
+                        toBrtIso(maxEndDate),
+                    );
+
+                    const liveBookings = res?._items || (Array.isArray(res) ? res : []);
+                    const liveIds = new Set(
+                        (Array.isArray(liveBookings) ? liveBookings : [])
+                            .filter((b: any) => b?.status !== 'canceled')
+                            .map((b: any) => String(b.id)),
+                    );
+
+                    const cancelledIds = new Set(
+                        (Array.isArray(liveBookings) ? liveBookings : [])
+                            .filter((b: any) => b?.status === 'canceled')
+                            .map((b: any) => String(b.id)),
+                    );
+
+                    for (const rec of doctorLinked) {
+                        if (!rec.doctoraliaBookingId) continue;
+                        if (rec.doctoraliaAddressId !== addr.doctoraliaAddressId) continue;
+                        if (liveIds.has(rec.doctoraliaBookingId)) continue;
+
+                        if (!cancelledIds.has(rec.doctoraliaBookingId)) {
+                            this.logger.debug(
+                                `[RECONCILE-CANCEL] Booking ${rec.doctoraliaBookingId} absent from API response (may be outside window or paginated), skipping`,
+                            );
+                            continue;
+                        }
+
+                        this.logger.log(
+                            `[RECONCILE-CANCEL] Booking ${rec.doctoraliaBookingId} (BookingSync ${rec.id}) confirmed cancelled on Doctoralia, propagating to VisMed`,
+                        );
+
+                        try {
+                            await this.propagateDoctoraliaCancellationToVismed(rec.id);
+                            await this.prisma.bookingSync.update({
+                                where: { id: rec.id },
+                                data: {
+                                    status: 'CANCELLED',
+                                    cancelledBy: 'DOCTORALIA',
+                                    cancelledAt: new Date(),
+                                    processedAt: new Date(),
+                                },
+                            });
+                        } catch (err: any) {
+                            this.logger.warn(`[RECONCILE-CANCEL] propagate failed for ${rec.doctoraliaBookingId}, will retry next cycle: ${err.message}`);
+                        }
+                    }
+                } catch (err: any) {
+                    this.logger.warn(`[RECONCILE-CANCEL] Failed checking bookings for doctor ${doctorId}: ${err.message}`);
+                }
+            }
+        }
+    }
+
     private async upsertVismedAppointment(clinicId: string, a: any): Promise<boolean> {
         const vismedAppointmentId = a?.idpacienteagendamento ? String(a.idpacienteagendamento) : null;
         const dataAg = a?.dataagendamento;
@@ -386,12 +497,15 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         const previousStartAt = existingByVismedId?.startAt ?? null;
 
         if (!existingByVismedId && doctor?.id) {
-            const windowMs = 60 * 1000;
+            const windowMs = 2 * 60 * 1000;
             const orphan = await this.prisma.bookingSync.findFirst({
                 where: {
                     clinicId,
-                    vismedDoctorId: doctor.id,
                     vismedAppointmentId: null,
+                    OR: [
+                        { vismedDoctorId: doctor.id },
+                        ...(doctoraliaDoctorId ? [{ doctoraliaDoctorId }] : []),
+                    ],
                     startAt: {
                         gte: new Date(startAt.getTime() - windowMs),
                         lte: new Date(startAt.getTime() + windowMs),
@@ -401,6 +515,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             });
 
             if (orphan) {
+                const isDoctoralia = orphan.origin === 'DOCTORALIA';
                 const updated = await this.prisma.bookingSync.update({
                     where: { id: orphan.id },
                     data: {
@@ -414,9 +529,13 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                         processedAt: new Date(),
                     },
                 });
-                await this.syncDoctoraliaBreak(updated.id).catch((err) =>
-                    this.logger.warn(`[VISMED-POLL] break sync failed (orphan): ${err.message}`),
-                );
+                if (!isDoctoralia) {
+                    await this.syncDoctoraliaBreak(updated.id).catch((err) =>
+                        this.logger.warn(`[VISMED-POLL] break sync failed (orphan): ${err.message}`),
+                    );
+                } else {
+                    this.logger.log(`[VISMED-POLL] Linked VisMed appt ${vismedAppointmentId} to DOCTORALIA record ${orphan.id} (no break needed)`);
+                }
                 if (status === 'CANCELLED') {
                     await this.propagateVismedCancellationToDoctoralia(updated.id).catch((err) =>
                         this.logger.warn(`[CANCEL-SYNC] propagate vismed→doctoralia failed (orphan): ${err.message}`),
@@ -479,6 +598,43 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             }
         }
 
+        const existingDoctoralia = await this.prisma.bookingSync.findFirst({
+            where: {
+                clinicId,
+                origin: 'DOCTORALIA',
+                ...(doctoraliaDoctorId ? { doctoraliaDoctorId } : { vismedDoctorId: doctor?.id || undefined }),
+                startAt: {
+                    gte: new Date(startAt.getTime() - 2 * 60 * 1000),
+                    lte: new Date(startAt.getTime() + 2 * 60 * 1000),
+                },
+                status: { not: 'CANCELLED' },
+            },
+        });
+
+        if (existingDoctoralia) {
+            const updated = await this.prisma.bookingSync.update({
+                where: { id: existingDoctoralia.id },
+                data: {
+                    vismedAppointmentId,
+                    vismedDoctorId: doctor?.id || null,
+                    status,
+                    startAt,
+                    endAt,
+                    duration: durationMin,
+                    rawPayload: a,
+                    syncedToVismed: true,
+                    processedAt: new Date(),
+                },
+            });
+            this.logger.log(`[VISMED-POLL] Linked VisMed appt ${vismedAppointmentId} to existing DOCTORALIA record ${existingDoctoralia.id} (docBookingId=${existingDoctoralia.doctoraliaBookingId})`);
+            if (status === 'CANCELLED') {
+                await this.propagateVismedCancellationToDoctoralia(updated.id).catch((err) =>
+                    this.logger.warn(`[CANCEL-SYNC] propagate vismed→doctoralia failed: ${err.message}`),
+                );
+            }
+            return true;
+        }
+
         const upserted = await this.prisma.bookingSync.upsert({
             where: { clinicId_vismedAppointmentId: { clinicId, vismedAppointmentId } },
             create: {
@@ -509,12 +665,18 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 rawPayload: a,
                 syncedToVismed: true,
                 processedAt: new Date(),
+                ...(existingByVismedId && (
+                    existingByVismedId.startAt.getTime() !== startAt.getTime() ||
+                    existingByVismedId.endAt.getTime() !== endAt.getTime()
+                ) ? { syncedToDoctoralia: false } : {}),
             },
         });
 
-        await this.syncDoctoraliaBreak(upserted.id).catch((err) =>
-            this.logger.warn(`[VISMED-POLL] break sync failed: ${err.message}`),
-        );
+        if (upserted.origin === 'VISMED') {
+            await this.syncDoctoraliaBreak(upserted.id).catch((err) =>
+                this.logger.warn(`[VISMED-POLL] break sync failed: ${err.message}`),
+            );
+        }
 
         // Sempre que o status for CANCELLED, tentar propagar para a Doctoralia.
         // O helper é idempotente: faz no-op se já foi cancelado por nós/Doctoralia ou
@@ -978,6 +1140,8 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         const rec = await this.prisma.bookingSync.findUnique({ where: { id: bookingSyncId } });
         if (!rec || rec.origin !== 'VISMED' || !rec.vismedDoctorId) return;
 
+        if (rec.syncedToDoctoralia && rec.doctoraliaBreakId && rec.status !== 'CANCELLED') return;
+
         const mapping = await this.prisma.mapping.findFirst({
             where: {
                 clinicId: rec.clinicId,
@@ -1060,6 +1224,14 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 this.logger.log(`[VISMED-POLL] Moved Doctoralia break ${rec.doctoraliaBreakId}`);
                 return;
             } catch (err: any) {
+                const isSameRange = /422/.test(String(err?.message)) && /Same Date Range/i.test(String(err?.message));
+                if (isSameRange) {
+                    await this.prisma.bookingSync.update({
+                        where: { id: rec.id },
+                        data: { syncedToDoctoralia: true },
+                    });
+                    return;
+                }
                 if (!isNotFound(err)) throw err;
                 this.logger.warn(`[VISMED-POLL] Break ${rec.doctoraliaBreakId} not found on move, will recreate`);
                 await this.prisma.bookingSync.update({
