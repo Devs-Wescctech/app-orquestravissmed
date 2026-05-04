@@ -1613,7 +1613,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
     }
 
     private async handleBookingCanceled(clinicId: string, data: any, rawNotification: any) {
-        const booking = data?.visit_booking;
+        const booking = data?.visit_booking || data?.booking || data;
         if (!booking?.id) return { processed: false, reason: 'no_booking_id' };
 
         const existing = await this.prisma.bookingSync.findUnique({
@@ -1670,7 +1670,11 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
     }
 
     private async handleBookingMoved(clinicId: string, data: any, rawNotification: any) {
-        const booking = data?.visit_booking;
+        const booking = data?.visit_booking || data?.booking || data;
+        this.logger.log(
+            `[BOOKING-MOVED] data keys: ${JSON.stringify(Object.keys(data || {}))}` +
+            `, booking.id=${booking?.id}, visit_booking=${!!data?.visit_booking}, data.booking=${!!data?.booking}`,
+        );
         if (!booking?.id) return { processed: false, reason: 'no_booking_id' };
 
         const existing = await this.prisma.bookingSync.findUnique({
