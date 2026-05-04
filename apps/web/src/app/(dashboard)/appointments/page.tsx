@@ -21,6 +21,7 @@ interface Doctor {
 interface BookingRecord {
     id?: string;
     doctoraliaBookingId?: string;
+    vismedAppointmentId?: string;
     origin: 'VISMED' | 'DOCTORALIA';
     status: string;
     patientName: string;
@@ -193,7 +194,14 @@ export default function AppointmentsPage() {
 
         for (const rec of syncRecords) {
             if (rec.doctoraliaBookingId) seenDoctoraliaIds.add(rec.doctoraliaBookingId);
-            merged.push(rec);
+            // Deriva sync status pela PRESENÇA dos IDs reais (mais confiável que
+            // os flags persistidos, que podem ficar dessincronizados após
+            // adopt/reschedule/race conditions).
+            merged.push({
+                ...rec,
+                syncedToVismed: !!rec.vismedAppointmentId,
+                syncedToDoctoralia: !!rec.doctoraliaBookingId,
+            });
         }
 
         for (const b of doctoraliaBookings) {
