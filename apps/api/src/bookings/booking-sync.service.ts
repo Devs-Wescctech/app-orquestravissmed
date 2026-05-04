@@ -280,14 +280,39 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             `[RECONCILE-DISAPPEARED] ${disappeared.length} appointment(s) disappeared from VisMed poll for clinic ${clinicId}`,
         );
 
+        const RECENT_MOVE_GRACE_MS = 5 * 60 * 1000;
+        const now = Date.now();
         for (const rec of disappeared) {
             try {
+                // Anti-race: se acabamos de mover este appt na VisMed (lastMoveBy=VISMED),
+                // a VisMed às vezes faz cancel+create internamente — o vismedAppointmentId
+                // antigo some e um novo aparece no horário-alvo. Tentamos primeiro adotar
+                // o replacement; se não houver, aplicamos grace de 5 min para evitar
+                // cancelar na Doctoralia um agendamento que o usuário acabou de remarcar.
+                if (rec.lastMoveBy === 'VISMED' && rec.lastMoveAt && rec.lastMoveTargetStartAt) {
+                    const adopted = await this.tryAdoptVismedReplacement(rec).catch(err => {
+                        this.logger.warn(
+                            `[RECONCILE-DISAPPEARED] adopt-replacement falhou para ${rec.vismedAppointmentId}: ${err.message}`,
+                        );
+                        return false;
+                    });
+                    if (adopted) continue;
+                    if (now - rec.lastMoveAt.getTime() < RECENT_MOVE_GRACE_MS) {
+                        this.logger.log(
+                            `[RECONCILE-DISAPPEARED] SKIP vismedApptId=${rec.vismedAppointmentId} — VISMED move há ${Math.round((now - rec.lastMoveAt.getTime()) / 1000)}s, sem replacement (grace ${RECENT_MOVE_GRACE_MS / 1000}s)`,
+                        );
+                        continue;
+                    }
+                }
                 this.logger.log(
                     `[RECONCILE-DISAPPEARED] vismedApptId=${rec.vismedAppointmentId} (BookingSync ${rec.id}) not in VisMed response — marking CANCELLED`,
                 );
                 const updated = await this.prisma.bookingSync.updateMany({
                     where: {
                         id: rec.id,
+                        // Guard otimista: só cancela se o vismedAppointmentId ainda
+                        // for o mesmo (não foi adotado por outro poll concorrente).
+                        vismedAppointmentId: rec.vismedAppointmentId,
                         status: { in: ['BOOKED', 'CONFIRMED'] },
                     },
                     data: {
@@ -315,6 +340,102 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 );
             }
         }
+    }
+
+    /**
+     * Quando a VisMed faz cancel+create internamente em uma remarcação iniciada
+     * pelo próprio VisMed, o vismedAppointmentId antigo some e um novo aparece
+     * no horário-alvo (lastMoveTargetStartAt). Tentamos localizar esse
+     * "replacement" e rebindar o BookingSync existente — preservando o
+     * doctoraliaBookingId e evitando cancelar na Doctoralia.
+     * Retorna true se adotou um replacement (pular cancelamento).
+     */
+    private async tryAdoptVismedReplacement(rec: {
+        id: string;
+        clinicId: string;
+        vismedDoctorId: string | null;
+        vismedAppointmentId: string | null;
+        lastMoveAt: Date | null;
+        lastMoveTargetStartAt: Date | null;
+        startAt: Date;
+    }): Promise<boolean> {
+        if (!rec.vismedDoctorId || !rec.lastMoveTargetStartAt || !rec.lastMoveAt) return false;
+        const tolMs = 2 * 60 * 1000;
+        const target = rec.lastMoveTargetStartAt;
+        // Freshness: candidato precisa ter sido criado em torno do moveAt (±10 min)
+        // para evitar adotar um booking antigo não relacionado.
+        const freshnessMs = 10 * 60 * 1000;
+        const createdAfter = new Date(rec.lastMoveAt.getTime() - freshnessMs);
+
+        const candidate = await this.prisma.bookingSync.findFirst({
+            where: {
+                clinicId: rec.clinicId,
+                vismedDoctorId: rec.vismedDoctorId,
+                vismedAppointmentId: { not: null },
+                doctoraliaBookingId: null,
+                status: { in: ['BOOKED', 'CONFIRMED'] },
+                id: { not: rec.id },
+                createdAt: { gte: createdAfter },
+                startAt: {
+                    gte: new Date(target.getTime() - tolMs),
+                    lte: new Date(target.getTime() + tolMs),
+                },
+            },
+            orderBy: { createdAt: 'desc' },
+        });
+
+        if (!candidate || !candidate.vismedAppointmentId) return false;
+
+        const newVid = candidate.vismedAppointmentId;
+        const newStart = candidate.startAt;
+        const newEnd = candidate.endAt;
+        const oldVid = rec.vismedAppointmentId;
+
+        // Interactive tx: re-lê o rec dentro da tx, valida invariantes
+        // (vismedAppointmentId não mudou + ainda ativo) antes de mutar.
+        // Garante que polls concorrentes não causem dupla adoção/cancel.
+        try {
+            await this.prisma.$transaction(async tx => {
+                const fresh = await tx.bookingSync.findUnique({ where: { id: rec.id } });
+                if (!fresh) throw new Error('rec desapareceu');
+                if (fresh.vismedAppointmentId !== oldVid) {
+                    throw new Error(`vismedAppointmentId mudou (${oldVid} → ${fresh.vismedAppointmentId})`);
+                }
+                if (fresh.status !== 'BOOKED' && fresh.status !== 'CONFIRMED') {
+                    throw new Error(`status mudou (${fresh.status})`);
+                }
+                const cand = await tx.bookingSync.findUnique({ where: { id: candidate.id } });
+                if (!cand || cand.vismedAppointmentId !== newVid) {
+                    throw new Error('candidate mudou');
+                }
+                await tx.bookingSync.delete({ where: { id: candidate.id } });
+                await tx.bookingSync.update({
+                    where: { id: rec.id },
+                    data: {
+                        vismedAppointmentId: newVid,
+                        startAt: newStart,
+                        endAt: newEnd,
+                        syncedToVismed: true,
+                        syncError: null,
+                        processedAt: new Date(),
+                        lastMoveBy: null,
+                        lastMoveAt: null,
+                        lastMoveTargetStartAt: null,
+                    },
+                });
+            });
+        } catch (err: any) {
+            this.logger.debug(
+                `[RECONCILE-DISAPPEARED] adopt-replacement abortado para ${oldVid}: ${err.message}`,
+            );
+            return false;
+        }
+
+        this.logger.log(
+            `[RECONCILE-DISAPPEARED] ADOPTED replacement: BookingSync ${rec.id} ` +
+                `vismedApptId ${oldVid} → ${newVid} @ ${newStart.toISOString()}`,
+        );
+        return true;
     }
 
     private async reconcileUnlinkedWithDoctoralia(clinicId: string) {

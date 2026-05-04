@@ -134,3 +134,5 @@ Both pipelines attempt BullMQ queue dispatch first, then fall back to direct inl
 - `apps/api/src/main.ts` — NestJS entry point
 - `apps/api/src/app.module.ts` — NestJS root module
 - `apps/api/prisma/schema.prisma` — Database schema
+
+- **Fix: Anti-race RECONCILE-DISAPPEARED em VisMed→VisMed move (04/May/2026)**: Quando o usuário move um agendamento dentro da VisMed, a API às vezes deixa de retornar o `vismedAppointmentId` no poll seguinte (transitório, ou cancel+create interno). O `reconcileDisappearedFromVismed` interpretava como cancelamento e propagava `cancelBooking` para Doctoralia — acabando com o agendamento que o usuário acabou de remarcar. Fix: grace de 5 min — se `lastMoveBy='VISMED'` e `lastMoveAt` < 5 min, pula a propagação. Caso seja cancelamento real, será capturado após expirar a grace. Complementa o grace já existente em `RECONCILE-CANCEL` (lado Doctoralia).
