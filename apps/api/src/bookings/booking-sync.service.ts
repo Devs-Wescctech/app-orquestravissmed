@@ -281,7 +281,6 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 where: {
                     clinicId,
                     vismedDoctorId: doctor.id,
-                    origin: 'VISMED',
                     vismedAppointmentId: null,
                     startAt: {
                         gte: new Date(startAt.getTime() - windowMs),
@@ -1189,10 +1188,20 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             this.logger.warn(`[SLOT-BOOKED] No LINKED doctor mapping for doctoraliaDoctorId=${doctoraliaDoctorId}`);
         }
 
+        let vismedAppointmentId: string | null = null;
+        if (vismedCreateResult) {
+            const rawId = vismedCreateResult?.idpacienteagendamento
+                || vismedCreateResult?.id
+                || vismedCreateResult?.idPacienteAgendamento;
+            if (rawId) vismedAppointmentId = String(rawId);
+            this.logger.log(`[SLOT-BOOKED] VisMed appointment ID: ${vismedAppointmentId ?? '(não retornado)'}`);
+        }
+
         await this.prisma.bookingSync.update({
             where: { id: reserved.id },
             data: {
                 vismedDoctorId: vismedDoctorId || undefined,
+                vismedAppointmentId: vismedAppointmentId || undefined,
                 status: vismedCreateResult ? 'BOOKED' : 'FAILED',
                 syncError: vismedCreateResult ? undefined : 'Failed to create in VisMed',
                 syncedToDoctoralia: true,
