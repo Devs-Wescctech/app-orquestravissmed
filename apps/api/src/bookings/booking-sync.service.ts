@@ -24,6 +24,15 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         private rateLimiter: RateLimiterService,
     ) {}
 
+    // Normaliza qualquer status vindo da Doctoralia para detectar cancelamento de forma robusta
+    // (lida com 'canceled', 'cancelled', 'CANCELLED', 'deleted' e flags cancelled_at/canceled_at).
+    private isDoctoraliaCancelled(b: any): boolean {
+        if (!b) return false;
+        if (b.cancelled_at || b.canceled_at) return true;
+        const s = String(b.status || '').toUpperCase();
+        return s === 'CANCELED' || s === 'CANCELLED' || s === 'DELETED';
+    }
+
     // Extrai data (YYYY-MM-DD) e hora (HH:mm) no fuso de Brasília independente do TZ do servidor.
     // Brasil não observa horário de verão desde 2019, mas usar IANA garante robustez futura.
     private extractBrtDateTime(date: Date): { dateStr: string; timeStr: string } {
@@ -380,7 +389,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                     for (const booking of bookings) {
                         const bid = String(booking.id || '');
                         if (!bid || alreadyLinked.has(bid)) continue;
-                        if (booking.status === 'canceled') continue;
+                        if (this.isDoctoraliaCancelled(booking)) continue;
 
                         const bookingStart = new Date(booking.start_at);
                         const toleranceMs = 120 * 1000;
@@ -473,13 +482,13 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                     const liveBookings = res?._items || (Array.isArray(res) ? res : []);
                     const liveIds = new Set(
                         (Array.isArray(liveBookings) ? liveBookings : [])
-                            .filter((b: any) => b?.status !== 'canceled')
+                            .filter((b: any) => !this.isDoctoraliaCancelled(b))
                             .map((b: any) => String(b.id)),
                     );
 
                     const cancelledIds = new Set(
                         (Array.isArray(liveBookings) ? liveBookings : [])
-                            .filter((b: any) => b?.status === 'canceled')
+                            .filter((b: any) => this.isDoctoraliaCancelled(b))
                             .map((b: any) => String(b.id)),
                     );
 

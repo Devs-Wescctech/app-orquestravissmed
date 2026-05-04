@@ -199,10 +199,12 @@ export default function AppointmentsPage() {
         for (const b of doctoraliaBookings) {
             const bid = String(b.id || b.visit_booking_id || '');
             if (bid && seenDoctoraliaIds.has(bid)) continue;
+            const rawStatus = String(b.status || 'booked').toUpperCase();
+            const normalizedStatus = (rawStatus === 'CANCELED' || rawStatus === 'CANCELLED' || rawStatus === 'DELETED' || b.cancelled_at || b.canceled_at) ? 'CANCELLED' : rawStatus;
             merged.push({
                 doctoraliaBookingId: bid,
                 origin: b.booked_by === 'integration' ? 'VISMED' : 'DOCTORALIA',
-                status: b.status || 'booked',
+                status: normalizedStatus,
                 patientName: b.patient?.name || 'Paciente',
                 patientSurname: b.patient?.surname || '',
                 patientPhone: b.patient?.phone ? String(b.patient.phone) : '',
