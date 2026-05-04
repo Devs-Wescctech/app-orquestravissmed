@@ -497,6 +497,22 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                         if (rec.doctoraliaAddressId !== addr.doctoraliaAddressId) continue;
                         if (liveIds.has(rec.doctoraliaBookingId)) continue;
 
+                        // Anti-race: depois de um moveBooking nosso (VisMed→Doctoralia), a Doctoralia
+                        // troca o ID do booking. O ID antigo some da listagem ANTES do webhook
+                        // booking-moved chegar com o novo ID. Sem esse grace, o reconcile interpreta
+                        // como cancelamento e cancela na VisMed o que acabamos de mover. Aguarda 3min.
+                        const RECONCILE_MOVE_GRACE_MS = 3 * 60 * 1000;
+                        if (
+                            rec.lastMoveBy === 'VISMED' &&
+                            rec.lastMoveAt &&
+                            Date.now() - rec.lastMoveAt.getTime() < RECONCILE_MOVE_GRACE_MS
+                        ) {
+                            this.logger.debug(
+                                `[RECONCILE-CANCEL] Booking ${rec.doctoraliaBookingId} dentro da janela de grace pós-moveBooking VisMed→Doctoralia, aguardando webhook booking-moved`,
+                            );
+                            continue;
+                        }
+
                         if (!cancelledIds.has(rec.doctoraliaBookingId)) {
                             this.logger.debug(
                                 `[RECONCILE-CANCEL] Booking ${rec.doctoraliaBookingId} absent from API response (may be outside window or paginated), skipping`,
