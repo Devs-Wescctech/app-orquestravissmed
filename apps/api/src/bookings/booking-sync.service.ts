@@ -185,6 +185,9 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             const datafim = fmt(end);
 
             let totalUpserts = 0;
+            const seenVismedIds = new Set<string>();
+            let fetchSuccess = true;
+
             for (const u of units) {
                 try {
                     const agendamentos = await this.vismedService.getAgendamentos(
@@ -193,9 +196,15 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                         { dataini, datafim },
                     );
 
-                    if (!Array.isArray(agendamentos)) continue;
+                    if (!Array.isArray(agendamentos)) {
+                        this.logger.warn(`[VISMED-POLL] Unit ${u.vismedId} returned non-array response, treating as fetch failure`);
+                        fetchSuccess = false;
+                        continue;
+                    }
 
                     for (const a of agendamentos) {
+                        const vid = a?.idpacienteagendamento ? String(a.idpacienteagendamento) : null;
+                        if (vid) seenVismedIds.add(vid);
                         try {
                             const upserted = await this.upsertVismedAppointment(conn.clinicId, a);
                             if (upserted) totalUpserts++;
@@ -205,10 +214,17 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                     }
                 } catch (uErr: any) {
                     this.logger.warn(`[VISMED-POLL] Unit ${u.vismedId} fetch failed: ${uErr.message}`);
+                    fetchSuccess = false;
                 }
             }
 
             this.logger.log(`[VISMED-POLL] Clinic ${conn.clinicId}: processed ${totalUpserts} VisMed appointments`);
+
+            if (fetchSuccess && seenVismedIds.size > 0) {
+                await this.reconcileDisappearedFromVismed(conn.clinicId, seenVismedIds, start, end).catch(err =>
+                    this.logger.warn(`[RECONCILE-DISAPPEARED] Error: ${err.message}`),
+                );
+            }
 
             await this.reconcileUnlinkedWithDoctoralia(conn.clinicId).catch(err =>
                 this.logger.warn(`[RECONCILE] Error: ${err.message}`),
@@ -219,6 +235,76 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             );
         } catch (err: any) {
             this.logger.warn(`[VISMED-POLL] Error polling clinic ${conn.clinicId}: ${err.message}`);
+        }
+    }
+
+    private async reconcileDisappearedFromVismed(
+        clinicId: string,
+        seenVismedIds: Set<string>,
+        windowStart: Date,
+        windowEnd: Date,
+    ) {
+        const brtOffset = -3 * 60 * 60 * 1000;
+        const dayStart = new Date(windowStart.getTime());
+        dayStart.setUTCHours(0, 0, 0, 0);
+        dayStart.setTime(dayStart.getTime() - brtOffset);
+        const dayEnd = new Date(windowEnd.getTime());
+        dayEnd.setUTCHours(23, 59, 59, 999);
+        dayEnd.setTime(dayEnd.getTime() - brtOffset);
+
+        const activeInWindow = await this.prisma.bookingSync.findMany({
+            where: {
+                clinicId,
+                vismedAppointmentId: { not: null },
+                status: { in: ['BOOKED', 'CONFIRMED'] },
+                startAt: { gte: dayStart, lte: dayEnd },
+            },
+        });
+
+        const disappeared = activeInWindow.filter(
+            r => r.vismedAppointmentId && !seenVismedIds.has(r.vismedAppointmentId),
+        );
+
+        if (disappeared.length === 0) return;
+
+        this.logger.log(
+            `[RECONCILE-DISAPPEARED] ${disappeared.length} appointment(s) disappeared from VisMed poll for clinic ${clinicId}`,
+        );
+
+        for (const rec of disappeared) {
+            try {
+                this.logger.log(
+                    `[RECONCILE-DISAPPEARED] vismedApptId=${rec.vismedAppointmentId} (BookingSync ${rec.id}) not in VisMed response — marking CANCELLED`,
+                );
+                const updated = await this.prisma.bookingSync.updateMany({
+                    where: {
+                        id: rec.id,
+                        status: { in: ['BOOKED', 'CONFIRMED'] },
+                    },
+                    data: {
+                        status: 'CANCELLED',
+                        cancelledBy: 'VISMED',
+                        cancelledAt: new Date(),
+                        syncedToVismed: true,
+                        syncedToDoctoralia: false,
+                    },
+                });
+                if (updated.count === 0) {
+                    this.logger.debug(
+                        `[RECONCILE-DISAPPEARED] vismedApptId=${rec.vismedAppointmentId} already changed status, skipping propagation`,
+                    );
+                    continue;
+                }
+                await this.propagateVismedCancellationToDoctoralia(rec.id).catch(err =>
+                    this.logger.warn(
+                        `[RECONCILE-DISAPPEARED] propagate cancel failed for ${rec.vismedAppointmentId}: ${err.message}`,
+                    ),
+                );
+            } catch (err: any) {
+                this.logger.warn(
+                    `[RECONCILE-DISAPPEARED] Error processing ${rec.vismedAppointmentId}: ${err.message}`,
+                );
+            }
         }
     }
 
