@@ -1710,13 +1710,51 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             }
         }
 
-        const existing = await this.prisma.bookingSync.findUnique({
+        let existing = await this.prisma.bookingSync.findUnique({
             where: { doctoraliaBookingId: String(booking.id) },
         });
 
+        // Reconciliação adicional: busca registro órfão pelo startAt antigo + clinic + doctor.
+        // Cobre o caso de IDs intermediários da Doctoralia que nunca foram salvos por nós.
+        if (!existing && oldBooking?.start_at) {
+            const oldStartAt = new Date(oldBooking.start_at);
+            const oldDoctorId = String(oldBooking.doctor?.id || data.doctor?.id || '');
+            const candidate = await this.prisma.bookingSync.findFirst({
+                where: {
+                    clinicId,
+                    doctoraliaDoctorId: oldDoctorId,
+                    startAt: oldStartAt,
+                    status: { in: ['BOOKED', 'PROCESSING'] },
+                },
+                orderBy: { processedAt: 'desc' },
+            });
+            if (candidate) {
+                this.logger.log(
+                    `[BOOKING-MOVED] reconciliou registro órfão ${candidate.id} (doctoraliaBookingId=${candidate.doctoraliaBookingId}) → adotando novo id ${booking.id}`,
+                );
+                existing = await this.prisma.bookingSync.update({
+                    where: { id: candidate.id },
+                    data: { doctoraliaBookingId: String(booking.id) },
+                });
+            }
+        }
+
         if (!existing) {
-            this.logger.warn(`[BOOKING-MOVED] booking ${booking.id} não encontrado no BookingSync, ignorando`);
-            return { processed: false, reason: 'not_found' };
+            this.logger.warn(
+                `[BOOKING-MOVED] booking ${booking.id} (old=${oldBooking?.id}) não encontrado no BookingSync — caindo no fluxo slot-booked para criar na VisMed`,
+            );
+            // Fallback: tabela está dessincronizada e não há órfão BOOKED equivalente.
+            // Trata o new_visit_booking como uma criação nova para garantir contraparte VisMed.
+            const slotData = {
+                ...data,
+                visit_booking: booking,
+            };
+            try {
+                return await this.handleSlotBooked(clinicId, slotData, rawNotification);
+            } catch (err: any) {
+                this.logger.error(`[BOOKING-MOVED] fallback slot-booked falhou: ${err.message}`);
+                return { processed: false, reason: 'fallback_failed', error: err.message };
+            }
         }
 
         const previousVismedAppointmentId = existing.vismedAppointmentId;
