@@ -414,16 +414,17 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                         );
 
                         try {
-                            await this.propagateDoctoraliaCancellationToVismed(rec.id);
                             await this.prisma.bookingSync.update({
                                 where: { id: rec.id },
                                 data: {
                                     status: 'CANCELLED',
                                     cancelledBy: 'DOCTORALIA',
                                     cancelledAt: new Date(),
+                                    syncedToVismed: false,
                                     processedAt: new Date(),
                                 },
                             });
+                            await this.propagateDoctoraliaCancellationToVismed(rec.id);
                         } catch (err: any) {
                             this.logger.warn(`[RECONCILE-CANCEL] propagate failed for ${rec.doctoraliaBookingId}, will retry next cycle: ${err.message}`);
                         }
@@ -635,6 +636,25 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             return true;
         }
 
+        const pendingCancelFromDoctoralia = existingByVismedId
+            && existingByVismedId.status === 'CANCELLED'
+            && existingByVismedId.cancelledBy === 'DOCTORALIA'
+            && !existingByVismedId.syncedToVismed;
+
+        if (pendingCancelFromDoctoralia) {
+            this.logger.log(
+                `[VISMED-POLL] Pending cancellation for ${vismedAppointmentId} — propagating to VisMed now`,
+            );
+            await this.propagateDoctoraliaCancellationToVismed(existingByVismedId!.id).catch((err) =>
+                this.logger.warn(`[VISMED-POLL] cancel propagation failed for ${vismedAppointmentId}: ${err.message}`),
+            );
+            return true;
+        }
+
+        const effectiveStatus = existingByVismedId?.status === 'CANCELLED' && existingByVismedId?.cancelledBy
+            ? 'CANCELLED'
+            : status;
+
         const upserted = await this.prisma.bookingSync.upsert({
             where: { clinicId_vismedAppointmentId: { clinicId, vismedAppointmentId } },
             create: {
@@ -656,7 +676,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 processedAt: new Date(),
             },
             update: {
-                status,
+                status: effectiveStatus,
                 vismedDoctorId: doctor?.id || null,
                 doctoraliaDoctorId,
                 doctoraliaFacilityId,
