@@ -201,7 +201,7 @@ export default function AppointmentsPage() {
             if (bid && seenDoctoraliaIds.has(bid)) continue;
             const rawStatus = String(b.status || 'booked').toUpperCase();
             const normalizedStatus = (rawStatus === 'CANCELED' || rawStatus === 'CANCELLED' || rawStatus === 'DELETED' || b.cancelled_at || b.canceled_at) ? 'CANCELLED' : rawStatus;
-            merged.push({
+            const newRec: BookingRecord = {
                 doctoraliaBookingId: bid,
                 origin: b.booked_by === 'integration' ? 'VISMED' : 'DOCTORALIA',
                 status: normalizedStatus,
@@ -218,7 +218,31 @@ export default function AppointmentsPage() {
                 booked_by: b.booked_by,
                 syncedToDoctoralia: true,
                 syncedToVismed: b.booked_by === 'integration',
-            });
+            };
+
+            // Anti-duplicata visual pós-reagendamento: se este booking ativo coincide em
+            // horário+médico com um cancelado já no merge (ID antigo da Doctoralia trocou
+            // após moveBooking), substitui o cancelado em vez de exibir os dois.
+            if (normalizedStatus !== 'CANCELLED') {
+                const newStartMs = new Date(b.start_at).getTime();
+                const dupIdx = merged.findIndex(m =>
+                    m.status === 'CANCELLED' &&
+                    m.doctoraliaDoctorId === selectedDoctorId &&
+                    new Date(m.startAt).getTime() === newStartMs,
+                );
+                if (dupIdx >= 0) {
+                    // Preserva o nome real do paciente (vindo do registro VisMed) se a
+                    // Doctoralia devolveu apenas placeholder "Paciente".
+                    if ((!b.patient?.name || b.patient.name === 'Paciente') && merged[dupIdx].patientName) {
+                        newRec.patientName = merged[dupIdx].patientName;
+                        newRec.patientSurname = merged[dupIdx].patientSurname || '';
+                    }
+                    merged[dupIdx] = newRec;
+                    continue;
+                }
+            }
+
+            merged.push(newRec);
         }
         return merged.sort((a, b) => new Date(a.startAt).getTime() - new Date(b.startAt).getTime());
     }, [syncRecords, doctoraliaBookings, selectedDoctorId]);
