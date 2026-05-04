@@ -267,11 +267,16 @@ export default function AppointmentsPage() {
     };
 
     const handleCancelBooking = async (booking: BookingRecord) => {
-        if (!clinicId || !booking.doctoraliaBookingId) return;
+        if (!clinicId) return;
+        if (!booking.doctoraliaBookingId && !booking.id) return;
         if (!confirm('Deseja realmente cancelar este agendamento?')) return;
         const toastId = toast.loading('Cancelando...');
         try {
-            await api.delete(`/booking-sync/cancel/${booking.doctoraliaBookingId}`, { params: { clinicId } });
+            if (booking.doctoraliaBookingId) {
+                await api.delete(`/booking-sync/cancel/${booking.doctoraliaBookingId}`, { params: { clinicId } });
+            } else if (booking.id) {
+                await api.delete(`/booking-sync/cancel-record/${booking.id}`, { params: { clinicId } });
+            }
             toast.success('Agendamento cancelado', { id: toastId });
             setSelectedBooking(null);
             fetchBookings();
@@ -786,7 +791,7 @@ export default function AppointmentsPage() {
                             )}
                         </div>
 
-                        {selectedBooking.status !== 'CANCELLED' && selectedBooking.doctoraliaBookingId && (
+                        {selectedBooking.status !== 'CANCELLED' && (selectedBooking.doctoraliaBookingId || selectedBooking.id) && (
                             <div className="mt-5">
                                 <button
                                     onClick={() => handleCancelBooking(selectedBooking)}

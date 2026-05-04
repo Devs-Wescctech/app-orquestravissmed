@@ -205,6 +205,17 @@ export class BookingSyncController {
         return this.bookingSyncService.cancelOnDoctoraliaFromVismed(clinicId, doctoraliaBookingId, body?.reason);
     }
 
+    @Delete('cancel-record/:id')
+    async cancelBookingById(
+        @Req() req: any,
+        @Param('id') id: string,
+        @Query('clinicId') clinicId: string,
+        @Body() body?: { reason?: string },
+    ) {
+        this.validateClinicAccess(req.user, clinicId);
+        return this.bookingSyncService.cancelBookingById(clinicId, id, body?.reason);
+    }
+
     @Post('poll')
     async triggerPoll(@Req() req: any) {
         this.logger.log('[MANUAL] Triggering notification poll');

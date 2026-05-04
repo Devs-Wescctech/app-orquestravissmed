@@ -209,8 +209,118 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             }
 
             this.logger.log(`[VISMED-POLL] Clinic ${conn.clinicId}: processed ${totalUpserts} VisMed appointments`);
+
+            await this.reconcileUnlinkedWithDoctoralia(conn.clinicId).catch(err =>
+                this.logger.warn(`[RECONCILE] Error: ${err.message}`),
+            );
         } catch (err: any) {
             this.logger.warn(`[VISMED-POLL] Error polling clinic ${conn.clinicId}: ${err.message}`);
+        }
+    }
+
+    private async reconcileUnlinkedWithDoctoralia(clinicId: string) {
+        const unlinked = await this.prisma.bookingSync.findMany({
+            where: {
+                clinicId,
+                doctoraliaBookingId: null,
+                status: { in: ['BOOKED', 'CONFIRMED'] },
+                doctoraliaDoctorId: { not: null },
+                startAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
+            },
+        });
+
+        if (unlinked.length === 0) return;
+
+        const docConn = await this.prisma.integrationConnection.findFirst({
+            where: { clinicId, provider: 'doctoralia', status: 'connected' },
+        });
+        if (!docConn?.clientId) return;
+
+        const client = this.docplannerService.createClient(
+            docConn.domain || 'doctoralia.com.br',
+            docConn.clientId,
+            docConn.clientSecret || '',
+        );
+
+        const doctorIds = [...new Set(unlinked.map(r => r.doctoraliaDoctorId!))];
+
+        for (const doctorId of doctorIds) {
+            const doctorUnlinked = unlinked.filter(r => r.doctoraliaDoctorId === doctorId);
+            if (doctorUnlinked.length === 0) continue;
+
+            const minStartDate = new Date(Math.min(...doctorUnlinked.map(r => r.startAt.getTime())) - 24 * 60 * 60 * 1000);
+            const maxEndDate = new Date(Math.max(...doctorUnlinked.map(r => r.startAt.getTime())) + 24 * 60 * 60 * 1000);
+            const toBrtIso = (d: Date) => {
+                const offset = -3;
+                const local = new Date(d.getTime() + offset * 60 * 60 * 1000);
+                return local.toISOString().replace(/\.\d{3}Z$/, '-03:00');
+            };
+            const minStart = toBrtIso(minStartDate);
+            const maxEnd = toBrtIso(maxEndDate);
+
+            const addresses = await this.prisma.bookingSync.findMany({
+                where: { clinicId, doctoraliaDoctorId: doctorId, doctoraliaAddressId: { not: null } },
+                select: { doctoraliaAddressId: true, doctoraliaFacilityId: true },
+                distinct: ['doctoraliaAddressId'],
+            });
+
+            for (const addr of addresses) {
+                if (!addr.doctoraliaAddressId || !addr.doctoraliaFacilityId) continue;
+
+                try {
+                    await this.rateLimiter.acquire('doctoralia');
+                    const res = await client.getBookings(
+                        addr.doctoraliaFacilityId,
+                        doctorId,
+                        addr.doctoraliaAddressId,
+                        minStart,
+                        maxEnd,
+                    );
+
+                    const bookings = res?._items || (Array.isArray(res) ? res : []);
+                    if (!Array.isArray(bookings) || bookings.length === 0) continue;
+
+                    const alreadyLinked = new Set(
+                        (await this.prisma.bookingSync.findMany({
+                            where: { clinicId, doctoraliaBookingId: { not: null } },
+                            select: { doctoraliaBookingId: true },
+                        })).map(r => r.doctoraliaBookingId!),
+                    );
+
+                    for (const booking of bookings) {
+                        const bid = String(booking.id || '');
+                        if (!bid || alreadyLinked.has(bid)) continue;
+                        if (booking.status === 'canceled') continue;
+
+                        const bookingStart = new Date(booking.start_at);
+                        const toleranceMs = 120 * 1000;
+
+                        const match = doctorUnlinked.find(r =>
+                            Math.abs(r.startAt.getTime() - bookingStart.getTime()) <= toleranceMs
+                            && !r.doctoraliaBookingId,
+                        );
+
+                        if (match) {
+                            await this.prisma.bookingSync.update({
+                                where: { id: match.id },
+                                data: {
+                                    doctoraliaBookingId: bid,
+                                    doctoraliaAddressId: addr.doctoraliaAddressId,
+                                    doctoraliaFacilityId: addr.doctoraliaFacilityId,
+                                    syncedToDoctoralia: true,
+                                },
+                            });
+                            match.doctoraliaBookingId = bid;
+                            alreadyLinked.add(bid);
+                            this.logger.log(
+                                `[RECONCILE] Linked BookingSync ${match.id} (vismedAppt=${match.vismedAppointmentId}) ↔ Doctoralia booking ${bid}`,
+                            );
+                        }
+                    }
+                } catch (err: any) {
+                    this.logger.warn(`[RECONCILE] Failed fetching bookings for doctor ${doctorId}: ${err.message}`);
+                }
+            }
         }
     }
 
@@ -1566,40 +1676,114 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             where: { doctoraliaBookingId },
         });
 
-        if (!syncRecord) {
+        if (!syncRecord || syncRecord.clinicId !== clinicId) {
             throw new Error('Agendamento não encontrado no registro de sincronização');
         }
 
-        const conn = await this.prisma.integrationConnection.findFirst({
-            where: { clinicId, provider: 'doctoralia' },
+        return this.cancelSyncRecord(clinicId, syncRecord, reason);
+    }
+
+    async cancelBookingById(clinicId: string, bookingSyncId: string, reason?: string) {
+        const syncRecord = await this.prisma.bookingSync.findUnique({
+            where: { id: bookingSyncId },
         });
 
-        if (!conn || !conn.clientId) {
-            throw new Error('Integração Doctoralia não configurada');
+        if (!syncRecord || syncRecord.clinicId !== clinicId) {
+            throw new Error('Agendamento não encontrado no registro de sincronização');
         }
 
-        const client = this.docplannerService.createClient(
-            conn.domain || 'doctoralia.com.br',
-            conn.clientId,
-            conn.clientSecret || '',
-        );
+        return this.cancelSyncRecord(clinicId, syncRecord, reason);
+    }
 
-        await this.rateLimiter.acquire('doctoralia');
+    private async cancelSyncRecord(clinicId: string, syncRecord: any, reason?: string) {
+        let cancelledDoctoralia = false;
+        let cancelledVismed = false;
 
-        await client.cancelBooking(
-            syncRecord.doctoraliaFacilityId || '',
-            syncRecord.doctoraliaDoctorId || '',
-            syncRecord.doctoraliaAddressId || '',
-            doctoraliaBookingId,
-            reason,
-        );
+        if (syncRecord.doctoraliaBookingId) {
+            const conn = await this.prisma.integrationConnection.findFirst({
+                where: { clinicId, provider: 'doctoralia' },
+            });
+
+            if (conn?.clientId) {
+                const client = this.docplannerService.createClient(
+                    conn.domain || 'doctoralia.com.br',
+                    conn.clientId,
+                    conn.clientSecret || '',
+                );
+
+                await this.rateLimiter.acquire('doctoralia');
+
+                try {
+                    await client.cancelBooking(
+                        syncRecord.doctoraliaFacilityId || '',
+                        syncRecord.doctoraliaDoctorId || '',
+                        syncRecord.doctoraliaAddressId || '',
+                        syncRecord.doctoraliaBookingId,
+                        reason,
+                    );
+                    cancelledDoctoralia = true;
+                } catch (err: any) {
+                    if (err.message?.includes('404') || err.message?.includes('409') || err.message?.includes('already')) {
+                        this.logger.warn(`[CANCEL] Doctoralia booking ${syncRecord.doctoraliaBookingId} already cancelled or not found`);
+                        cancelledDoctoralia = true;
+                    } else {
+                        this.logger.error(`[CANCEL] Failed to cancel Doctoralia booking ${syncRecord.doctoraliaBookingId}: ${err.message}`);
+                        throw err;
+                    }
+                }
+            }
+        }
+
+        if (syncRecord.vismedAppointmentId) {
+            const vismedConn = await this.prisma.integrationConnection.findFirst({
+                where: { clinicId, provider: 'vismed', status: 'connected' },
+            });
+
+            if (vismedConn) {
+                try {
+                    await this.vismedService.cancelarAgendamento(
+                        syncRecord.vismedAppointmentId,
+                        vismedConn.domain || undefined,
+                    );
+                    cancelledVismed = true;
+                    this.logger.log(`[CANCEL] Cancelled VisMed appointment ${syncRecord.vismedAppointmentId}`);
+                } catch (err: any) {
+                    this.logger.warn(`[CANCEL] Failed to cancel VisMed appointment ${syncRecord.vismedAppointmentId}: ${err.message}`);
+                }
+            }
+        }
+
+        if (syncRecord.doctoraliaBreakId) {
+            try {
+                const conn = await this.prisma.integrationConnection.findFirst({
+                    where: { clinicId, provider: 'doctoralia' },
+                });
+                if (conn?.clientId) {
+                    const client = this.docplannerService.createClient(
+                        conn.domain || 'doctoralia.com.br',
+                        conn.clientId,
+                        conn.clientSecret || '',
+                    );
+                    await this.rateLimiter.acquire('doctoralia');
+                    await client.deleteCalendarBreak(
+                        syncRecord.doctoraliaFacilityId || '',
+                        syncRecord.doctoraliaDoctorId || '',
+                        syncRecord.doctoraliaAddressId || '',
+                        syncRecord.doctoraliaBreakId,
+                    );
+                    this.logger.log(`[CANCEL] Deleted Doctoralia break ${syncRecord.doctoraliaBreakId}`);
+                }
+            } catch (err: any) {
+                this.logger.warn(`[CANCEL] Failed to delete Doctoralia break ${syncRecord.doctoraliaBreakId}: ${err.message}`);
+            }
+        }
 
         await this.prisma.bookingSync.update({
-            where: { doctoraliaBookingId },
-            data: { status: 'CANCELLED', processedAt: new Date() },
+            where: { id: syncRecord.id },
+            data: { status: 'CANCELLED', cancelledBy: 'DASHBOARD', processedAt: new Date() },
         });
 
-        return { success: true, cancelled: true };
+        return { success: true, cancelledDoctoralia, cancelledVismed };
     }
 
     async getBookingSyncRecords(clinicId: string, filters: any = {}) {
