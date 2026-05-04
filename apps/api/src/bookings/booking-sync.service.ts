@@ -685,18 +685,25 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             }
         }
 
-        const existingDoctoralia = await this.prisma.bookingSync.findFirst({
-            where: {
-                clinicId,
-                origin: 'DOCTORALIA',
-                ...(doctoraliaDoctorId ? { doctoraliaDoctorId } : { vismedDoctorId: doctor?.id || undefined }),
-                startAt: {
-                    gte: new Date(startAt.getTime() - 2 * 60 * 1000),
-                    lte: new Date(startAt.getTime() + 2 * 60 * 1000),
+        // Só procuramos um registro DOCTORALIA "solto" para vincular se este vismedAppointmentId
+        // ainda não tem dono. Caso contrário, o upsert abaixo (key clinicId_vismedAppointmentId)
+        // já vai atualizar a row correta — tentar gravar o mesmo vismedAppointmentId em outra
+        // row violaria a unique constraint (clinicId, vismedAppointmentId).
+        const existingDoctoralia = !existingByVismedId
+            ? await this.prisma.bookingSync.findFirst({
+                where: {
+                    clinicId,
+                    origin: 'DOCTORALIA',
+                    vismedAppointmentId: null,
+                    ...(doctoraliaDoctorId ? { doctoraliaDoctorId } : { vismedDoctorId: doctor?.id || undefined }),
+                    startAt: {
+                        gte: new Date(startAt.getTime() - 2 * 60 * 1000),
+                        lte: new Date(startAt.getTime() + 2 * 60 * 1000),
+                    },
+                    status: { not: 'CANCELLED' },
                 },
-                status: { not: 'CANCELLED' },
-            },
-        });
+            })
+            : null;
 
         if (existingDoctoralia) {
             const updated = await this.prisma.bookingSync.update({
