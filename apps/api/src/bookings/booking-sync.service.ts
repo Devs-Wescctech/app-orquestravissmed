@@ -1686,12 +1686,29 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
     }
 
     private async handleBookingMoved(clinicId: string, data: any, rawNotification: any) {
-        const booking = data?.visit_booking || data?.booking || data;
+        // Doctoralia booking-moved payload uses new_visit_booking (after) + old_visit_booking (before)
+        const booking = data?.new_visit_booking || data?.visit_booking || data?.booking || data;
+        const oldBooking = data?.old_visit_booking;
         this.logger.log(
             `[BOOKING-MOVED] data keys: ${JSON.stringify(Object.keys(data || {}))}` +
-            `, booking.id=${booking?.id}, visit_booking=${!!data?.visit_booking}, data.booking=${!!data?.booking}`,
+            `, booking.id=${booking?.id}, old.id=${oldBooking?.id}, new_visit_booking=${!!data?.new_visit_booking}`,
         );
         if (!booking?.id) return { processed: false, reason: 'no_booking_id' };
+
+        // Quando a Doctoralia muda o ID no reschedule (cria new_visit_booking diferente do old),
+        // precisamos achar o registro pelo ID antigo para atualizar com o novo ID.
+        if (oldBooking?.id && String(oldBooking.id) !== String(booking.id)) {
+            const byOldId = await this.prisma.bookingSync.findUnique({
+                where: { doctoraliaBookingId: String(oldBooking.id) },
+            });
+            if (byOldId && !await this.prisma.bookingSync.findUnique({ where: { doctoraliaBookingId: String(booking.id) } })) {
+                await this.prisma.bookingSync.update({
+                    where: { id: byOldId.id },
+                    data: { doctoraliaBookingId: String(booking.id) },
+                });
+                this.logger.log(`[BOOKING-MOVED] migrou doctoraliaBookingId ${oldBooking.id} → ${booking.id}`);
+            }
+        }
 
         const existing = await this.prisma.bookingSync.findUnique({
             where: { doctoraliaBookingId: String(booking.id) },
