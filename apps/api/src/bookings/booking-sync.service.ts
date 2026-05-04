@@ -410,6 +410,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                         endAt,
                         duration: durationMin,
                         rawPayload: a,
+                        syncedToVismed: true,
                         processedAt: new Date(),
                     },
                 });
@@ -494,6 +495,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 endAt,
                 duration: durationMin,
                 rawPayload: a,
+                syncedToVismed: true,
                 processedAt: new Date(),
             },
             update: {
@@ -505,6 +507,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 endAt,
                 duration: durationMin,
                 rawPayload: a,
+                syncedToVismed: true,
                 processedAt: new Date(),
             },
         });
@@ -1018,7 +1021,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         const findRemoteBreakId = async (): Promise<string | null> => {
             try {
                 await this.rateLimiter.acquire('doctoralia');
-                const list = await client.getCalendarBreaks(facilityId, mapping.externalId!, addressId, since);
+                const list = await client.getCalendarBreaks(facilityId, mapping.externalId!, addressId, since, till);
                 const items: any[] = Array.isArray(list) ? list : list?._items || [list].filter(Boolean);
                 const target = new Date(since).getTime();
                 const match = items.find((b) => b?.since && Math.abs(new Date(b.since).getTime() - target) < 60_000);
@@ -1050,6 +1053,10 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             try {
                 await this.rateLimiter.acquire('doctoralia');
                 await client.moveCalendarBreak(facilityId, mapping.externalId, addressId, rec.doctoraliaBreakId, { since, till });
+                await this.prisma.bookingSync.update({
+                    where: { id: rec.id },
+                    data: { syncedToDoctoralia: true },
+                });
                 this.logger.log(`[VISMED-POLL] Moved Doctoralia break ${rec.doctoraliaBreakId}`);
                 return;
             } catch (err: any) {
@@ -1073,14 +1080,13 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                         doctoraliaBreakId: breakId,
                         doctoraliaFacilityId: facilityId,
                         doctoraliaAddressId: addressId,
+                        syncedToDoctoralia: true,
                     },
                 });
                 this.logger.log(`[VISMED-POLL] Created Doctoralia break ${breakId} for booking ${rec.id}`);
             }
         } catch (err: any) {
             if (!isConflict(err)) throw err;
-            // 409 = a break already covers this slot. Find it and adopt its id so
-            // future polls can move/delete it.
             const existingId = await findRemoteBreakId();
             if (existingId) {
                 await this.prisma.bookingSync.update({
@@ -1089,6 +1095,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                         doctoraliaBreakId: existingId,
                         doctoraliaFacilityId: facilityId,
                         doctoraliaAddressId: addressId,
+                        syncedToDoctoralia: true,
                     },
                 });
                 this.logger.log(`[VISMED-POLL] Adopted existing Doctoralia break ${existingId} for booking ${rec.id} (409)`);

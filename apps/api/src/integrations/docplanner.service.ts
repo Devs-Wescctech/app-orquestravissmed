@@ -249,9 +249,12 @@ export class DocplannerClient {
         return this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/calendar`);
     }
 
-    async getCalendarBreaks(facilityId: string, doctorId: string, addressId: string, since?: string): Promise<any> {
+    async getCalendarBreaks(facilityId: string, doctorId: string, addressId: string, since?: string, till?: string): Promise<any> {
         let path = `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/breaks`;
-        if (since) path += `?since=${encodeURIComponent(since)}`;
+        const params: string[] = [];
+        if (since) params.push(`since=${encodeURIComponent(since)}`);
+        if (till) params.push(`till=${encodeURIComponent(till)}`);
+        if (params.length) path += `?${params.join('&')}`;
         return this.request('GET', path);
     }
 
