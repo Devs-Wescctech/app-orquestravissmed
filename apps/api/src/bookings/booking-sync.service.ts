@@ -477,6 +477,9 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         else if (noShow) status = 'NO_SHOW';
         else if (confirmado) status = 'CONFIRMED';
 
+        const isDoctoraliaOnline = String(a?.agendamentoonline) === '1' && Number(a?.idpacienteagendamentocanal) === 2;
+        const realOrigin: 'VISMED' | 'DOCTORALIA' = isDoctoraliaOnline ? 'DOCTORALIA' : 'VISMED';
+
         const patientName = a?.nomepaciente || a?.nome || `Paciente VisMed #${a?.idpaciente ?? ''}`.trim();
         const patientPhone = a?.telefonepaciente || a?.celularpaciente || a?.telefone1 || null;
 
@@ -485,9 +488,6 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             Math.round((endAt.getTime() - startAt.getTime()) / 60000),
         );
 
-        // Reconcile with records previously created by the integration flow
-        // (bookOnDoctoraliaFromVismed creates origin=VISMED rows without vismedAppointmentId).
-        // Match by clinic + doctor + startAt window to attach the VisMed id instead of duplicating.
         const existingByVismedId = await this.prisma.bookingSync.findUnique({
             where: { clinicId_vismedAppointmentId: { clinicId, vismedAppointmentId } },
         });
@@ -643,7 +643,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 vismedDoctorId: doctor?.id || null,
                 doctoraliaDoctorId,
                 doctoraliaFacilityId,
-                origin: 'VISMED',
+                origin: realOrigin,
                 status,
                 patientName: String(patientName).slice(0, 200),
                 patientPhone: patientPhone ? String(patientPhone) : null,
@@ -652,6 +652,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 duration: durationMin,
                 rawPayload: a,
                 syncedToVismed: true,
+                syncedToDoctoralia: realOrigin === 'DOCTORALIA',
                 processedAt: new Date(),
             },
             update: {
@@ -665,17 +666,21 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 rawPayload: a,
                 syncedToVismed: true,
                 processedAt: new Date(),
-                ...(existingByVismedId && (
-                    existingByVismedId.startAt.getTime() !== startAt.getTime() ||
-                    existingByVismedId.endAt.getTime() !== endAt.getTime()
-                ) ? { syncedToDoctoralia: false } : {}),
+                ...(realOrigin === 'DOCTORALIA'
+                    ? { origin: 'DOCTORALIA', syncedToDoctoralia: true }
+                    : (existingByVismedId && (
+                        existingByVismedId.startAt.getTime() !== startAt.getTime() ||
+                        existingByVismedId.endAt.getTime() !== endAt.getTime()
+                    ) ? { syncedToDoctoralia: false } : {})),
             },
         });
 
-        if (upserted.origin === 'VISMED') {
+        if (realOrigin === 'VISMED' && upserted.origin === 'VISMED') {
             await this.syncDoctoraliaBreak(upserted.id).catch((err) =>
                 this.logger.warn(`[VISMED-POLL] break sync failed: ${err.message}`),
             );
+        } else if (realOrigin === 'DOCTORALIA') {
+            this.logger.debug(`[VISMED-POLL] DOCTORALIA-origin appointment ${vismedAppointmentId} — no break needed`);
         }
 
         // Sempre que o status for CANCELLED, tentar propagar para a Doctoralia.
