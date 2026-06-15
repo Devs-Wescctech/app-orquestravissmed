@@ -229,8 +229,13 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
 
             this.logger.log(`[VISMED-POLL] Clinic ${conn.clinicId}: processed ${totalUpserts} VisMed appointments`);
 
-            if (fetchSuccess && seenVismedIds.size > 0) {
-                await this.reconcileDisappearedFromVismed(conn.clinicId, seenVismedIds, start, end).catch(err =>
+            // Antes exigíamos seenVismedIds.size > 0, mas isso QUEBRAVA o caso legítimo de
+            // "excluí o último agendamento da janela": a unidade volta vazia ([] com HTTP 200) e
+            // o cancelamento nunca era propagado — o registro ficava BOOKED para sempre. Agora
+            // basta que TODOS os fetches tenham tido sucesso (fetchSuccess). A re-confirmação
+            // dentro do reconcile protege contra glitch de API que retorne lista vazia/parcial.
+            if (fetchSuccess) {
+                await this.reconcileDisappearedFromVismed(conn.clinicId, seenVismedIds, start, end, units, baseUrl, dataini, datafim).catch(err =>
                     this.logger.warn(`[RECONCILE-DISAPPEARED] Error: ${err.message}`),
                 );
             }
@@ -252,6 +257,10 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         seenVismedIds: Set<string>,
         windowStart: Date,
         windowEnd: Date,
+        units: any[],
+        baseUrl: string | undefined,
+        dataini: string,
+        datafim: string,
     ) {
         const brtOffset = -3 * 60 * 60 * 1000;
         const dayStart = new Date(windowStart.getTime());
@@ -276,13 +285,43 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
 
         if (disappeared.length === 0) return;
 
+        // Re-confirmação anti-glitch: a VisMed pode responder HTTP 200 com lista vazia/parcial
+        // durante instabilidade. Cancelar é destrutivo (propaga p/ Doctoralia), então refazemos
+        // UMA leitura de todas as unidades e só cancelamos quem CONTINUA ausente. Se qualquer
+        // unidade falhar/não-array na reconfirmação, abortamos para não cancelar por engano.
+        const confirmSeen = new Set<string>();
+        for (const u of units) {
+            try {
+                const ags = await this.vismedService.getAgendamentos(u.vismedId, baseUrl, { dataini, datafim });
+                if (!Array.isArray(ags)) {
+                    this.logger.warn(`[RECONCILE-DISAPPEARED] reconfirmação unidade ${u.vismedId} não-array — abortando para evitar falso cancelamento`);
+                    return;
+                }
+                for (const a of ags) {
+                    const vid = a?.idpacienteagendamento ? String(a.idpacienteagendamento) : null;
+                    if (vid) confirmSeen.add(vid);
+                }
+            } catch (err: any) {
+                this.logger.warn(`[RECONCILE-DISAPPEARED] reconfirmação unidade ${u.vismedId} falhou (${err.message}) — abortando para evitar falso cancelamento`);
+                return;
+            }
+        }
+
+        const confirmedGone = disappeared.filter(
+            r => r.vismedAppointmentId && !confirmSeen.has(r.vismedAppointmentId),
+        );
+        if (confirmedGone.length === 0) {
+            this.logger.log(`[RECONCILE-DISAPPEARED] reconfirmação trouxe todos de volta — nenhum cancelamento (provável glitch transitório)`);
+            return;
+        }
+
         this.logger.log(
-            `[RECONCILE-DISAPPEARED] ${disappeared.length} appointment(s) disappeared from VisMed poll for clinic ${clinicId}`,
+            `[RECONCILE-DISAPPEARED] ${confirmedGone.length} appointment(s) confirmados ausentes na VisMed para clínica ${clinicId}`,
         );
 
         const RECENT_MOVE_GRACE_MS = 5 * 60 * 1000;
         const now = Date.now();
-        for (const rec of disappeared) {
+        for (const rec of confirmedGone) {
             try {
                 // Anti-race: se acabamos de mover este appt na VisMed (lastMoveBy=VISMED),
                 // a VisMed às vezes faz cancel+create internamente — o vismedAppointmentId
@@ -332,6 +371,15 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 await this.propagateVismedCancellationToDoctoralia(rec.id).catch(err =>
                     this.logger.warn(
                         `[RECONCILE-DISAPPEARED] propagate cancel failed for ${rec.vismedAppointmentId}: ${err.message}`,
+                    ),
+                );
+                // Agendamentos origin=VISMED criam um BREAK (bloqueio) na Doctoralia em vez de
+                // booking. O propagate acima só cancela bookings (precisa de doctoraliaBookingId).
+                // Sem esta chamada, o break permanecia na agenda da Doctoralia mesmo após o
+                // agendamento sumir da VisMed. syncDoctoraliaBreak apaga o break quando status=CANCELLED.
+                await this.syncDoctoraliaBreak(rec.id).catch(err =>
+                    this.logger.warn(
+                        `[RECONCILE-DISAPPEARED] break delete failed for ${rec.vismedAppointmentId}: ${err.message}`,
                     ),
                 );
             } catch (err: any) {
