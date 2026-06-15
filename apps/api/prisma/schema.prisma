@@ -505,3 +505,14 @@ model SyncJob {
   @@index([clinicId, status])
   @@index([type, status])
 }
+
+model SlotPushState {
+  id                 String   @id @default(uuid())
+  doctoraliaDoctorId String
+  addressId          String
+  availabilityHash   String
+  lastSyncedAt       DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@unique([doctoraliaDoctorId, addressId])
+}

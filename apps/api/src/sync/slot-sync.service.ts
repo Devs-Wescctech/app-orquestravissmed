@@ -1,6 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
+import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { DocplannerClient } from '../integrations/docplanner.service';
+import { VismedAvailabilityService, ClinicAvailability, AvailRange } from './vismed-availability.service';
 
 interface TurnoSlot {
     start: string;
@@ -10,8 +12,30 @@ interface TurnoSlot {
 @Injectable()
 export class SlotSyncService {
     private readonly logger = new Logger(SlotSyncService.name);
+    /** Hash do payload de slots vazio (`[]`) — usado para distinguir "nunca tinha nada" de "esvaziado". */
+    private readonly EMPTY_SLOTS_HASH = crypto.createHash('sha256').update(JSON.stringify([])).digest('hex');
 
-    constructor(private prisma: PrismaService) {}
+    constructor(
+        private prisma: PrismaService,
+        private availabilityService: VismedAvailabilityService,
+    ) {}
+
+    private async upsertSlotPushState(doctoraliaDoctorId: string, addressId: string, availabilityHash: string): Promise<void> {
+        try {
+            await this.prisma.slotPushState.upsert({
+                where: { doctoraliaDoctorId_addressId: { doctoraliaDoctorId, addressId } },
+                create: { doctoraliaDoctorId, addressId, availabilityHash },
+                update: { availabilityHash, lastSyncedAt: new Date() },
+            });
+        } catch (err: any) {
+            this.logger.warn(`Falha ao gravar SlotPushState (${doctoraliaDoctorId}/${addressId}): ${err.message}`);
+        }
+    }
+
+    /** Fonte dos horários: 'availability' (scheduleDay, reflete bloqueio) ou 'template' (turno_m/t/n legado). */
+    private slotSource(): 'availability' | 'template' {
+        return (process.env.SLOT_SOURCE || 'availability').toLowerCase() === 'template' ? 'template' : 'availability';
+    }
 
     parseTurno(turnoStr: string | null): TurnoSlot | null {
         if (!turnoStr || turnoStr.trim() === '-' || turnoStr.trim() === '') return null;
@@ -45,40 +69,59 @@ export class SlotSyncService {
         for (const turno of turnos) {
             const parsed = this.parseTurno(turno);
             if (!parsed) continue;
-
-            const slot: any = {
-                start: `${date}T${parsed.start}:00${timezone}`,
-                end: `${date}T${parsed.end}:00${timezone}`,
-                address_services: uniqueServiceIds.map(id => ({
-                    address_service_id: String(id),
-                    duration: slotDurationMinutes,
-                })),
-            };
-
-            if (insuranceProviderIds.length > 0) {
-                const mode = (process.env.SLOT_INSURANCE_MODE || 'with-insurance-only').toLowerCase();
-                if (mode === 'without-insurance-only') {
-                    slot.insurance_accepted = 'without-insurance-only';
-                } else if (mode === 'with-and-without-insurance') {
-                    slot.insurance_accepted = 'with-and-without-insurance';
-                    slot.insurance_providers = insuranceProviderIds;
-                    if (insurancePlanIds.length > 0) slot.insurance_plans = insurancePlanIds;
-                } else if (mode === 'none') {
-                    slot.insurance_providers = insuranceProviderIds;
-                    if (insurancePlanIds.length > 0) slot.insurance_plans = insurancePlanIds;
-                } else {
-                    slot.insurance_accepted = 'with-insurance-only';
-                    slot.insurance_providers = insuranceProviderIds;
-                    // CRITICAL: insurance_plans é OBRIGATÓRIO para a UI pública marcar a Unimed como
-                    // "agendável online" (isBookable:true). Sem ele, o convênio aparece com a tag
-                    // "(Não disponível para agendamentos online)" mesmo com providers vinculados.
-                    if (insurancePlanIds.length > 0) slot.insurance_plans = insurancePlanIds;
-                }
-            }
-
-            slots.push(slot);
+            slots.push(this.buildSlotObject(date, parsed.start, parsed.end, uniqueServiceIds, timezone, slotDurationMinutes, insuranceProviderIds, insurancePlanIds));
         }
         return slots;
+    }
+
+    /**
+     * Constrói os slots de um dia a partir das FAIXAS reais disponíveis (scheduleDay).
+     * Cada faixa contígua vira um work period. Faixas vazias (turno bloqueado na VisMed
+     * naquele dia) simplesmente não geram slot — é assim que o bloqueio é refletido.
+     */
+    buildDaySlotsFromRanges(date: string, ranges: AvailRange[], addressServiceIds: number[], timezone: string = '-03:00', slotDurationMinutes: number = 30, insuranceProviderIds: number[] = [], insurancePlanIds: number[] = []): any[] {
+        const slots: any[] = [];
+        const uniqueServiceIds = [...new Set(addressServiceIds)];
+        if (uniqueServiceIds.length === 0) return slots;
+
+        for (const range of ranges || []) {
+            if (!range?.start || !range?.end || range.end <= range.start) continue;
+            slots.push(this.buildSlotObject(date, range.start, range.end, uniqueServiceIds, timezone, slotDurationMinutes, insuranceProviderIds, insurancePlanIds));
+        }
+        return slots;
+    }
+
+    private buildSlotObject(date: string, start: string, end: string, uniqueServiceIds: number[], timezone: string, slotDurationMinutes: number, insuranceProviderIds: number[], insurancePlanIds: number[]): any {
+        const slot: any = {
+            start: `${date}T${start}:00${timezone}`,
+            end: `${date}T${end}:00${timezone}`,
+            address_services: uniqueServiceIds.map(id => ({
+                address_service_id: String(id),
+                duration: slotDurationMinutes,
+            })),
+        };
+
+        if (insuranceProviderIds.length > 0) {
+            const mode = (process.env.SLOT_INSURANCE_MODE || 'with-insurance-only').toLowerCase();
+            if (mode === 'without-insurance-only') {
+                slot.insurance_accepted = 'without-insurance-only';
+            } else if (mode === 'with-and-without-insurance') {
+                slot.insurance_accepted = 'with-and-without-insurance';
+                slot.insurance_providers = insuranceProviderIds;
+                if (insurancePlanIds.length > 0) slot.insurance_plans = insurancePlanIds;
+            } else if (mode === 'none') {
+                slot.insurance_providers = insuranceProviderIds;
+                if (insurancePlanIds.length > 0) slot.insurance_plans = insurancePlanIds;
+            } else {
+                slot.insurance_accepted = 'with-insurance-only';
+                slot.insurance_providers = insuranceProviderIds;
+                // CRITICAL: insurance_plans é OBRIGATÓRIO para a UI pública marcar a Unimed como
+                // "agendável online" (isBookable:true). Sem ele, o convênio aparece com a tag
+                // "(Não disponível para agendamentos online)" mesmo com providers vinculados.
+                if (insurancePlanIds.length > 0) slot.insurance_plans = insurancePlanIds;
+            }
+        }
+        return slot;
     }
 
     generateDateRange(startDate: Date, days: number): string[] {
@@ -100,7 +143,9 @@ export class SlotSyncService {
         syncRunId?: string,
         daysAhead: number = 30,
         clinicId?: string,
+        availability?: ClinicAvailability | null,
     ): Promise<{ success: boolean; message: string; slotsCreated: number }> {
+        const source = this.slotSource();
         const whereClause: any = { id: vismedDoctorId };
 
         const doctor = await this.prisma.vismedDoctor.findUnique({
@@ -146,7 +191,9 @@ export class SlotSyncService {
             }
         }
 
-        if (!doctor.turnoM && !doctor.turnoT && !doctor.turnoN) {
+        // No modo legado (template) os turnos são obrigatórios. No modo availability a fonte
+        // é o scheduleDay (não depende de turno_m/t/n preenchido).
+        if (source === 'template' && !doctor.turnoM && !doctor.turnoT && !doctor.turnoN) {
             return { success: false, message: `Médico ${doctor.name} não possui turnos configurados no VisMed.`, slotsCreated: 0 };
         }
 
@@ -168,6 +215,8 @@ export class SlotSyncService {
         let totalSlots = 0;
         let addressesAttempted = 0;
         let addressesFailed = 0;
+        let addressesUnchanged = 0;
+        let addressesCleared = 0;
         const dDoc = selectedMapping.doctoraliaDoctor;
 
         let doctoraliaAddresses: any[];
@@ -188,6 +237,48 @@ export class SlotSyncService {
         const startDate = new Date();
         startDate.setDate(startDate.getDate() + 1);
         const dates = this.generateDateRange(startDate, daysAhead);
+
+        // ── Disponibilidade real (scheduleDay) ────────────────────────────────────────────
+        // Categorias (idcategoriaservico) deste médico = vismedId de cada especialidade dele.
+        const doctorCategoryIds = [...new Set(
+            (doctor.specialties || [])
+                .map((ps: any) => ps?.specialty?.vismedId)
+                .filter((v: any): v is number => Number.isInteger(v))
+        )];
+
+        // Resolve o snapshot de disponibilidade. Se não veio pronto (build por clínica), constrói
+        // só para as categorias deste médico. No modo template, não precisamos de scheduleDay.
+        let avail = availability ?? null;
+        if (source === 'availability' && !avail && clinicId) {
+            avail = await this.availabilityService.buildForCategories(clinicId, doctorCategoryIds, dates);
+        }
+
+        // FAIL-SAFE: replaceSlots SUBSTITUI todo o calendário do endereço. Se a foto da
+        // disponibilidade do médico estiver INCOMPLETA (qualquer fetch scheduleDay falhou),
+        // NÃO empurramos — apagar o calendário por causa de erro de rede seria desastroso.
+        if (source === 'availability') {
+            if (!avail) {
+                const msg = `Médico ${doctor.name}: disponibilidade VisMed indisponível — slots NÃO empurrados (fail-safe).`;
+                this.logger.warn(msg);
+                if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'skipped_incomplete', msg);
+                return { success: false, message: msg, slotsCreated: 0 };
+            }
+            // Sem categorias = não conseguimos saber a disponibilidade real (especialidades não
+            // sincronizadas ainda). Tratar como INCOMPLETO — nunca como "totalmente bloqueado" —
+            // para não disparar o caminho de limpeza por inconsistência de dados.
+            if (doctorCategoryIds.length === 0) {
+                const msg = `Médico ${doctor.name}: sem especialidades VisMed mapeadas — disponibilidade desconhecida, slots NÃO empurrados (fail-safe).`;
+                this.logger.warn(msg);
+                if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'skipped_incomplete', msg);
+                return { success: false, message: msg, slotsCreated: 0 };
+            }
+            if (!avail.isComplete(doctorCategoryIds, dates)) {
+                const msg = `Médico ${doctor.name}: foto de disponibilidade INCOMPLETA (falha em alguma categoria/data) — slots NÃO empurrados para evitar apagar calendário.`;
+                this.logger.warn(msg);
+                if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'skipped_incomplete', msg);
+                return { success: false, message: msg, slotsCreated: 0 };
+            }
+        }
 
         // Cache de plan_id por provider_id (escopo: este médico). Evita N+1 quando o mesmo provider
         // aparece em múltiplos endereços. Valor -1 significa "consultado e sem planos disponíveis".
@@ -226,7 +317,8 @@ export class SlotSyncService {
                 seenServiceIds.add(key);
                 return true;
             });
-            const addressServiceIds = deduplicatedServices.map((s: any) => Number(s.id));
+            // Ordenado para hash incremental determinístico (a API Doctoralia não garante ordem estável).
+            const addressServiceIds = deduplicatedServices.map((s: any) => Number(s.id)).sort((a: number, b: number) => a - b);
             this.logger.log(`Doctor ${doctor.name} address ${addrId}: using ${addressServiceIds.length} unique address_service_ids (from ${addressServices.length} total): ${addressServiceIds.join(', ')}`);
 
             // DEBUG: log detalhado do que a Doctoralia retornou para os serviços do endereço
@@ -303,13 +395,72 @@ export class SlotSyncService {
                 if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'insurance_omitted', `Doctor ${doctor.name} addr ${addrId}: insurance_providers OMITIDO do payload (flag legacy)`);
             }
 
+            // Ordenação determinística: as listas vêm de queries sem ORDER BY, então a ordem pode
+            // variar entre execuções. Sem isso, o hash incremental muda à toa e re-empurra slots
+            // idênticos. A ordem não importa para a Doctoralia.
+            insuranceProviderIds.sort((a, b) => a - b);
+            insurancePlanIds.sort((a, b) => a - b);
+
             const allSlots: any[] = [];
             for (const date of dates) {
-                const daySlots = this.buildDaySlots(date, doctor.turnoM, doctor.turnoT, doctor.turnoN, addressServiceIds, '-03:00', 30, insuranceProviderIds, insurancePlanIds);
+                let daySlots: any[];
+                if (source === 'availability' && avail) {
+                    // Faixas REALMENTE livres deste profissional naquele dia (já sem turnos bloqueados).
+                    const ranges = avail.getRanges(Number(doctor.vismedId), date);
+                    daySlots = this.buildDaySlotsFromRanges(date, ranges, addressServiceIds, '-03:00', 30, insuranceProviderIds, insurancePlanIds);
+                } else {
+                    daySlots = this.buildDaySlots(date, doctor.turnoM, doctor.turnoT, doctor.turnoN, addressServiceIds, '-03:00', 30, insuranceProviderIds, insurancePlanIds);
+                }
                 allSlots.push(...daySlots);
             }
 
-            if (allSlots.length === 0) continue;
+            // ── Incremental: só re-empurra se a disponibilidade do endereço mudou ──────────────
+            // Hash determinístico do payload de slots. Se igual ao último push bem-sucedido,
+            // pulamos a chamada replaceSlots (idempotente) — economiza chamadas à API.
+            const availabilityHash = crypto.createHash('sha256').update(JSON.stringify(allSlots)).digest('hex');
+            const prevState = await this.prisma.slotPushState.findUnique({
+                where: { doctoraliaDoctorId_addressId: { doctoraliaDoctorId: String(dDoc.doctoraliaDoctorId), addressId: addrId } },
+            });
+
+            if (allSlots.length === 0) {
+                // Médico TOTALMENTE bloqueado neste endereço (nenhuma faixa livre na janela).
+                // Só limpamos o calendário (replaceSlots []) se a foto está completa E havia algo
+                // empurrado antes (estado prévio não-vazio). Senão, pulamos com aviso — evita
+                // wipe acidental de um calendário que nunca gerenciamos.
+                const prevWasNonEmpty = prevState && prevState.availabilityHash !== this.EMPTY_SLOTS_HASH;
+                if (source === 'availability' && prevWasNonEmpty) {
+                    if (prevState!.availabilityHash === availabilityHash) {
+                        addressesUnchanged++;
+                        this.logger.log(`Doctor ${doctor.name} address ${addrId}: já vazio (hash igual), skip.`);
+                        continue;
+                    }
+                    try {
+                        await client.replaceSlots(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, { slots: [] });
+                        await this.upsertSlotPushState(String(dDoc.doctoraliaDoctorId), addrId, availabilityHash);
+                        addressesCleared++;
+                        const msg = `Doctor ${doctor.name} address ${addrId}: agenda totalmente bloqueada na VisMed — calendário Doctoralia limpo.`;
+                        this.logger.log(msg);
+                        if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'cleared', msg);
+                    } catch (error: any) {
+                        addressesFailed++;
+                        const msg = `Doctor ${doctor.name} address ${addrId}: falha ao limpar calendário: ${error.message}`;
+                        this.logger.error(msg);
+                        if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'error', msg);
+                    }
+                } else {
+                    const msg = `Doctor ${doctor.name} address ${addrId}: nenhuma faixa livre e sem estado prévio gerenciado — skip (evita wipe acidental).`;
+                    this.logger.warn(msg);
+                    if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'skipped_empty', msg);
+                }
+                continue;
+            }
+
+            if (source === 'availability' && prevState && prevState.availabilityHash === availabilityHash) {
+                addressesUnchanged++;
+                this.logger.log(`Doctor ${doctor.name} address ${addrId}: disponibilidade inalterada (hash igual), skip replaceSlots.`);
+                if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'unchanged', `Doctor ${doctor.name} addr ${addrId}: disponibilidade inalterada, push pulado.`);
+                continue;
+            }
 
             try {
                 await client.enableCalendar(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId);
@@ -338,6 +489,7 @@ export class SlotSyncService {
                 if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'doctoralia_response', `Doctor ${doctor.name} addr ${addrId}: resposta Doctoralia: ${respStr.substring(0, 400)}`);
 
                 totalSlots += allSlots.length;
+                await this.upsertSlotPushState(String(dDoc.doctoraliaDoctorId), addrId, availabilityHash);
                 this.logger.log(`Doctor ${doctor.name}: synced ${allSlots.length} work periods to address ${addrId} for ${dates.length} days`);
                 if (syncRunId) {
                     await this.logEvent(syncRunId, 'SLOT_SYNC', 'created', `Doctor ${doctor.name}: ${allSlots.length} slots sincronizados para endereço ${addrId}`);
@@ -354,6 +506,19 @@ export class SlotSyncService {
             return {
                 success: false,
                 message: `Falha ao sincronizar slots para ${doctor.name}: ${addressesFailed}/${addressesAttempted} endereço(s) falharam.`,
+                slotsCreated: 0,
+            };
+        }
+
+        // Incremental: nada empurrado porque já estava tudo sincronizado (hash igual) ou foi
+        // limpo por bloqueio total. Isso é SUCESSO — não há trabalho a fazer.
+        if (totalSlots === 0 && (addressesUnchanged > 0 || addressesCleared > 0)) {
+            const parts: string[] = [];
+            if (addressesUnchanged > 0) parts.push(`${addressesUnchanged} inalterado(s)`);
+            if (addressesCleared > 0) parts.push(`${addressesCleared} limpo(s) por bloqueio`);
+            return {
+                success: true,
+                message: `${doctor.name}: nada a empurrar (${parts.join(', ')}).`,
                 slotsCreated: 0,
             };
         }
@@ -399,16 +564,30 @@ export class SlotSyncService {
             include: { vismedDoctor: true }
         });
 
+        const source = this.slotSource();
+
+        // Constrói a disponibilidade da clínica UMA vez (todas as categorias × janela) e reusa
+        // para todos os médicos — evita refazer as chamadas scheduleDay por médico.
+        let availability: ClinicAvailability | null = null;
+        if (source === 'availability' && clinicId) {
+            const startDate = new Date();
+            startDate.setDate(startDate.getDate() + 1);
+            const dates = this.generateDateRange(startDate, daysAhead);
+            availability = await this.availabilityService.buildForClinic(clinicId, dates);
+        }
+
         let synced = 0;
         let errors = 0;
 
         for (const m of mappedDoctors) {
-            if (!m.vismedDoctor.turnoM && !m.vismedDoctor.turnoT && !m.vismedDoctor.turnoN) {
+            // No modo legado (template) pulamos médicos sem turnos. No modo availability a
+            // fonte é o scheduleDay, então não filtramos por turno aqui.
+            if (source === 'template' && !m.vismedDoctor.turnoM && !m.vismedDoctor.turnoT && !m.vismedDoctor.turnoN) {
                 continue;
             }
 
             try {
-                const result = await this.syncSlotsForDoctor(m.vismedDoctorId, client, syncRunId, daysAhead, clinicId);
+                const result = await this.syncSlotsForDoctor(m.vismedDoctorId, client, syncRunId, daysAhead, clinicId, availability);
                 if (result.success) synced++;
                 else errors++;
             } catch (error: any) {

@@ -11,6 +11,7 @@ import { VismedService } from '../integrations/vismed/vismed.service';
 import { MappingsModule } from '../mappings/mappings.module';
 import { PushSyncService } from './push-sync.service';
 import { SlotSyncService } from './slot-sync.service';
+import { VismedAvailabilityService } from './vismed-availability.service';
 import { SyncSchedulerService } from './sync-scheduler.service';
 
 @Module({
@@ -27,7 +28,7 @@ import { SyncSchedulerService } from './sync-scheduler.service';
         }),
     ],
     controllers: [SyncController],
-    providers: [SyncService, SyncProcessor, VismedSyncProcessor, VismedService, PushSyncService, SlotSyncService, SyncSchedulerService],
+    providers: [SyncService, SyncProcessor, VismedSyncProcessor, VismedService, PushSyncService, SlotSyncService, VismedAvailabilityService, SyncSchedulerService],
     exports: [SyncService, SlotSyncService],
 })
 export class SyncModule { }

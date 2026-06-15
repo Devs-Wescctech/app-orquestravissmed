@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { DocplannerClient } from '../integrations/docplanner.service';
 import { SlotSyncService } from './slot-sync.service';
+import { VismedAvailabilityService, ClinicAvailability } from './vismed-availability.service';
 
 @Injectable()
 export class PushSyncService {
@@ -10,6 +11,7 @@ export class PushSyncService {
     constructor(
         private prisma: PrismaService,
         private slotSync: SlotSyncService,
+        private availabilityService: VismedAvailabilityService,
     ) { }
 
     async pushToDoctoralia(clinicId: string, syncRunId: string, client: DocplannerClient): Promise<void> {
@@ -63,6 +65,17 @@ export class PushSyncService {
         });
 
         this.logger.log(`Found ${mappings.length} actively mapped doctors for push sync.`);
+
+        // Disponibilidade real (scheduleDay) da clínica — construída UMA vez e reusada por todos
+        // os médicos. Reflete bloqueios de agenda da VisMed. Pulada no modo legado (template).
+        const slotSourceTemplate = (process.env.SLOT_SOURCE || 'availability').toLowerCase() === 'template';
+        let availability: ClinicAvailability | null = null;
+        if (!slotSourceTemplate) {
+            const startDate = new Date();
+            startDate.setDate(startDate.getDate() + 1);
+            const dates = this.slotSync.generateDateRange(startDate, 30);
+            availability = await this.availabilityService.buildForClinic(clinicId, dates);
+        }
 
         for (const mapping of mappings) {
             const vDoc = mapping.vismedDoctor;
@@ -131,10 +144,12 @@ export class PushSyncService {
                 await this.syncInsuranceProviders(syncRunId, client, clinicId, dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, dDoc.name);
             }
 
-            // 5. SLOT SYNC (turnos VisMed → slots Doctoralia) — always runs
+            // 5. SLOT SYNC (disponibilidade VisMed → slots Doctoralia) — always runs.
+            // No modo availability (padrão), a fonte é o scheduleDay e não dependemos de turnos.
+            // No modo template (legado), só roda se houver turno_m/t/n configurado.
             try {
-                if (vDoc.turnoM || vDoc.turnoT || vDoc.turnoN) {
-                    const slotResult = await this.slotSync.syncSlotsForDoctor(vDoc.id, client, syncRunId, 30, clinicId);
+                if (!slotSourceTemplate || vDoc.turnoM || vDoc.turnoT || vDoc.turnoN) {
+                    const slotResult = await this.slotSync.syncSlotsForDoctor(vDoc.id, client, syncRunId, 30, clinicId, availability);
                     this.logger.log(`Doctor ${dDoc.name}: [SLOTS] ${slotResult.message}`);
                     if (slotResult.success) {
                         const doctorMapping = await this.prisma.mapping.findFirst({
