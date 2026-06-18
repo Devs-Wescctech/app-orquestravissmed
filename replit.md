@@ -1,146 +1,94 @@
 # VisMed Workspace
 
 ## Overview
-A monorepo for the VisMed platform — a medical scheduling and integration dashboard.
+Monorepo da plataforma VisMed — dashboard de agendamento médico e integração que sincroniza
+bidirecionalmente a agenda da **VisMed** com a **Doctoralia/Docplanner**.
 
 ## Architecture
-- **apps/web** — Next.js 14 frontend (port 5000, proxies API calls to backend)
-- **apps/api** — NestJS backend with Prisma ORM + PostgreSQL (port 3000)
-
-## How It Runs
-The workflow starts both services together:
-1. NestJS API on port 3000 (backend)
-2. Next.js frontend on port 5000 (serves UI, proxies `/api/*` to backend)
-
-The frontend uses `next.config.js` rewrites to proxy all `/api/*` requests to the NestJS backend transparently.
+- **apps/web** — Next.js 14 frontend (porta 5000; proxia `/api/*` para o backend via rewrites em `next.config.js`).
+- **apps/api** — NestJS + Prisma ORM + PostgreSQL (porta 3000, **sem** prefixo `/api`).
 
 ## Running the App
-Workflow: `Start application` → `cd apps/api && node dist/main.js & cd apps/web && npm run dev`
+Workflow `Start application`: `cd apps/api && node dist/main.js & cd apps/web && npm run dev`
+- Build da API: `cd apps/api && npx tsc` (saída em `apps/api/dist/`). **Sempre rebuildar após mudar código da API.**
+- Package manager: **npm** (workspace monorepo).
 
 ## Key APIs
-- `POST /api/auth/login` — JWT authentication
-- `GET /api/clinics/my` — User's clinics
-- `GET /api/doctors` — Synced doctors
-- `GET /api/appointments/*` — Calendar and bookings
-- `GET /api/mappings/*` — Data mapping management
-- `POST /api/sync/:clinicId/*` — Synchronization triggers
+- `POST /api/auth/login` — autenticação JWT
+- `GET /api/clinics/my` — clínicas do usuário
+- `GET /api/doctors` — médicos sincronizados
+- `GET /api/appointments/*` — calendário e bookings
+- `GET /api/mappings/*` — gestão de mapeamentos
+- `POST /api/sync/:clinicId/*` — gatilhos de sincronização
+- `POST /api/webhooks/doctoralia` — push público de notificações Doctoralia
 
 ## Database
-Replit PostgreSQL (Prisma ORM). Schema in `apps/api/prisma/schema.prisma`.
+PostgreSQL do Replit (Prisma). Schema em `apps/api/prisma/schema.prisma`.
 
 ## Environment Variables
-- `DATABASE_URL` — PostgreSQL connection (auto-set by Replit)
-- `JWT_SECRET` — JWT signing key
-- `VISMED_API_PORT` — API port (3000)
-- `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` — Optional, for BullMQ sync queues
-
-## Package Manager
-npm (workspace monorepo).
-
-## Build Commands
-- API build: `cd apps/api && npx tsc` (outputs to `apps/api/dist/`)
-- Web dev: `cd apps/web && npm run dev`
-
-## Integrations
-- **VisMed API**: Uses `idEmpresaGestora` (stored as `clientId` in `IntegrationConnection` with provider `vismed`). Default base URL: `https://app.vissmed.com.br/api-vissmed-4/api/v1.0`. The service auto-prepends `https://` and the API path if only a domain is stored.
-- **Doctoralia/Docplanner**: OAuth2 client credentials flow. Credentials stored in `IntegrationConnection` with provider `doctoralia` (fields: `clientId`, `clientSecret`, `domain`). Domain must include `www` prefix (e.g., `www.doctoralia.com.br`). Calendar API uses dedicated endpoints: `GET .../calendar` (status), `POST .../calendar/enable`, `POST .../calendar/disable`. The `appointments.service.ts` auto-enriches doctor data (facilityId, addressId) and auto-refreshes calendarStatus from Doctoralia API when local cache is missing/stale, preventing false "disabled" blocks.
-- **Redis/BullMQ**: Used for sync job queues. When Redis is unavailable (default in Replit), the `SyncService` falls back to running sync logic directly inline. Redis errors in logs are expected and non-fatal.
-
-## Sync Architecture
-The `SyncService` orchestrates two sync pipelines:
-1. **VisMed sync** (`vismed-full`): Pulls units, specialties, professionals, and insurances (convênios) from the VisMed API. Creates `VismedUnit`, `VismedSpecialty`, `VismedDoctor`, `VismedInsurance` records and `Mapping` entries.
-2. **Doctoralia sync** (`full`): Pulls facilities, doctors, services from Docplanner API. Creates `DoctoraliaDoctor`, `DoctoraliaService`, `DoctoraliaAddressService` records and `Mapping` entries. Fetches the global services dictionary (`GET /api/v3/integration/services`, ~10,889 items) into `DoctoraliaService`, and the global insurance providers dictionary (2717+ items) into `DoctoraliaInsuranceProvider`. Runs push sync back to Doctoralia.
-3. **Global sync** (`/sync/:clinicId/global`): Triggers both pipelines in sequence.
-4. **Matching Engine**: After sync, auto-matches VisMed specialties to Doctoralia services, VisMed doctors to Doctoralia doctors, and VisMed convênios (insurances) to Doctoralia insurance providers using exact/contains/fuzzy string similarity.
-
-Both pipelines attempt BullMQ queue dispatch first, then fall back to direct inline execution if Redis is unavailable.
+- `DATABASE_URL` — conexão PostgreSQL (auto-set pelo Replit)
+- `JWT_SECRET` — chave de assinatura JWT
+- `VISMED_API_PORT` — porta da API (3000)
+- `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` — opcionais (BullMQ). Sem Redis, o sync roda inline; erros
+  `ECONNREFUSED 6379` nos logs são esperados e não-fatais.
+- Kill switches: `DISABLE_SYNC_CRON=true`, `SLOT_SOURCE=template` (modo legado de turnos),
+  `SLOT_INSURANCE_MODE` (modo de convênio dos slots).
 
 ## Default Credentials
-- Email: `admin@vismed.com`
-- Password: `admin123`
+- Email: `admin@vismed.com` · Senha: `admin123`
 
-## Mapping Module
-- **Specialty deduplication**: `getProfessionalMappings` deduplicates specialties per doctor by `normalizedName` to avoid visual duplicates (e.g., "Clinico Geral" vs "Clínico Geral").
-- **Insurance enrichment**: `findAll` for INSURANCE mappings now returns `doctoraliaCounterpart` with name/doctoraliaId from `DoctoraliaInsuranceProvider`.
-- **Specialty stats**: `GET /mappings/specialties/stats` returns totalVismedSpecialties, totalDoctoraliaServices, totalMatched, totalAutoApproved, totalPendingReview, totalUnmatched, coveragePercent.
-- **Manual approval threshold**: Insurance convênios: ONLY exact name match (100%) auto-links. All other matches (contains, token, fuzzy) go to `PENDING_REVIEW` for manual confirmation. Approve/reject via `POST /mappings/insurance/approve` and `/reject` (clinic-scoped). Re-matching skips both LINKED and PENDING_REVIEW entries.
-- **Insurance matching engine**: NOISE_WORDS are only grammatical connectives (de, do, da, etc.) — meaningful words like "cartao", "clinica", "unimed" are NOT noise. NON_INSURANCE_PATTERNS skip payment-type entries (orcamento, r$, a vista, parcelado, faturar, particular). Token-based matching uses combined score (60% token overlap + 40% dice similarity). Only exact string match auto-links; contains match goes to PENDING_REVIEW at ~90%, token match at 55%+, fuzzy match at 65%+ (must share at least one core token). Substring matching (≥4 chars) allows "clinica" ⊂ "clinicas". Rescan step auto-cleans false-positive matches when a VisMed insurance name matches NON_INSURANCE_PATTERNS.
-- **Insurance auto-push on approval**: When a convênio is approved via `POST /mappings/insurance/approve`, the frontend automatically triggers `POST /sync/:clinicId/insurance` to push all LINKED insurances to all doctors in Doctoralia.
-- **Profissionais tab**: Shows sync status indicator (Completo/Parcial/Sem Turnos/Pendente) instead of manual sync button — sync is fully automatic via global pipeline. `calendarStatus` defaults to `'unknown'` (not `'enabled'`) to prevent false "Completo" status. Only set to `'enabled'` after successful slot sync in push-sync. Frontend treats `unknown` as non-complete.
-- **Orphan cleanup safety**: `cleanupOrphans` in sync.processor.ts skips orphaning when activeIds is empty (for ALL entity types, not just DOCTOR).
+## Integrations
+- **VisMed API**: `idEmpresaGestora` guardado como `clientId` em `IntegrationConnection` (provider `vismed`).
+  Base URL default `https://app.vissmed.com.br/api-vissmed-4/api/v1.0`. O serviço auto-prepende `https://` e o
+  caminho da API se só o domínio estiver salvo.
+- **Doctoralia/Docplanner**: OAuth2 client credentials. Credenciais em `IntegrationConnection` (provider
+  `doctoralia`: `clientId`, `clientSecret`, `domain`). `domain` deve incluir `www` (ex.: `www.doctoralia.com.br`).
+  ⚠️ Contratos implícitos não-óbvios da página pública (insurance_support, insurance_plans, slot insurance_accepted)
+  estão em `.agents/memory/doctoralia-api-gotchas.md` — leia antes de mexer em convênio/slots.
+- **Redis/BullMQ**: filas de sync; fallback inline quando indisponível (default no Replit).
 
-## Turnos (Work Shifts) Module
-- **turnoM/T/N fields** on `VismedDoctor`: Stores morning/afternoon/night shift times (e.g. `"08:00 - 12:00"`).
-- **Sync paths**: Both `sync.service.ts` (global sync) and `vismed-sync.processor.ts` (queue-based) persist turno data from VisMed API field `turno_m/t/n`.
-- **SlotSyncService** (`slot-sync.service.ts`): Converts turnoM/T/N into Doctoralia calendar work periods via `replaceSlots` API. Sends work periods (e.g., 08:00-12:00 with duration=30) and lets Docplanner calculate individual bookable slots — per API docs: "Add work periods, not individual slots". Deduplicates address services by `service_id`. Auto-enables calendar before sending; skips address on 4xx enable failure. `deleteSlots` uses `DELETE .../slots/{date}` (per-date, not range query params). `address_service_id` sent as string per API spec.
-- **Bloqueio de agenda VisMed → slots (availability mode, 15/Jun/2026)**: A VisMed NÃO tem endpoint de "bloqueio"; um bloqueio simplesmente faz o `schedule/online/scheduleDay` parar de retornar aqueles horários. Por isso o `scheduleDay` (disponibilidade REAL por médico/data) virou a fonte de verdade dos work periods, substituindo o template fixo `turno_m/t/n`. **Kill switch**: env `SLOT_SOURCE=template` reverte para o modo legado (turnos). Default = `availability`.
-  - **`VismedAvailabilityService`** (`vismed-availability.service.ts`): por `(idcategoriaservico, data)` faz 1 chamada `scheduleDay` (concorrência 5, coalesce de chamadas idênticas), agrupa os intervalos livres por `(idprofissional, data)` e coalesce horários contíguos em ranges. Rastreia falhas de fetch por `(categoria,data)` para saber se a foto do médico está COMPLETA. `buildForClinic` monta tudo uma vez por clínica; `push-sync` e `syncAllSlots` constroem a disponibilidade 1× e repassam a todos os médicos (evita explosão de chamadas).
-  - **Janela**: 30 dias (hoje+1 … +30). Roda dentro do sync global (cron 2h).
-  - **FAIL-SAFE anti-wipe (CRÍTICO)**: `replaceSlots` é um PUT que SUBSTITUI o calendário inteiro do endereço. No modo availability o médico é PULADO (`skipped_incomplete`, sem apagar nada) quando: (a) disponibilidade indisponível, (b) **médico sem especialidades VisMed mapeadas** (`doctorCategoryIds` vazio → disponibilidade desconhecida, NÃO tratar como "bloqueio total"), ou (c) qualquer fetch `scheduleDay` da categoria/data falhou (foto incompleta). Bloqueio TOTAL (sem faixas livres) só limpa o calendário (`replaceSlots []`) se a foto está completa E existe `SlotPushState` anterior não-vazio; senão `skipped_empty` com warning.
-  - **Incremental por endereço (`SlotPushState`)**: model `SlotPushState(doctoraliaDoctorId, addressId, availabilityHash, lastSyncedAt; @@unique[doctoraliaDoctorId, addressId])`. Hash = sha256 de `allSlots`; se igual ao último, pula o `replaceSlots` (`unchanged`). `EMPTY_SLOTS_HASH` representa calendário vazio. **Determinismo do hash**: `insuranceProviderIds`, `insurancePlanIds` e `addressServiceIds` são ordenados antes de montar `allSlots` (as queries/API não garantem ordem estável) — sem isso o hash mudava à toa e re-empurrava slots idênticos. Desbloqueio reflete automaticamente: o `scheduleDay` volta a retornar os horários → hash muda → re-push.
-  - **Eventos `SLOT_SYNC`**: `created` (push feito), `unchanged` (hash igual, pulado), `skipped_empty` (bloqueio total sem estado prévio), `skipped_incomplete` (foto incompleta / sem categorias), `cleared` (calendário esvaziado por bloqueio total com estado prévio).
-- **Calendar Breaks API**: `DocplannerClient` supports `getCalendarBreaks`, `addCalendarBreak`, `moveCalendarBreak`, `deleteCalendarBreak`.
-- **Endpoints**: `POST /sync/:clinicId/slots/:vismedDoctorId` (single), `POST /sync/:clinicId/slots` (all), `GET /sync/shifts/:vismedDoctorId`, `POST /sync/:clinicId/calendar/:doctorId/enable|disable`.
-- **Push-sync integration**: After services delta sync, automatically syncs insurance providers (step 4) and slots (step 5) for all doctors. Slots are always evaluated — doctors with turnos get slots pushed, doctors without turnos get a skip event logged.
-- **Insurance push sync**: Compares LINKED insurance mappings in DB with current providers on Doctoralia per address. Adds missing, removes extra. Endpoints: `POST /sync/:clinicId/insurance` (all doctors), `GET /sync/:clinicId/insurance/:doctoraliaDoctorId` (single doctor). The standalone `POST /sync/:clinicId/insurance` endpoint creates a `SyncRun` of type `'insurance'` so warnings appear in the dashboard.
-- **Anti-regression check (24/Apr/2026)**: After every push, `syncInsuranceProviders` waits 500ms then re-fetches the address providers and counts those LINKED but with zero `insurance_plans`. Each occurrence is logged as a `SyncEvent` with `entityType='INSURANCE_PUSH'` + `action='regression_warning'` + the offending provider IDs. The result includes `providersWithoutPlans`/`providersMissingPlanIds`. The `/sync/:clinicId/status` endpoint reads warnings from the latest completed `SyncRun` of type `full` OR `insurance` and exposes `insurance.regressionWarnings` + `insurance.regressionDetails`. The `/sync` page shows an amber banner whenever `regressionWarnings>0` so silent regressions become visible without having to inspect the public Doctoralia page.
-- **`address.insurance_support` (CRITICAL — bug raiz descoberto 24/Apr/2026)**: O `PATCH /addresses/{id}` aceita SOMENTE 3 valores em `insurance_support`: `'private'`, `'insurance'`, `'private_and_insurance'`. **`'private'` faz a página pública mostrar "Planos de saúde não aceitos / só aceita pacientes particulares" mesmo que existam `insurance-providers` vinculados com planos.** Era esse o motivo real do problema relatado. O `push-sync.service.ts` fazia fallback para `'private'` toda vez no `ADDRESS_PUSH`, derrubando o trabalho do `INSURANCE_PUSH` posterior. Agora o sync conta `Mapping` `entityType=INSURANCE` `status=LINKED` da clínica e envia `'private_and_insurance'` se há ao menos 1, senão `'private'`. Valores como `'with-and-without-insurance'` (válidos para slots) **NÃO** são aceitos no address — retornam 400 `"Value is invalid"`.
-- **Insurance payload (CRITICAL — confirmed via UI testing 24/Apr/2026)**:
-  - `POST/PUT /addresses/{id}/insurance-providers` payload MUST include `{insurance_provider_id: N, insurance_plans: [{insurance_plan_id: M}]}`. Without `insurance_plans`, the public UI shows "Planos de saúde **não aceitos** — Este especialista só aceita pacientes particulares" and `doctor-is-private-only="true"`, blocking all booking-by-insurance. With at least one plan attached, UI flips to "Planos de saúde **aceitos**" and `doctor-is-private-only="false"`. Push sync auto-resolves the first plan from `GET /insurance-providers/{id}/plans` (`_items[0]`) and attaches it. Returns 204.
-  - **Slot payload (CRITICAL — bug 24/Apr/2026)**: além de `insurance_accepted: "with-insurance-only"` + `insurance_providers: [N]`, **TAMBÉM precisa enviar `insurance_plans: [planId, planId, ...]`** no slot. Sem `insurance_plans`, o convênio aparece listado como "Planos de saúde aceitos" mas vem com a tag "**(Não disponível para agendamentos online)**" ao lado, e o atributo Vue `all-bookable-insurances` retorna `isBookable:false`. Com `insurance_plans`, a tag desaparece e `isBookable:true`. O `slot-sync.service.ts` agora chama `getInsurancePlans(providerId)` para cada provider LINKED e injeta os plan IDs no slot. `with-and-without-insurance` was confirmed to make the UI show "Não tem vagas online com convênio" — Doctoralia treats those slots as private-only by default. The 3 valid enum values are `with-insurance-only` (default), `with-and-without-insurance`, `without-insurance-only`.
-  - Override via env `SLOT_INSURANCE_MODE`: `with-insurance-only` (default), `with-and-without-insurance`, `without-insurance-only`, or `none` (legacy: send only providers, no `insurance_accepted` field).
-  - Trade-off: with the default `with-insurance-only`, slots only accept the linked insurances; private patients cannot book those exact slots. To support both, the doctor's calendar must mix slots with different `insurance_accepted` values (not currently implemented — single mode per sync run).
-  - **End-to-end validation (24/Apr/2026)**: validado via `POST /sync/:clinicId/global` (nosso endpoint, autenticado com JWT do admin). Cenário: Aaron foi degradado manualmente (`insurance_support='private'`, providers removidos, slots deletados); HTML público confirmou `doctor-is-private-only="true"`. Após disparar o sync pelo nosso endpoint, eventos `ADDRESS_PUSH updated → private_and_insurance`, `INSURANCE_PUSH added` (provider 36 com plano 225) e `SLOT_SYNC created` (60 slots/endereço × 5 médicos) executaram. HTML público pós-sync: `doctor-is-private-only="false"` + `all-bookable-insurances=[{"id":36,"name":"Unimed","isBookable":true}]`. Fluxo end-to-end aprovado: o sync padrão do nosso sistema corrige automaticamente o estado degradado.
-- **Auto Sync Scheduler (24/Apr/2026)**: `SyncSchedulerService` (`apps/api/src/sync/sync-scheduler.service.ts`) usa `@Cron('0 */2 * * *', timeZone:'America/Sao_Paulo')` via `@nestjs/schedule` para disparar `triggerGlobalSync(clinicId)` para cada clínica ativa a cada 2 horas (no minuto 0 de horas pares). Anti-overlap: pula clínica que já tem `SyncRun.status='running'`. Failsafe: erro em uma clínica não derruba as outras (try/catch por clínica). Kill switch via env `DISABLE_SYNC_CRON=true`. Log inicial de boot indica se cron está ATIVO ou DESATIVADO. ScheduleModule registrado em `app.module.ts`.
-- **Reagendamento bidirecional (30/Apr/2026)**: VisMed↔Doctoralia. Como a VisMed NÃO tem endpoint de "alterar agendamento" (info do TI), o reagendamento sempre é cancela+recria do lado da VisMed; do lado da Doctoralia usamos `client.moveBooking`. (1) **VisMed→Doctoralia**: no `upsertVismedAppointment`, comparamos `previousStartAt` vs `startAt` do agendamento (mesmo `vismedAppointmentId`, status vivo BOOKED/CONFIRMED). Se mudou, `propagateVismedRescheduleToDoctoralia` chama `DocplannerClient.moveBooking(facility, doctor, address, bookingId, {address_service_id, duration, start})`. 404 trata como sucesso (sumiu lá). (2) **Doctoralia→VisMed**: notificação `booking-moved` aciona `handleBookingMoved` (com idempotência: se `existing.startAt === newStartAt` é no-op). Atualiza `startAt/endAt` localmente e chama `propagateDoctoraliaRescheduleToVismed`. Cria novo agendamento na VisMed PRIMEIRO (via `createVismedAppointment` reutilizando construtor de payload), persiste o NOVO `vismedAppointmentId` no BookingSync IMEDIATAMENTE, e SÓ DEPOIS cancela o antigo via `cancelarAgendamento`. (3) Premissa: **médico não muda** em reagendamento (info do produto). (4) **Anti-eco PREVENTIVO** via 3 novos campos `BookingSync.lastMoveBy/lastMoveAt/lastMoveTargetStartAt`: gravados ANTES da chamada externa, assim a notificação de confirmação que volta da outra ponta já encontra o flag. `isRescheduleEco` retorna true se `lastMoveAt < 5min` E `lastMoveTargetStartAt === novoStart`. (5) **Reschedule-orphan reconcile** (em `upsertVismedAppointment`): se o crash ocorrer entre criar o agendamento na VisMed e gravar `vismedAppointmentId`, o próximo poll detecta o agendamento "novo" sem casamento, busca por `lastMoveBy='DOCTORALIA' + lastMoveTargetStartAt` próximo nas últimas 24h e anexa, evitando duplicação. (6) Status volta a `BOOKED` após reagendamento bem-sucedido. (7) Reagendamento para o passado é bloqueado com warning + `syncError`. (8) Falha → `syncError` + retry no próximo ciclo de poll (igual ao cancelamento).
-- **Fix: Cancelamento bidirecional completo + Reconciliação automática (04/May/2026)**: (1) `cancelOnDoctoraliaFromVismed` agora cancela em AMBAS as pontas (Doctoralia + VisMed + break), não só na Doctoralia. Novo método centralizado `cancelSyncRecord` trata todos os casos. (2) Novo endpoint `DELETE /booking-sync/cancel-record/:id` permite cancelar por BookingSync ID (para registros sem `doctoraliaBookingId`). (3) Frontend: botão cancelar aparece para TODOS os bookings (não só os que têm `doctoraliaBookingId`). (4) **Reconciliação automática** (`reconcileUnlinkedWithDoctoralia`): ao final de cada poll VisMed, busca registros BookingSync sem `doctoraliaBookingId` e tenta casar com bookings vivos na Doctoralia (mesmo doctor, startAt ±2min). Resolve o problema de notificações perdidas (GET é destrutivo na API Doctoralia).
-- **Fix: Booking Doctoralia gerando breaks indevidos + Reconciliação de cancelamentos (04/May/2026)**: (1) **Bug 1 — breaks indevidos**: Bookings origin=DOCTORALIA estavam gerando breaks na Doctoralia (loop). Fix em 3 camadas: (a) orphan reconcile agora busca por `vismedDoctorId OR doctoraliaDoctorId` com janela ±2min, e se orphan for DOCTORALIA NÃO chama `syncDoctoraliaBreak`; (b) ANTES do upsert principal, busca registro DOCTORALIA existente com mesmo doctor+horário±2min — se encontrar, atualiza esse registro em vez de criar novo; (c) upsert final só chama `syncDoctoraliaBreak` se `upserted.origin === 'VISMED'`. (2) **Bug 2 — cancelamento Doctoralia perdido**: Novo método `reconcileCancelledOnDoctoralia` roda ao final de `pollVismedClinic`. Busca BookingSync linkados (com `doctoraliaBookingId`, status BOOKED/CONFIRMED), verifica na API Doctoralia se o booking ainda existe/está ativo — se cancelado ou ausente, propaga cancelamento para VisMed via `propagateDoctoraliaCancellationToVismed`. (3) **Otimização 422 "Same Date Range"**: `syncDoctoraliaBreak` agora trata 422 "Same Date Range" como sucesso silencioso (no-op), e faz early-return quando `syncedToDoctoralia=true` + `doctoraliaBreakId` presente. Elimina ~7 chamadas API desnecessárias por ciclo de poll.
-- **Fix: Cancelamento VisMed→Doctoralia por "desaparecimento" (04/May/2026)**: Quando um agendamento é cancelado na VisMed, a API simplesmente para de retorná-lo no poll (não envia `cancelado=1`). Antes, o sistema só detectava cancelamento pelo campo `cancelado` no payload — agendamentos que "sumiam" ficavam eternamente BOOKED no banco. Fix: novo método `reconcileDisappearedFromVismed` roda ao final de cada `pollVismedClinic`. Coleta todos os `vismedAppointmentId` retornados pela API, compara com registros ativos (BOOKED/CONFIRMED) no banco dentro da janela do poll. Registros que não aparecem mais são marcados CANCELLED (`cancelledBy=VISMED`) e propagados para Doctoralia via `propagateVismedCancellationToDoctoralia`. Safeguards: só roda se TODOS os fetches de unidades tiveram sucesso (`fetchSuccess`) E pelo menos 1 agendamento foi retornado (`seenVismedIds.size > 0`) — previne falsos positivos por erro de rede ou API fora do ar.
-- **Fix: Detecção de origem Doctoralia no poll VisMed (04/May/2026)**: Quando paciente agenda pela Doctoralia, a integração cria automaticamente na VisMed. O poll VisMed detectava primeiro e marcava `origin=VISMED` (roxo no calendário + criava break indevido). Fix: `upsertVismedAppointment` agora detecta `agendamentoonline='1' + idpacienteagendamentocanal=2` no payload VisMed como indicador de origem Doctoralia. Nesses casos: `origin=DOCTORALIA`, `syncedToDoctoralia=true`, e **não cria break**. Funciona tanto no create quanto no update path (corrige registros existentes a cada ciclo de poll). Break suppression usa `realOrigin` computado em vez de `upserted.origin` persistido, evitando stale data.
-- **Fix: handleSlotBooked salva vismedAppointmentId (04/May/2026)**: Corrigido bug em `handleSlotBooked` que criava o agendamento na VisMed (via `createVismedAppointment`) mas NÃO salvava o `vismedAppointmentId` de volta no BookingSync. Consequência: o poll VisMed encontrava o agendamento "solto", criava SEGUNDO registro (origin=VISMED), e o dashboard mostrava duplicata (1 DOCTORALIA + 1 VISMED para o MESMO appointment). Fix: extrai `idpacienteagendamento` do resultado e grava no update. Também estendeu o orphan reconcile para buscar registros de QUALQUER origin (não só VISMED) com `vismedAppointmentId=null` — assim, mesmo se o handler falhar entre criar na VisMed e salvar o ID, o poll seguinte casa o registro.
-- **Cancelamento bidirecional (30/Apr/2026)**: VisMed↔Doctoralia. (1) Quando o poll detecta `cancelado='1'` em um agendamento VisMed, `propagateVismedCancellationToDoctoralia()` chama `DocplannerClient.cancelBooking()`. (2) Quando notificação `booking-canceled` chega via polling Doctoralia, `propagateDoctoraliaCancellationToVismed()` chama `VismedService.cancelarAgendamento()` (POST multipart `/api-vissmed-4/api/v1.0/delete-agendamento` com campo `id=idpacienteagendamento`, conforme spec do TI VisMed). Anti-loop via campo `BookingSync.cancelledBy` ('VISMED'|'DOCTORALIA'|'INTEGRATION') — eco da notificação NÃO repropaga. Idempotente: 404 (`err.status===404` ou regex no msg) tratado como sucesso (já cancelado). Auto-retry: enquanto `syncedToVismed/syncedToDoctoralia=false`, cada novo ciclo de poll tenta novamente e marca `syncError`. NO_SHOW NÃO propaga (preserva histórico). Funciona tanto no upsert normal quanto no caminho de orphan reconcile.
-- **Specialty matching rule (24/Apr/2026)**: `MatchingEngineService` aplica 3 faixas: `score ≥ 0.90` → auto-aprovado (`requiresReview=false`), `0.60 ≤ score < 0.90` → cria com `requiresReview=true` (botões Aprovar/Rejeitar na UI `/mapping`), `score < 0.60` → não cria.
-  - **CRÍTICO — Push/Slot Sync respeitam `requiresReview` (24/Apr/2026)**: tanto `push-sync.service.ts` (que adiciona/remove serviços do médico nos endereços Doctoralia) quanto `slot-sync.service.ts` (que cria horários disponíveis) agora usam `where: { isActive: true, requiresReview: false }` ao carregar `specialty.mappings`. Mappings pendentes (0.60-0.89) **NÃO** são empurrados pra Doctoralia até serem aprovados manualmente em `/mapping → Especialidades`. Antes, esses 13 mappings pending estavam sendo empurrados automaticamente — incluindo absurdos como "Estética → Estética genital masculina" para Andre Matos. Após aprovação manual, o próximo sync já leva os dados.
-  - **Bug fix (24/Apr/2026)**: o controller `GET /mappings/specialties/matches` ficou robusto contra strings não-booleanas (`undefined`, `null`, vazias) no query param `requiresReview`. Antes, axios mandava `?requiresReview=undefined` quando o frontend não filtrava, e o controller interpretava isso como "filtrar por false", retornando só os 51 aprovados em vez dos 64 totais. Agora só `'true'` ou `'false'` ativam filtro; qualquer outra coisa retorna todos. Frontend `mapping-data.ts` também foi blindado para nunca enviar params undefined. **Layer 1.5 ("Token Containment Match")** substituiu o antigo "Contains" que inflava cego para 0.90: agora tokeniza com filtro de noise (`primeira/consulta/retorno/de/da/...`), exige palavra inteira (não substring), e calcula score como `0.5×coverage + 0.5×reverseCoverage` — isso elimina falsos positivos como "Pediatria"→"odontopediatria" e "Geriatria"→"psicogeriatria". Endpoint admin `POST /mappings/specialties/recompute-scores` reavalia todos os mappings ativos APPROXIMATE (preserva EXACT/SYNONYM/MANUAL) e reclassifica conforme nova regra. Boot reclassifier (`onApplicationBootstrap`) também força `requiresReview=true` em qualquer mapping com `score<0.90` que ainda esteja como auto.
-- **Sync status dashboard**: `GET /sync/:clinicId/status` returns health status (healthy/warning/error/never_synced), doctor counts (clinic-scoped), insurance breakdown (linked/pending/unlinked), and recent runs. Frontend `/sync` page shows status-based dashboard with auto-polling (3s when syncing, 15s idle).
-- **Queue toggle**: `POST /sync/:clinicId/queue/toggle { enabled: bool }` pauses/resumes sync by setting `IntegrationConnection.status` to `paused`/`connected`. Only transitions paused↔connected (preserves other states). Validates boolean input. `triggerManualSync` and `triggerGlobalSync` check queue status and reject syncs when paused.
-- **Frontend**: Mapping page shows turno badges (M/T/N with times), "Sync Slots" button per professional, calendar toggle.
+## Sync Architecture
+`SyncService` orquestra os pipelines (BullMQ primeiro, fallback inline):
+1. **VisMed sync** (`vismed-full`): unidades, especialidades, profissionais, convênios → `VismedUnit/Specialty/Doctor/Insurance` + `Mapping`.
+2. **Doctoralia sync** (`full`): facilities, doctors, services + dicionários globais de serviços (~10.889) e
+   de convênios (2717+) → `DoctoraliaDoctor/Service/AddressService/InsuranceProvider` + `Mapping`. Roda push de volta.
+3. **Global** (`/sync/:clinicId/global`): dispara os dois em sequência.
+4. **Matching Engine**: auto-casa especialidades↔serviços, médicos↔médicos, convênios↔providers (exato/contains/fuzzy).
+- **Auto Sync Scheduler** (`sync-scheduler.service.ts`): `@Cron('*/30 * * * *', America/Sao_Paulo)` dispara o sync
+  global de cada clínica ativa a cada 30 min. Roda in-process (não sofre timeout do gateway). Anti-overlap triplo
+  (flag global + `SyncRun.status='running'` por clínica + limpeza de lock travado). Failsafe por clínica (try/catch).
 
-## Multi-Tenant Security
-- **User-clinic validation**: All `/sync/:clinicId/*` endpoints validate that the authenticated user has a role (`UserClinicRole`) for the specified `clinicId` before proceeding. Implemented via `validateUserClinicAccess()` in `SyncController`.
-- **Doctor-clinic scoping**: `validateDoctorBelongsToClinic()` and `validateDoctoraliaDoctorBelongsToClinic()` ensure doctors belong to the clinic via `Mapping` table lookups.
-- **Professional list scoping**: `getProfessionalMappings(clinicId)` only returns doctors that have a `Mapping` entry for the given clinic (filters by `vismedId in clinicVismedDoctorIds`).
-- **Slot sync mapping scoping**: When `clinicId` is provided, `syncSlotsForDoctor` resolves the correct `ProfessionalUnifiedMapping` by filtering to vismed doctor IDs linked to the clinic.
-
-## Bidirectional Booking Sync (VisMed ↔ Doctoralia)
-- **BookingSyncService** (`apps/api/src/bookings/booking-sync.service.ts`): Core sync engine. Handles `slot-booked`, `booking-canceled`, `booking-moved` notifications from Doctoralia. Creates mirror appointments in VisMed. Uses atomic upsert for dedup to prevent race conditions on concurrent notifications.
-- **Webhook endpoint**: `POST /webhooks/doctoralia` — public push endpoint for Doctoralia notifications. Resolves clinic by facilityId matching or falls back to first connected clinic.
-- **Pull polling**: Staggered per-clinic polling via `startStaggeredPolling()`. Each clinic gets its own interval (base 3min, staggered by 6s per clinic). First poll delayed 15s after startup. Falls back to single-loop polling if no connections found.
-- **BookingSyncController** (`/booking-sync/*`): Auth-protected endpoints — `GET /records` (with `start/end` date filters), `GET /stats`, `GET /health` (queue depth, rate limiter stats), `GET /metrics` (per-clinic throughput), `POST /retry-dead-letters`, `POST /book-from-vismed`, `DELETE /cancel/:id`, `POST /poll`.
-- **BookingSync DB model**: Tracks all synced bookings with origin (VISMED/DOCTORALIA), status (BOOKED/CONFIRMED/CANCELLED/MOVED/FAILED/PROCESSING), patient data, timestamps, sync flags (`syncedToVismed`, `syncedToDoctoralia`). `doctoraliaBookingId` has unique index for dedup.
-- **Frontend**: Weekly calendar view at `/appointments`. Doctor sidebar, unified V/D sync badges per appointment. Create/cancel booking modals with simultaneous VisMed+Doctoralia sync.
-- **Dedup mechanism**: `booked_by === 'integration'` skips reverse sync (prevents loops). Atomic upsert with PROCESSING status prevents duplicate VisMed appointments from concurrent webhook/poll.
-
-## Scalability Architecture (30 clinics × 400 bookings/day)
-- **PostgreSQL-backed job queue** (`SyncJob` table + `QueueService`): Replaces Redis/BullMQ dependency. Claims jobs with `FOR UPDATE SKIP LOCKED` for safe concurrency. Aggressive worker loop fills up to 10 concurrent slots per tick (1s interval). Supports priorities, exponential backoff (2^attempt seconds, max 5min), and dead-letter after 5 failed attempts. Stale lock cleanup every 60s (properly tracked and cleared on shutdown).
-- **Rate limiter** (`RateLimiterService`): Token bucket per provider. Doctoralia: 30 tokens, refill 10/s. VisMed: 20 tokens, refill 8/s. Auto-waits when bucket is empty.
-- **Staggered polling**: Each clinic polls independently on its own interval, spread 6s apart. Dynamically refreshes every 5min to pick up new/removed clinic connections without restart.
-- **Job deduplication**: Uses `dedupKey` (format: `clinicId:eventType:bookingId`) to prevent duplicate jobs from concurrent webhook + polling. Both `enqueue` and `enqueueBatch` check for existing PENDING/RUNNING jobs with same key.
-- **Webhook security**: Clinic resolution requires exact facilityId match — no fallback to first connection. Prevents cross-tenant data corruption.
-- **Monitoring**: `GET /booking-sync/health` (queue depth, active jobs, dead letters, rate limiter stats), `GET /booking-sync/metrics` (per-clinic throughput in last 24h), `POST /booking-sync/retry-dead-letters` (clinic-scoped only, requires clinicId).
-- **Key files**: `apps/api/src/bookings/queue.service.ts`, `apps/api/src/bookings/rate-limiter.service.ts`.
+## Modules (resumo)
+- **Mapping** (`/mappings/*`): dedup de especialidades por `normalizedName`; stats de cobertura; aprovação
+  manual de matches. Especialidades: `score≥0.90` auto-aprova, `0.60–0.89` cria com `requiresReview=true`
+  (aprovar em `/mapping`), `<0.60` não cria. Push/slot sync usam `requiresReview:false` — pendentes NÃO vão pra
+  Doctoralia até aprovados. Convênios: só match exato (100%) auto-linka; resto vai a `PENDING_REVIEW`. Aprovar
+  convênio dispara push automático.
+- **Turnos / Slots**: `turnoM/T/N` no `VismedDoctor`. `SlotSyncService` empurra work periods via `replaceSlots`
+  (PUT que substitui o calendário inteiro do endereço). **Fonte de verdade = `scheduleDay`** (disponibilidade real;
+  bloqueio na VisMed faz o horário sumir). Anti-wipe + incremental por hash (`SlotPushState`). Detalhes e limites em
+  `.agents/memory/vismed-slot-availability.md` e `vismed-schedule-day-blocks.md`.
+- **Bidirectional Booking Sync** (`BookingSyncService`): espelha bookings VisMed↔Doctoralia (slot-booked,
+  booking-canceled, booking-moved) via webhook + polling escalonado por clínica. Cancelamento e reagendamento
+  bidirecionais com reconciliação ao fim de cada poll e anti-loop/anti-eco. Princípios em
+  `.agents/memory/booking-sync-reconciliation.md` e `vismed-cancellation-disappearance.md`.
+- **Multi-Tenant Security**: todos os `/sync/:clinicId/*` validam `UserClinicRole` do usuário; médicos são
+  escopados à clínica via `Mapping` (`validateDoctorBelongsToClinic` usa `Mapping.vismedId` = UUID do VismedDoctor).
+- **Scalability** (30 clínicas × 400 bookings/dia): job queue em PostgreSQL (`SyncJob` + `QueueService`, `FOR UPDATE
+  SKIP LOCKED`, backoff exponencial, dead-letter após 5 tentativas); rate limiter token-bucket por provider;
+  polling escalonado; dedup por `dedupKey`; webhook exige match exato de facilityId (sem fallback cross-tenant).
 
 ## Key Files
-- `apps/web/src/lib/api.ts` — HTTP client (fetches `/api/*` via Next.js proxy)
-- `apps/web/src/lib/store.ts` — Zustand auth store with persist + hydration tracking (`_hasHydrated`)
-- `apps/web/src/lib/clinic-store.ts` — Zustand clinic selection store with persist
-- `apps/web/src/components/client-providers.tsx` — Client-side providers (Toaster) wrapper for RootLayout
-- `apps/web/src/middleware.ts` — Auth middleware (cookie-based token check)
-- `apps/web/next.config.js` — Next.js config with API proxy rewrites
-- `apps/api/src/main.ts` — NestJS entry point
-- `apps/api/src/app.module.ts` — NestJS root module
-- `apps/api/prisma/schema.prisma` — Database schema
+- `apps/web/src/lib/api.ts` — HTTP client (via proxy `/api/*`)
+- `apps/web/src/lib/store.ts` / `clinic-store.ts` — Zustand (auth + seleção de clínica, com persist)
+- `apps/web/next.config.js` — rewrites do proxy da API
+- `apps/web/src/middleware.ts` — auth middleware (cookie)
+- `apps/api/src/main.ts` / `app.module.ts` — entry point / root module NestJS
+- `apps/api/src/sync/` — scheduler, slot-sync, vismed-availability, push-sync, sync.controller
+- `apps/api/src/bookings/booking-sync.service.ts` — engine de sync de bookings
+- `apps/api/prisma/schema.prisma` — schema do banco
 
-- **Fix: Anti-race RECONCILE-DISAPPEARED em VisMed→VisMed move (04/May/2026)**: Quando o usuário move um agendamento dentro da VisMed, a API às vezes deixa de retornar o `vismedAppointmentId` no poll seguinte (transitório, ou cancel+create interno). O `reconcileDisappearedFromVismed` interpretava como cancelamento e propagava `cancelBooking` para Doctoralia — acabando com o agendamento que o usuário acabou de remarcar. Fix: grace de 5 min — se `lastMoveBy='VISMED'` e `lastMoveAt` < 5 min, pula a propagação. Caso seja cancelamento real, será capturado após expirar a grace. Complementa o grace já existente em `RECONCILE-CANCEL` (lado Doctoralia).
-
-- **Fix: Anti-race RECONCILE-CANCEL com adopt no lado Doctoralia (04/May/2026)**: Sintoma: 3 min após mover na VisMed, o appt era cancelado na VisMed. Causa: a Doctoralia faz cancel+create internamente em moveBooking — o doctoraliaBookingId antigo fica CANCELLED e um novo aparece ATIVO no horário-alvo. O `reconcileCancelledOnDoctoralia` via o ID antigo cancelado e propagava `cancelAppointment` para a VisMed. Fix: novo `tryAdoptDoctoraliaReplacement` busca em `liveActive` um booking ativo no `lastMoveTargetStartAt` (±2min) e rebinda o doctoraliaBookingId no rec existente (transação interativa com guards otimistas). Grace estendido de 3min para 10min. Cancel `updateMany` agora exige `doctoraliaBookingId` inalterado.
+## User Preferences
+- **Idioma**: sempre responder em **português do Brasil (pt-BR)**.
+- **Memória de detalhes**: lições profundas e gotchas de API externa ficam em `.agents/memory/` (índice em
+  `MEMORY.md`); manter o `replit.md` enxuto como README estrutural, não como changelog.
