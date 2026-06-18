@@ -20,11 +20,11 @@ export class SyncSchedulerService implements OnModuleInit {
         if (this.disabled) {
             this.logger.warn('[SCHEDULER] Sync cron DESATIVADO via DISABLE_SYNC_CRON=true.');
         } else {
-            this.logger.log('[SCHEDULER] Sync cron ATIVO — global sync VisMed↔Doctoralia executa a cada 2 horas (cron: 0 */2 * * *).');
+            this.logger.log('[SCHEDULER] Sync cron ATIVO — global sync VisMed↔Doctoralia executa a cada 30 minutos (cron: */30 * * * *).');
         }
     }
 
-    @Cron('0 */2 * * *', { name: 'global-sync-every-2h', timeZone: 'America/Sao_Paulo' })
+    @Cron('*/30 * * * *', { name: 'global-sync-every-30min', timeZone: 'America/Sao_Paulo' })
     async runGlobalSyncForAllClinics() {
         if (this.disabled) {
             return;
