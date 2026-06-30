@@ -215,6 +215,27 @@ export class VismedService {
         }
     }
 
+    /**
+     * Lista os bloqueios de agenda dos profissionais de uma empresa gestora.
+     * Cada item: { idprofissional, dataagendamento:"YYYY-MM-DD", horarioagendamento:"HH:MM", horarioagendamentofinal:"HH:MM" }.
+     * ATENÇÃO: o campo `horarioagendamentofinal` vem com serialização instável/malformada (ex.: "011:0"),
+     * por isso NÃO deve ser usado para parse exato de horário — só como sinal de mudança (diff/hash).
+     * A disponibilidade real é recalculada via scheduleDay.
+     */
+    async getBloqueiosProfissional(idEmpresaGestora: number, baseUrl?: string): Promise<any[]> {
+        try {
+            this.logger.log(`Buscando bloqueios de profissionais para empresa gestora: ${idEmpresaGestora}`);
+            const res = await this.requestData(
+                `bloqueios-profissional-by-idempresagestora?idempresagestora=${idEmpresaGestora}`,
+                baseUrl
+            );
+            return Array.isArray(res) ? res : [];
+        } catch (error) {
+            this.logger.error(`Erro ao buscar bloqueios de profissionais VisMed: ${error.message}`);
+            throw error;
+        }
+    }
+
     async getAgendamentos(unidade: number, baseUrl?: string, options?: { dataini?: string; datafim?: string; profissional?: number }): Promise<any[]> {
         try {
             let path = `get-agendamento-filtros?unidade=${unidade}`;
