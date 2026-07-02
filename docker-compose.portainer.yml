@@ -1,0 +1,28 @@
+# Compose mínimo para deploy via "Stack a partir de Git" no Portainer.
+# Sobe UM único container (API + Web); o PostgreSQL continua no HOST (não vira container).
+# Só existe para permitir buildar o repositório privado e subir tudo pela UI do Portainer.
+services:
+  vismed:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vismed:latest
+    container_name: vismed
+    ports:
+      - "5000:5000"
+    environment:
+      # Defina estas nas "Environment variables" da stack no Portainer:
+      DATABASE_URL: ${DATABASE_URL}
+      JWT_SECRET: ${JWT_SECRET}
+      VISMED_API_PORT: "3000"
+      # Opcionais (descomente/defina se precisar):
+      # SKIP_DB_INIT: "false"
+      # SKIP_SEED: "false"
+      # DISABLE_SYNC_CRON: "true"
+      # REDIS_HOST: ""
+      # REDIS_PORT: ""
+      # REDIS_PASSWORD: ""
+    extra_hosts:
+      # Faz o container enxergar o PostgreSQL rodando no host.
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

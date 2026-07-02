@@ -1,0 +1,92 @@
+# Dependencias e artefatos de build (reinstalados/rebuildados dentro da imagem)
+node_modules
+**/node_modules
+dist
+**/dist
+.next
+**/.next
+out
+**/out
+build
+**/build
+*.tsbuildinfo
+**/*.tsbuildinfo
+
+# Segredos e ambiente
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Controle de versao e agentes
+.git
+.gitignore
+.agents/
+.gemini/
+_agent/
+.cursor/
+.cursorrules
+.windsurfrules
+
+# IDE / SO
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Assets pesados e exports que nao entram na imagem
+attached_assets/
+exports/
+supabase/
+.cache/
+.canvas/
+.config/
+.local/
+temp/
+tmp/
+
+# Scripts temporarios de exploracao/diagnostico e dumps na raiz
+*.log
+*.sql
+build_migration.js
+explore_*.js
+get_clinic_id.js
+test_*.js
+test_*.ts
+tmp_*.js
+
+# Scripts temporarios dentro de apps/api (nao sao necessarios em runtime)
+apps/api/check_*.js
+apps/api/test_*.js
+apps/api/test_*.ts
+apps/api/test-*.js
+apps/api/debug_*.js
+apps/api/debug_*.ts
+apps/api/diag*.js
+apps/api/explore_*.js
+apps/api/fetch_*.js
+apps/api/compare_*.js
+apps/api/fix_*.js
+apps/api/check_*.ts
+apps/api/get_*.js
+apps/api/list_*.js
+apps/api/run_*.js
+apps/api/scan_*.js
+apps/api/seed-mappings.js
+apps/api/seed_synonyms.js
+apps/api/sync_trigger.js
+apps/api/sync.*.js
+apps/api/trigger_*.js
+apps/api/trigger_*.ts
+apps/api/homologacao_push.js
+apps/api/import_catalog_and_map.js
+apps/api/correct_sync.js
+apps/api/append_models.js
+apps/api/full_sync_test.js
+apps/api/run_matching.js
+apps/api/run_sync.js
+
+# Documentacao / meta
+Dockerfile
+.dockerignore
