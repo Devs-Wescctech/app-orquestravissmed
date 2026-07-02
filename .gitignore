@@ -35,6 +35,7 @@ tsc_errors.txt
 *.sql
 *.json
 !package.json
+!package-lock.json
 !composer.json
 !tsconfig.json
 !deno.json
