@@ -7,6 +7,9 @@ services:
       context: .
       dockerfile: Dockerfile
     image: vismed:latest
+    # A imagem e SEMPRE buildada localmente pelo Dockerfile (nao existe em registry).
+    # Isso evita o "pull access denied for vismed" quando o Portainer tenta dar pull.
+    pull_policy: build
     container_name: vismed
     ports:
       # host:container — a 5000 do HOST costuma estar ocupada por outros apps neste
