@@ -148,8 +148,11 @@ docker exec -it vismed node /app/apps/api/prisma/seed.js
 
 ## 6. Validação pós-deploy
 
-1. Logs: `docker logs -f vismed` → deve mostrar API na porta 3000 e Web na 5000.
-2. Acesse `http://HOST:5000` e faça login com as credenciais padrão do seed:
+1. Logs: `docker logs -f vismed` → deve mostrar API na porta 3000 e Web na 5000 (interna).
+2. Acesse `http://HOST:5400` e faça login com as credenciais padrão do seed:
+   > A porta **interna** do container é sempre 5000; o `docker-compose.portainer.yml` publica
+   > no host em **5400** porque a 5000 do host já é usada por outros apps neste servidor
+   > (ex.: `app-politicall` → `5000:5000`). Ajuste o lado esquerdo do mapeamento se precisar.
    - **Email:** `admin@vismed.com` · **Senha:** `admin123`
 3. Confirme o proxy: o login chama `POST /api/auth/login`, que o Next.js roteia para a
    API local — se o login funciona, o proxy `/api/*` está ok.

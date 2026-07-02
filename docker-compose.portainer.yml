@@ -9,7 +9,10 @@ services:
     image: vismed:latest
     container_name: vismed
     ports:
-      - "5000:5000"
+      # host:container — a 5000 do HOST costuma estar ocupada por outros apps neste
+      # servidor (ex.: app-politicall usa 5000:5000). Publicamos numa porta livre do host
+      # (5400) apontando para a 5000 interna do container (onde o Next.js escuta).
+      - "5400:5000"
     environment:
       # Defina estas nas "Environment variables" da stack no Portainer:
       DATABASE_URL: ${DATABASE_URL}
