@@ -108,8 +108,14 @@ Obrigatórias:
 
 | Variável | Exemplo / Descrição |
 |---|---|
-| `DATABASE_URL` | `postgresql://USER:SENHA@host.docker.internal:5432/vismed?schema=public` |
+| `DATABASE_URL` | `postgresql://USER:SENHA@172.17.0.1:5432/vismed?schema=public` |
 | `JWT_SECRET` | chave forte para assinar os JWTs |
+
+> **Host do banco:** use o IP do gateway da bridge do Docker — neste servidor é **`172.17.0.1`**
+> (mesmo endereço que os outros apps do Portainer usam para alcançar o Postgres do host).
+> `host.docker.internal` também funciona (via o `extra_hosts` do compose), mas `172.17.0.1` é o
+> caminho comprovado aqui e não depende desse mapeamento. **Nunca** use `localhost` — dentro do
+> container ele aponta para o próprio container, não para o host.
 
 Opcionais / com default:
 
