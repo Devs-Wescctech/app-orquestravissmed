@@ -47,3 +47,7 @@ VISMED_API_PORT = "3000"
 deploymentTarget = "vm"
 run = ["sh", "-c", "cd /home/runner/workspace/apps/api && node dist/main.js & cd /home/runner/workspace/apps/web && npm run start"]
 build = ["sh", "-c", "cd /home/runner/workspace/apps/api && npx tsc && npx prisma db push --accept-data-loss && node prisma/seed.js && cd /home/runner/workspace/apps/web && npm run build"]
+
+[postMerge]
+path = "scripts/post-merge.sh"
+timeoutMs = 180000
