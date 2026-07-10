@@ -66,6 +66,13 @@ export class PushSyncService {
 
         this.logger.log(`Found ${mappings.length} actively mapped doctors for push sync.`);
 
+        // Cache do catálogo de serviços POR UNIDADE (facility). É a fonte de verdade dos
+        // service_id que a unidade aceita — só empurramos IDs presentes aqui. Evita mandar
+        // IDs do dicionário global que a unidade não conhece (404 "ItemService object not found").
+        // Valor `null` = catálogo indisponível/falha de fetch → NÃO enforçamos (fail-open) para
+        // não bloquear serviços válidos; o handler de rejeição 404 abaixo ainda protege o loop.
+        const facilityCatalogCache = new Map<string, Set<string> | null>();
+
         // Disponibilidade real (scheduleDay) da clínica — construída UMA vez e reusada por todos
         // os médicos. Reflete bloqueios de agenda da VisMed. Pulada no modo legado (template).
         const slotSourceTemplate = (process.env.SLOT_SOURCE || 'availability').toLowerCase() === 'template';
@@ -107,6 +114,9 @@ export class PushSyncService {
             });
             const desiredInsuranceSupport = linkedInsuranceCount > 0 ? 'private_and_insurance' : 'private';
 
+            // Resolve (uma vez por facility) o conjunto de service_id aceitos pela unidade.
+            const facilityCatalogIds = await this.resolveFacilityCatalogIds(client, dDoc.doctoraliaFacilityId, facilityCatalogCache);
+
             for (const addr of doctoraliaAddresses) {
                 const addrId = String(addr.id);
 
@@ -138,7 +148,7 @@ export class PushSyncService {
                 }
 
                 // 3. SERVICES DELTA
-                await this.syncServicesDelta(syncRunId, client, dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, vDoc.specialties, dDoc.name);
+                await this.syncServicesDelta(syncRunId, client, dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, vDoc.specialties, dDoc.name, facilityCatalogIds);
 
                 // 4. INSURANCE PROVIDERS SYNC
                 await this.syncInsuranceProviders(syncRunId, client, clinicId, dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, dDoc.name);
@@ -183,7 +193,8 @@ export class PushSyncService {
         doctorId: string,
         addressId: string,
         vismedSpecialties: any[],
-        doctorName: string
+        doctorName: string,
+        facilityCatalogIds: Set<string> | null,
     ) {
         // Fetch current address services from Doctoralia
         let currentServices = [];
@@ -205,7 +216,7 @@ export class PushSyncService {
 
         // Build expected services from VisMed specialties with active mappings
         // The mapping.doctoraliaService.doctoraliaServiceId IS the dictionary ID
-        const expectedDictIds = new Map<string, string>(); // dict_id -> specialty_name
+        const expectedDictIds = new Map<string, { specName: string; mappingId: string }>(); // dict_id -> mapping info
         const matchedNames = [];
 
         for (const vs of vismedSpecialties) {
@@ -213,7 +224,7 @@ export class PushSyncService {
             if (spec && spec.mappings && spec.mappings.length > 0) {
                 const mapping = spec.mappings[0];
                 const dictId = mapping.doctoraliaService.doctoraliaServiceId;
-                expectedDictIds.set(dictId, spec.name);
+                expectedDictIds.set(dictId, { specName: spec.name, mappingId: mapping.id });
                 matchedNames.push(`${spec.name} (→ dict:${dictId})`);
             }
         }
@@ -240,7 +251,7 @@ export class PushSyncService {
         // ADD: Expected by VisMed but NOT currently assigned
         const addedDictIds = new Set<string>();
         const failedDictIds = new Set<string>();
-        for (const [dictId, specName] of expectedDictIds.entries()) {
+        for (const [dictId, { specName, mappingId }] of expectedDictIds.entries()) {
             if (!currentByDictId.has(dictId)) {
                 const numericId = Number(dictId);
                 if (!Number.isFinite(numericId)) {
@@ -248,6 +259,20 @@ export class PushSyncService {
                     failedDictIds.add(dictId);
                     continue;
                 }
+
+                // GATE POR CATÁLOGO DA UNIDADE (fonte de verdade). Se o catálogo foi resolvido e o
+                // dict_id NÃO está nele, a unidade não aceita esse serviço → NÃO fazemos o POST
+                // (que retornaria 404 "ItemService object not found" a cada ciclo). Marcamos o mapping
+                // como inválido para o cron parar de reenviar e o operador remapear em /mapping.
+                if (facilityCatalogIds && !facilityCatalogIds.has(dictId)) {
+                    failedDictIds.add(dictId);
+                    const reason = `service_id ${dictId} não existe no catálogo da unidade ${facilityId} (não aceito pela Doctoralia)`;
+                    this.logger.warn(`Doctor ${doctorName}: [SKIP NOT IN CATALOG] Service dict:${dictId} (${specName}) — ${reason}`);
+                    await this.markMappingInvalid(mappingId, reason);
+                    await this.logEvent(syncRunId, 'SERVICE_PUSH', 'invalid_service_id', `Doctor ${doctorName}: "${specName}" (dict:${dictId}) fora do catálogo da unidade — mapping marcado para revisão em /mapping.`);
+                    continue;
+                }
+
                 try {
                     const payload = {
                         service_id: numericId,
@@ -262,8 +287,18 @@ export class PushSyncService {
                     await this.logEvent(syncRunId, 'SERVICE_PUSH', 'created', `Doctor ${doctorName}: Adicionado serviço "${specName}" (dict:${dictId}) ao endereço ${addressId}`);
                 } catch (error: any) {
                     failedDictIds.add(dictId);
-                    this.logger.warn(`Doctor ${doctorName}: [ADD FAILED] Service dict:${dictId}: ${error.message}`);
-                    await this.logEvent(syncRunId, 'SERVICE_PUSH', 'error', `Doctor ${doctorName}: Falha ao adicionar serviço "${specName}" (dict:${dictId}) - ${error.message}`);
+                    // Rejeição do service_id pela Doctoralia (404 / "ItemService object not found") NÃO é
+                    // erro transitório: significa que a unidade não aceita esse ID. Marcar o mapping como
+                    // inválido faz o cron parar de reenviar o mesmo POST inválido a cada 30 min.
+                    if (this.isServiceIdRejected(error)) {
+                        const reason = `service_id ${dictId} rejeitado pela Doctoralia (${this.shortError(error.message)})`;
+                        await this.markMappingInvalid(mappingId, reason);
+                        this.logger.warn(`Doctor ${doctorName}: [ADD REJECTED] Service dict:${dictId} (${specName}) — ${reason}. Mapping marcado para revisão.`);
+                        await this.logEvent(syncRunId, 'SERVICE_PUSH', 'invalid_service_id', `Doctor ${doctorName}: "${specName}" (dict:${dictId}) rejeitado pela Doctoralia — mapping marcado para revisão em /mapping.`);
+                    } else {
+                        this.logger.warn(`Doctor ${doctorName}: [ADD FAILED] Service dict:${dictId}: ${error.message}`);
+                        await this.logEvent(syncRunId, 'SERVICE_PUSH', 'error', `Doctor ${doctorName}: Falha ao adicionar serviço "${specName}" (dict:${dictId}) - ${error.message}`);
+                    }
                 }
             }
         }
@@ -455,6 +490,74 @@ export class PushSyncService {
         if (syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'completed', finalMsg);
 
         return result;
+    }
+
+    /**
+     * Resolve (com cache por facility) o conjunto de service_id (dict IDs) que a UNIDADE aceita,
+     * via GET /facilities/{id}/services/catalog. Retorna `null` quando o catálogo não pôde ser
+     * obtido ou veio vazio — nesse caso o chamador NÃO deve enforçar o gate (fail-open), para não
+     * bloquear serviços válidos por causa de uma falha de rede ou resposta inesperada.
+     */
+    private async resolveFacilityCatalogIds(
+        client: DocplannerClient,
+        facilityId: string,
+        cache: Map<string, Set<string> | null>,
+    ): Promise<Set<string> | null> {
+        if (cache.has(facilityId)) return cache.get(facilityId)!;
+
+        let ids: Set<string> | null = null;
+        try {
+            const res = await client.getFacilityServicesCatalog(facilityId);
+            const items = res?._items || [];
+            if (items.length > 0) {
+                ids = new Set<string>();
+                for (const item of items) {
+                    // O catálogo lista os ItemService da unidade; o dict_id costuma vir em
+                    // `service_id` ou `id`. Guardamos ambos por segurança.
+                    if (item.service_id != null) ids.add(String(item.service_id));
+                    if (item.id != null) ids.add(String(item.id));
+                }
+                this.logger.log(`Facility ${facilityId}: catálogo com ${items.length} serviço(s) aceitos resolvido.`);
+            } else {
+                this.logger.warn(`Facility ${facilityId}: catálogo de serviços vazio/indisponível — gate por catálogo desabilitado (fail-open).`);
+            }
+        } catch (error: any) {
+            this.logger.warn(`Facility ${facilityId}: falha ao buscar catálogo de serviços (${error.message}) — gate por catálogo desabilitado (fail-open).`);
+        }
+
+        cache.set(facilityId, ids);
+        return ids;
+    }
+
+    /**
+     * Detecta rejeição definitiva de um service_id pela Doctoralia: 404 e/ou a mensagem
+     * "ItemService object not found". Não é erro transitório — o ID não é aceito pela unidade.
+     */
+    private isServiceIdRejected(error: any): boolean {
+        const status = error?.status ?? 0;
+        const msg = String(error?.message || '');
+        return status === 404 || /ItemService object not found/i.test(msg);
+    }
+
+    private shortError(message?: string): string {
+        const m = String(message || '').trim();
+        return m.length > 160 ? `${m.slice(0, 157)}...` : m;
+    }
+
+    /**
+     * Sinaliza um SpecialtyServiceMapping como inválido: registra o motivo e o remove do
+     * push automático (requiresReview=true), sem apagá-lo. Aparece em /mapping para reaprovação
+     * ou remapeamento manual com o service_id correto do catálogo da unidade.
+     */
+    private async markMappingInvalid(mappingId: string, reason: string): Promise<void> {
+        try {
+            await this.prisma.specialtyServiceMapping.update({
+                where: { id: mappingId },
+                data: { invalidReason: reason, invalidAt: new Date(), requiresReview: true },
+            });
+        } catch (e: any) {
+            this.logger.error(`Falha ao marcar mapping ${mappingId} como inválido: ${e.message}`);
+        }
     }
 
     private async logEvent(syncRunId: string, entityType: string, action: string, message: string) {

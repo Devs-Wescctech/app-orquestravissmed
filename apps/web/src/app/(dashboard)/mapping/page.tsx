@@ -47,6 +47,7 @@ interface VismedUnit {
 interface SpecialtyMatch {
     id: string; vismedSpecialtyId: string; doctoraliaServiceId: string;
     matchType: string; confidenceScore: number; requiresReview: boolean; isActive: boolean;
+    invalidReason?: string | null; invalidAt?: string | null;
     vismedSpecialty?: { name: string; normalizedName?: string } | null;
     doctoraliaService?: { name: string } | null;
 }
@@ -621,6 +622,12 @@ export default function MappingHub() {
                                                         <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest border border-primary/20 bg-primary/5 text-primary">
                                                             <CheckCircle2 className="h-3 w-3" />
                                                             Aprovado ({Math.round(m.confidenceScore * 100)}%)
+                                                        </span>
+                                                    )}
+                                                    {m.invalidReason && (
+                                                        <span title={m.invalidReason} className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest border border-rose-300 bg-rose-100 text-rose-700 max-w-[280px]">
+                                                            <AlertTriangle className="h-3 w-3 shrink-0" />
+                                                            <span className="truncate">Serviço inválido na Doctoralia</span>
                                                         </span>
                                                     )}
                                                     {m.requiresReview && (

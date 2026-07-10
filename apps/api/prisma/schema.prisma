@@ -377,6 +377,11 @@ model SpecialtyServiceMapping {
   reviewedAt           DateTime?
   reviewedBy           String?
   isActive             Boolean  @default(true)
+  // Sinaliza que o service_id deste mapping foi rejeitado pela Doctoralia (não existe no
+  // catálogo da unidade / "ItemService object not found"). Quando preenchido, o push para de
+  // reenviar automaticamente e o operador reaprova/remapeia em /mapping.
+  invalidReason        String?
+  invalidAt            DateTime?
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt
 

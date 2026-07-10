@@ -192,6 +192,7 @@ export class MappingsService {
                                 matchType: (ps.specialty.mappings[0] as any).matchType,
                                 confidenceScore: (ps.specialty.mappings[0] as any).confidenceScore,
                                 requiresReview: (ps.specialty.mappings[0] as any).requiresReview,
+                                invalidReason: (ps.specialty.mappings[0] as any).invalidReason,
                                 doctoraliaService: (ps.specialty.mappings[0] as any).doctoraliaService?.name
                             } : null
                         }))
@@ -379,7 +380,7 @@ export class MappingsService {
                     doctoraliaServiceId
                 }
             },
-            data: { requiresReview: false }
+            data: { requiresReview: false, invalidReason: null, invalidAt: null }
         });
 
         if (userId) {
@@ -442,7 +443,9 @@ export class MappingsService {
                 matchType: 'MANUAL',
                 confidenceScore: 1.0,
                 requiresReview: false,
-                isActive: true
+                isActive: true,
+                invalidReason: null,
+                invalidAt: null
             },
             create: {
                 vismedSpecialtyId,

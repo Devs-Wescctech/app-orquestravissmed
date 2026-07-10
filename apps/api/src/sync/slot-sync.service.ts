@@ -610,7 +610,7 @@ export class SlotSyncService {
         const provisionedServices: any[] = [];
 
         const doctorSpecialties = doctor.specialties || [];
-        const serviceIdsToAdd: { doctoraliaServiceId: string; name: string }[] = [];
+        const serviceIdsToAdd: { doctoraliaServiceId: string; name: string; mappingId: string }[] = [];
 
         for (const ps of doctorSpecialties) {
             const specialty = ps.specialty;
@@ -624,6 +624,7 @@ export class SlotSyncService {
                 serviceIdsToAdd.push({
                     doctoraliaServiceId: docSvc.doctoraliaServiceId,
                     name: docSvc.name,
+                    mappingId: mapping.id,
                 });
             }
         }
@@ -649,6 +650,9 @@ export class SlotSyncService {
 
         this.logger.log(`Doctor ${doctor.name}: will provision ${serviceIdsToAdd.length} service(s): ${serviceIdsToAdd.map(s => `${s.name} (${s.doctoraliaServiceId})`).join(', ')}`);
 
+        // Catálogo da unidade (fonte de verdade dos service_id aceitos). `null` = indisponível → fail-open.
+        const facilityCatalogIds = await this.resolveFacilityCatalogIds(client, facilityId);
+
         for (const svc of serviceIdsToAdd) {
             const candidateIds = [svc.doctoraliaServiceId];
 
@@ -664,7 +668,7 @@ export class SlotSyncService {
                 }
             }
 
-            const validCandidateIds = candidateIds.filter(id => {
+            let validCandidateIds = candidateIds.filter(id => {
                 const num = Number(id);
                 return Number.isFinite(num) && num > 0;
             });
@@ -674,7 +678,25 @@ export class SlotSyncService {
                 continue;
             }
 
+            // GATE POR CATÁLOGO: só tentamos IDs que a unidade aceita. Se nenhum candidato
+            // estiver no catálogo, o mapping aponta para um service_id inválido para esta unidade
+            // → marcamos como inválido (para revisão) e não fazemos POST que retornaria 404.
+            if (facilityCatalogIds) {
+                const inCatalog = validCandidateIds.filter(id => facilityCatalogIds.has(String(id)));
+                if (inCatalog.length === 0) {
+                    const reason = `service_id ${svc.doctoraliaServiceId} não existe no catálogo da unidade ${facilityId} (não aceito pela Doctoralia)`;
+                    this.logger.warn(`Doctor ${doctor.name}: [SKIP NOT IN CATALOG] "${svc.name}" — ${reason}`);
+                    await this.markMappingInvalid(svc.mappingId, reason);
+                    if (syncRunId) {
+                        await this.logEvent(syncRunId, 'SERVICE_PROVISION', 'invalid_service_id', `Serviço "${svc.name}" (dict:${svc.doctoraliaServiceId}) fora do catálogo da unidade — mapping marcado para revisão em /mapping.`);
+                    }
+                    continue;
+                }
+                validCandidateIds = inCatalog;
+            }
+
             let provisioned = false;
+            let sawRejection = false;
             for (const candidateId of validCandidateIds) {
                 try {
                     const result = await client.addAddressService(facilityId, doctorId, addressId, {
@@ -718,6 +740,7 @@ export class SlotSyncService {
                         return m ? Number(m[1]) : 0;
                     })();
                     const isRetryable = status === 404 || status === 422 || status === 0;
+                    if (this.isServiceIdRejected(error)) sawRejection = true;
                     this.logger.warn(`Doctor ${doctor.name}: service_id ${candidateId} failed for "${svc.name}" on address ${addressId} (status ${status}): ${error.message}`);
                     if (!isRetryable) {
                         this.logger.error(`Doctor ${doctor.name}: non-retryable error (${status}) for "${svc.name}", stopping candidate attempts`);
@@ -728,8 +751,14 @@ export class SlotSyncService {
 
             if (!provisioned) {
                 this.logger.error(`Doctor ${doctor.name}: all candidate service_ids failed for "${svc.name}" on address ${addressId}. Tried: ${candidateIds.join(', ')}`);
+                // Se a Doctoralia REJEITOU todos os candidatos (404 / ItemService not found), o mapping
+                // aponta para service_id(s) que a unidade não aceita → marcar como inválido para o cron
+                // parar de reenviar e o operador remapear em /mapping.
+                if (sawRejection) {
+                    await this.markMappingInvalid(svc.mappingId, `service_id ${svc.doctoraliaServiceId} rejeitado pela Doctoralia na unidade ${facilityId} (nenhum candidato aceito)`);
+                }
                 if (syncRunId) {
-                    await this.logEvent(syncRunId, 'SERVICE_PROVISION', 'error', `Falha ao adicionar serviço "${svc.name}" ao endereço ${addressId}: nenhum service_id válido. Tentados: ${candidateIds.join(', ')}`);
+                    await this.logEvent(syncRunId, 'SERVICE_PROVISION', sawRejection ? 'invalid_service_id' : 'error', `Falha ao adicionar serviço "${svc.name}" ao endereço ${addressId}: nenhum service_id válido. Tentados: ${candidateIds.join(', ')}`);
                 }
             }
         }
@@ -740,6 +769,51 @@ export class SlotSyncService {
         }
 
         return provisionedServices;
+    }
+
+    /**
+     * Resolve o conjunto de service_id (dict IDs) que a UNIDADE aceita via
+     * GET /facilities/{id}/services/catalog. Retorna `null` quando indisponível/vazio (fail-open).
+     */
+    private async resolveFacilityCatalogIds(client: DocplannerClient, facilityId: string): Promise<Set<string> | null> {
+        try {
+            const res = await client.getFacilityServicesCatalog(facilityId);
+            const items = res?._items || [];
+            if (items.length === 0) return null;
+            const ids = new Set<string>();
+            for (const item of items) {
+                if (item.service_id != null) ids.add(String(item.service_id));
+                if (item.id != null) ids.add(String(item.id));
+            }
+            return ids;
+        } catch (error: any) {
+            this.logger.warn(`Facility ${facilityId}: falha ao buscar catálogo de serviços (${error.message}) — gate por catálogo desabilitado (fail-open).`);
+            return null;
+        }
+    }
+
+    /**
+     * Rejeição definitiva de um service_id pela Doctoralia: 404 e/ou "ItemService object not found".
+     */
+    private isServiceIdRejected(error: any): boolean {
+        const status = error?.status ?? error?.response?.status ?? 0;
+        const msg = String(error?.message || '');
+        return status === 404 || /ItemService object not found/i.test(msg);
+    }
+
+    /**
+     * Sinaliza um SpecialtyServiceMapping como inválido (motivo registrado + fora do push
+     * automático) sem apagá-lo, para reaprovação/remapeamento manual em /mapping.
+     */
+    private async markMappingInvalid(mappingId: string, reason: string): Promise<void> {
+        try {
+            await this.prisma.specialtyServiceMapping.update({
+                where: { id: mappingId },
+                data: { invalidReason: reason, invalidAt: new Date(), requiresReview: true },
+            });
+        } catch (e: any) {
+            this.logger.error(`Falha ao marcar mapping ${mappingId} como inválido: ${e.message}`);
+        }
     }
 
     private async logEvent(syncRunId: string, entityType: string, action: string, message: string) {
