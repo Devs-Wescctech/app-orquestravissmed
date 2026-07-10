@@ -906,9 +906,21 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         }
 
         const startAt = new Date(`${dataAg}T${horaIni}:00-03:00`);
-        const endAt = horaFim
+        if (isNaN(startAt.getTime())) {
+            this.logger.warn(
+                `[VISMED-POLL] Ignorando agendamento ${vismedAppointmentId}: data/hora inicial inválida (data=${dataAg}, hora=${horaIni})`,
+            );
+            return false;
+        }
+        let endAt = horaFim
             ? new Date(`${dataAg}T${horaFim}:00-03:00`)
             : new Date(startAt.getTime() + 30 * 60 * 1000);
+        if (isNaN(endAt.getTime())) {
+            this.logger.warn(
+                `[VISMED-POLL] Agendamento ${vismedAppointmentId}: horário final inválido (horaFim=${horaFim}); usando fallback de +30min`,
+            );
+            endAt = new Date(startAt.getTime() + 30 * 60 * 1000);
+        }
 
         const cancelado = a?.cancelado === '1' || a?.cancelado === 1 || a?.cancelado === true;
         const noShow = a?.naocompareceu === '1' || a?.naocompareceu === 1 || a?.naocompareceu === true;
