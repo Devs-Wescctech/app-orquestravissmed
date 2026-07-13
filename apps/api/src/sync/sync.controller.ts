@@ -22,6 +22,8 @@ export class SyncController {
     ) { }
 
     private validateUserClinicAccess(user: any, clinicId: string) {
+        const isSuperAdmin = user?.roles?.some((r: any) => r.role === 'SUPER_ADMIN');
+        if (isSuperAdmin) return;
         const userClinicIds = (user?.roles || []).map((r: any) => r.clinicId);
         if (!userClinicIds.includes(clinicId)) {
             throw new ForbiddenException('Você não tem acesso a esta clínica.');
