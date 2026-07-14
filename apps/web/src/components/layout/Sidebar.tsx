@@ -12,7 +12,8 @@ import {
     Building2,
     ChevronLeft,
     ChevronRight,
-    Database
+    Database,
+    BookOpen
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useAuthStore } from '@/lib/store';
@@ -39,6 +40,7 @@ export function Sidebar() {
     const mainLinks = [
         { name: 'Dashboard', href: '/', icon: LayoutDashboard },
         { name: 'Agendamentos', href: '/appointments', icon: CalendarDays },
+        { name: 'Ajuda', href: '/help', icon: BookOpen },
     ];
 
     const integrationLinks = [
