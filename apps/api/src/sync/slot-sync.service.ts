@@ -673,6 +673,20 @@ export class SlotSyncService {
                 return Number.isFinite(num) && num > 0;
             });
 
+            // GUARD ANTI address_service id: descarta candidatos que são na verdade ids de VÍNCULO
+            // serviço↔endereço (contaminação antiga do dicionário) — a Doctoralia rejeitaria com 404.
+            if (validCandidateIds.length > 0) {
+                const linkCollisions = await this.prisma.doctoraliaAddressService.findMany({
+                    where: { doctoraliaAddressServiceId: { in: validCandidateIds } },
+                    select: { doctoraliaAddressServiceId: true },
+                });
+                if (linkCollisions.length > 0) {
+                    const linkIds = new Set(linkCollisions.map(l => l.doctoraliaAddressServiceId));
+                    this.logger.warn(`Doctor ${doctor.name}: descartando candidato(s) que são address_service ids, não service_ids: ${[...linkIds].join(', ')}`);
+                    validCandidateIds = validCandidateIds.filter(id => !linkIds.has(String(id)));
+                }
+            }
+
             if (validCandidateIds.length === 0) {
                 this.logger.error(`Doctor ${doctor.name}: no valid numeric service_ids for "${svc.name}" on address ${addressId}`);
                 continue;

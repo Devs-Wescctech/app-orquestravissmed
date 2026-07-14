@@ -260,6 +260,26 @@ export class PushSyncService {
                     continue;
                 }
 
+                // GUARD ANTI address_service id: se o id que iríamos enviar é na verdade um id de
+                // VÍNCULO serviço↔endereço (address_service), o dicionário está contaminado (bug de
+                // ingestão antigo) e o POST retornaria 404. Nunca enviar esse id.
+                // Premissa: na Docplanner os espaços de id são disjuntos na prática (dicionário
+                // global ~10k ids baixos vs address_service ids sequenciais na casa dos milhões);
+                // se houver colisão improvável, o efeito é conservador e visível ao operador
+                // (mapping marcado com invalidReason para revisão em /mapping, sem POST 404).
+                const isLinkId = await this.prisma.doctoraliaAddressService.findUnique({
+                    where: { doctoraliaAddressServiceId: dictId },
+                    select: { id: true },
+                });
+                if (isLinkId) {
+                    failedDictIds.add(dictId);
+                    const reason = `id ${dictId} é um address_service id (vínculo serviço↔endereço), não um service_id do dicionário — mapping inválido`;
+                    this.logger.warn(`Doctor ${doctorName}: [SKIP LINK ID] Service dict:${dictId} (${specName}) — ${reason}`);
+                    await this.markMappingInvalid(mappingId, reason);
+                    await this.logEvent(syncRunId, 'SERVICE_PUSH', 'invalid_service_id', `Doctor ${doctorName}: "${specName}" (dict:${dictId}) é um address_service id, não um service_id — mapping marcado para revisão em /mapping.`);
+                    continue;
+                }
+
                 // GATE POR CATÁLOGO DA UNIDADE (fonte de verdade). Se o catálogo foi resolvido e o
                 // dict_id NÃO está nele, a unidade não aceita esse serviço → NÃO fazemos o POST
                 // (que retornaria 404 "ItemService object not found" a cada ciclo). Marcamos o mapping

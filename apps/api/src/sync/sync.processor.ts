@@ -103,7 +103,15 @@ export class SyncProcessor extends WorkerHost {
                         try {
                             const srvRes = await client.getServices(facilityId, docId, addrId);
                             for (const srv of (srvRes._items || [])) {
-                                const srvId = String(srv.id);
+                                // srv.id é o id do VÍNCULO serviço↔endereço (address_service id).
+                                // srv.service_id é o id do DICIONÁRIO global de serviços.
+                                // O dicionário local (DoctoraliaService) deve usar SOMENTE service_id.
+                                const linkId = String(srv.id);
+                                if (srv.service_id === undefined || srv.service_id === null) {
+                                    this.logger.warn(`Serviço "${srv.name || linkId}" (address_service ${linkId}) sem service_id do dicionário — pulado para não gravar id inválido.`);
+                                    continue;
+                                }
+                                const srvId = String(srv.service_id);
                                 activeServiceIds.push(srvId);
                                 allServicesMap.set(srvId, srv);
 
@@ -123,8 +131,8 @@ export class SyncProcessor extends WorkerHost {
                                     }
                                 });
 
-                                // Save Address Service Association (Pivot)
-                                const addrServiceId = `${addrId}_${docId}_${srvId}`;
+                                // Save Address Service Association (Pivot) — chave = id real do vínculo
+                                const addrServiceId = linkId;
                                 await this.prisma.doctoraliaAddressService.upsert({
                                     where: { doctoraliaAddressServiceId: addrServiceId },
                                     update: {
