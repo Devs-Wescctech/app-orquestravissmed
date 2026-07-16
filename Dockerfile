@@ -51,6 +51,8 @@ COPY --from=builder /app/package-lock.json ./package-lock.json
 COPY --from=builder /app/apps/api/package.json ./apps/api/package.json
 COPY --from=builder /app/apps/api/dist ./apps/api/dist
 COPY --from=builder /app/apps/api/prisma ./apps/api/prisma
+# Scripts de manutencao/migracao one-off (ex.: fix-service-dict-ids.js).
+COPY --from=builder /app/apps/api/scripts ./apps/api/scripts
 
 # Artefatos e arquivos de runtime do Web.
 COPY --from=builder /app/apps/web/package.json ./apps/web/package.json
