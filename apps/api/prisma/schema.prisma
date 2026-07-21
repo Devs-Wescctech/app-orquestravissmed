@@ -493,6 +493,7 @@ model SkippedBookingAlert {
   endAt          DateTime
   patientName    String?
   reason         String    @default("DOCTOR_NOT_LINKED")
+  errorMessage   String?
   resolved       Boolean   @default(false)
   resolvedAt     DateTime?
   createdAt      DateTime  @default(now())

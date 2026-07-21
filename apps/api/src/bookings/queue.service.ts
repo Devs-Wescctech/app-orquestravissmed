@@ -34,10 +34,16 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     }
 
     private handlers = new Map<string, (payload: any, clinicId: string) => Promise<void>>();
+    private deadLetterHandlers = new Map<string, (payload: any, clinicId: string, error: string) => Promise<void>>();
 
     registerHandler(type: string, handler: (payload: any, clinicId: string) => Promise<void>) {
         this.handlers.set(type, handler);
         this.logger.log(`Registered handler for job type: ${type}`);
+    }
+
+    registerDeadLetterHandler(type: string, handler: (payload: any, clinicId: string, error: string) => Promise<void>) {
+        this.deadLetterHandlers.set(type, handler);
+        this.logger.log(`Registered dead-letter handler for job type: ${type}`);
     }
 
     async enqueue(clinicId: string, type: string, payload: any, options?: {
@@ -210,6 +216,18 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
             await this.completeJob(job.id);
         } catch (err: any) {
             await this.failJob(job.id, err.message, job.attempts, job.maxAttempts);
+
+            const isDead = job.attempts >= job.maxAttempts;
+            if (isDead) {
+                const deadHandler = this.deadLetterHandlers.get(job.type);
+                if (deadHandler) {
+                    try {
+                        await deadHandler(job.payload, job.clinicId, err.message || 'unknown error');
+                    } catch (dlErr: any) {
+                        this.logger.error(`[DEAD-LETTER] Handler error for job ${job.id}: ${dlErr.message}`);
+                    }
+                }
+            }
         }
     }
 

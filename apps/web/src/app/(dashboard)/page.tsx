@@ -9,9 +9,10 @@ import { useAuthStore } from '@/lib/store';
 interface SkippedAlertDoctor {
     vismedDoctorId: string;
     doctorName: string | null;
+    reason?: string;
     count: number;
     latestAt: string;
-    appointments: Array<{ id: string; startAt: string; endAt: string; patientName?: string | null }>;
+    appointments: Array<{ id: string; startAt: string; endAt: string; patientName?: string | null; errorMessage?: string | null }>;
 }
 
 export default function DashboardOverview() {
@@ -174,20 +175,32 @@ export default function DashboardOverview() {
                                     {skippedAlerts.total} agendamento{skippedAlerts.total > 1 ? 's' : ''} não enviado{skippedAlerts.total > 1 ? 's' : ''} à Doctoralia
                                 </h3>
                                 <p className="text-xs font-bold text-amber-700 mt-1">
-                                    Médico{skippedAlerts.doctors.length > 1 ? 's' : ''} sem vínculo com a Doctoralia — os horários abaixo continuam livres lá, com risco de overbooking. Vincule o{skippedAlerts.doctors.length > 1 ? 's' : ''} profissiona{skippedAlerts.doctors.length > 1 ? 'is' : 'l'} na Central de Mapeamento para resolver.
+                                    {skippedAlerts.doctors.some((d) => d.reason === 'VISMED_CREATE_FAILED')
+                                        ? 'Alguns agendamentos precisam de atenção: médico sem vínculo com a Doctoralia e/ou agendamento da Doctoralia que a VisMed não confirmou — nestes últimos, agende manualmente na VisMed.'
+                                        : `Médico${skippedAlerts.doctors.length > 1 ? 's' : ''} sem vínculo com a Doctoralia — os horários abaixo continuam livres lá, com risco de overbooking. Vincule o${skippedAlerts.doctors.length > 1 ? 's' : ''} profissiona${skippedAlerts.doctors.length > 1 ? 'is' : 'l'} na Central de Mapeamento para resolver.`}
                                 </p>
                                 <div className="mt-3 flex flex-wrap gap-2">
                                     {skippedAlerts.doctors.map((d) => (
-                                        <div key={d.vismedDoctorId} className="bg-white/70 border border-amber-200 rounded-2xl px-4 py-2.5">
+                                        <div key={`${d.vismedDoctorId}:${d.reason || ''}`} className="bg-white/70 border border-amber-200 rounded-2xl px-4 py-2.5">
                                             <div className="flex items-center gap-2">
                                                 <AlertTriangle className="h-3.5 w-3.5 text-amber-500" />
                                                 <span className="text-xs font-black text-slate-800">{d.doctorName || 'Profissional desconhecido'}</span>
                                                 <span className="text-[10px] font-black text-white bg-amber-500 rounded-full px-2 py-0.5">{d.count}</span>
                                             </div>
+                                            {d.reason === 'VISMED_CREATE_FAILED' && (
+                                                <div className="text-[10px] font-black text-red-600 mt-1 uppercase tracking-wide">Falha ao criar na VisMed — agendar manualmente</div>
+                                            )}
                                             {d.appointments.slice(0, 3).map((a) => (
-                                                <div key={a.id} className="text-[10px] font-bold text-amber-800/80 mt-1 tabular-nums">
-                                                    {new Date(a.startAt).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' })}
-                                                    {a.patientName ? ` · ${a.patientName}` : ''}
+                                                <div key={a.id} className="mt-1">
+                                                    <div className="text-[10px] font-bold text-amber-800/80 tabular-nums">
+                                                        {new Date(a.startAt).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' })}
+                                                        {a.patientName ? ` · ${a.patientName}` : ''}
+                                                    </div>
+                                                    {d.reason === 'VISMED_CREATE_FAILED' && a.errorMessage && (
+                                                        <div className="text-[10px] font-semibold text-red-700/90 mt-0.5 max-w-xs break-words">
+                                                            {a.errorMessage}
+                                                        </div>
+                                                    )}
                                                 </div>
                                             ))}
                                             {d.count > 3 && (
