@@ -2156,6 +2156,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             return { processed: false, reason: 'already_synced' };
         }
 
+        const isRetry = reserved.status === 'FAILED';
         if (reserved.status === 'FAILED') {
             // Retry de tentativa anterior que falhou: retomar atomicamente (evita corrida entre workers).
             const claimed = await this.prisma.bookingSync.updateMany({
@@ -2182,6 +2183,23 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         if (mapping) {
             vismedDoctorId = mapping.vismedId;
             try {
+                // Anti-duplicação em retry: se a tentativa anterior recebeu 200 sem ID mas a VisMed
+                // criou o agendamento mesmo assim, criar de novo geraria duplicata. Antes de re-criar,
+                // buscamos na agenda VisMed um agendamento com mesmo profissional+data+hora+paciente
+                // e, se existir, adotamos o ID em vez de criar outro.
+                if (isRetry) {
+                    const adoptedId = await this.findExistingVismedAppointmentId(clinicId, mapping.vismedId, booking)
+                        .catch((err: any) => {
+                            this.logger.warn(`[SLOT-BOOKED] Pré-retry lookup na VisMed falhou (${err.message}) — seguindo com criação`);
+                            return null;
+                        });
+                    if (adoptedId) {
+                        vismedAppointmentId = adoptedId;
+                        this.logger.log(`[SLOT-BOOKED] Retry: agendamento já existia na VisMed (id=${adoptedId}) para booking ${bookingIdStr} — adotado, sem re-criar`);
+                    }
+                }
+
+                if (!vismedAppointmentId) {
                 await this.rateLimiter.acquire('vismed');
                 const vismedCreateResult = await this.createVismedAppointment(clinicId, mapping, booking, data);
 
@@ -2200,6 +2218,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 }
 
                 this.logger.log(`[SLOT-BOOKED] Created VisMed appointment ${vismedAppointmentId} for booking ${bookingIdStr}`);
+                }
             } catch (err: any) {
                 this.logger.error(`[SLOT-BOOKED] Failed to create VisMed appointment for booking ${bookingIdStr}: ${err.message}`);
                 // Persistir FAILED + erro real antes de propagar (fila fará retry/backoff até dead-letter).
@@ -2236,6 +2255,88 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         }
 
         return { processed: true, action: 'slot_booked', vismedCreated: !!vismedAppointmentId };
+    }
+
+    /**
+     * Busca na agenda VisMed um agendamento já existente com o mesmo profissional, data,
+     * hora e paciente do booking Doctoralia. Usado em retry para adotar um agendamento
+     * que a VisMed possa ter criado apesar de responder 200 sem idpacienteagendamento.
+     * Retorna o idpacienteagendamento encontrado, ou null se não houver match confiável.
+     */
+    private async findExistingVismedAppointmentId(clinicId: string, vismedDoctorId: string, booking: any): Promise<string | null> {
+        const conn = await this.prisma.integrationConnection.findFirst({
+            where: { clinicId, provider: 'vismed' },
+        });
+        if (!conn) return null;
+
+        const vismedDoctor = await this.prisma.vismedDoctor.findUnique({ where: { id: vismedDoctorId } });
+        if (!vismedDoctor?.vismedId) return null;
+
+        const startDate = new Date(booking.start_at);
+        if (isNaN(startDate.getTime())) return null;
+        const { dateStr, timeStr } = this.extractBrtDateTime(startDate); // YYYY-MM-DD / HH:MM (BRT)
+        const [yyyy, mm, dd] = dateStr.split('-');
+        const dataBr = `${dd}/${mm}/${yyyy}`; // formato do filtro dataini/datafim
+
+        const patient = booking.patient || {};
+        const expectedName = this.normalizeName(`${patient.name || ''} ${patient.surname || ''}`);
+
+        const units = await this.prisma.vismedUnit.findMany({ where: { isActive: true } });
+        const baseUrl = conn.domain || undefined;
+
+        for (const u of units) {
+            let agendamentos: any[];
+            try {
+                await this.rateLimiter.acquire('vismed');
+                agendamentos = await this.vismedService.getAgendamentos(u.vismedId, baseUrl, {
+                    dataini: dataBr,
+                    datafim: dataBr,
+                    profissional: vismedDoctor.vismedId,
+                });
+            } catch (err: any) {
+                this.logger.warn(`[SLOT-BOOKED] Pré-retry lookup: unidade ${u.vismedId} falhou (${err.message})`);
+                continue;
+            }
+            if (!Array.isArray(agendamentos)) continue;
+
+            for (const a of agendamentos) {
+                const vid = a?.idpacienteagendamento ? String(a.idpacienteagendamento) : null;
+                if (!vid) continue;
+                if (String(a?.cancelado) === '1' || a?.cancelado === true) continue;
+                if (String(a?.idprofissional) !== String(vismedDoctor.vismedId)) continue;
+                if (String(a?.dataagendamento) !== dateStr) continue;
+                const hora = String(a?.horarioagendamento || '').slice(0, 5);
+                if (hora !== timeStr) continue;
+
+                // Só adota se o paciente bater (evita adotar agendamento de outra pessoa no mesmo horário).
+                const foundName = this.normalizeName(a?.nomepaciente || a?.nome || '');
+                if (expectedName && foundName && !foundName.includes(expectedName) && !expectedName.includes(foundName)) {
+                    this.logger.warn(
+                        `[SLOT-BOOKED] Pré-retry lookup: agendamento ${vid} no mesmo horário mas paciente diferente ("${foundName}" vs "${expectedName}") — não adotado`,
+                    );
+                    continue;
+                }
+
+                // Não adotar ID que já pertence a outro BookingSync (seria roubo de vínculo).
+                const alreadyLinked = await this.prisma.bookingSync.findUnique({
+                    where: { clinicId_vismedAppointmentId: { clinicId, vismedAppointmentId: vid } },
+                });
+                if (alreadyLinked) continue;
+
+                return vid;
+            }
+        }
+        return null;
+    }
+
+    /** Normaliza nome para comparação: minúsculas, sem acentos, espaços colapsados. */
+    private normalizeName(name: string): string {
+        return String(name || '')
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .toLowerCase()
+            .replace(/\s+/g, ' ')
+            .trim();
     }
 
     /** Extrai o ID de agendamento de uma resposta de criação da VisMed; null se ausente/inválido. */
