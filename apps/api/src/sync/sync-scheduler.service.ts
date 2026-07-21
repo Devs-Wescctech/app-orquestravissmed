@@ -38,6 +38,8 @@ export class SyncSchedulerService implements OnModuleInit {
         const startedAt = new Date();
         this.logger.log(`[SCHEDULER] >>> Iniciando ciclo automático de sync global (${startedAt.toISOString()})`);
 
+        await this.cleanupSkippedBookingAlerts();
+
         try {
             const clinics = await this.prisma.clinic.findMany({
                 where: { active: true },
@@ -95,6 +97,34 @@ export class SyncSchedulerService implements OnModuleInit {
             this.logger.error(`[SCHEDULER] Erro inesperado no ciclo: ${err?.message}`, err?.stack);
         } finally {
             this.isRunning = false;
+        }
+    }
+
+    /**
+     * Limpeza automática dos alertas de agendamentos pulados:
+     * 1. Auto-resolve alertas cujo startAt já passou (risco de overbooking acabou).
+     * 2. Apaga alertas resolvidos há mais de 30 dias.
+     */
+    private async cleanupSkippedBookingAlerts(): Promise<void> {
+        try {
+            const now = new Date();
+            const expired = await this.prisma.skippedBookingAlert.updateMany({
+                where: { resolved: false, startAt: { lt: now } },
+                data: { resolved: true, resolvedAt: now },
+            });
+            if (expired.count > 0) {
+                this.logger.log(`[SKIPPED-ALERT] ${expired.count} alerta(s) auto-resolvido(s) — agendamento já passou.`);
+            }
+
+            const cutoff = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+            const purged = await this.prisma.skippedBookingAlert.deleteMany({
+                where: { resolved: true, resolvedAt: { lt: cutoff } },
+            });
+            if (purged.count > 0) {
+                this.logger.log(`[SKIPPED-ALERT] ${purged.count} alerta(s) resolvidos há mais de 30 dias apagado(s).`);
+            }
+        } catch (err: any) {
+            this.logger.warn(`[SKIPPED-ALERT] Falha na limpeza de alertas antigos: ${err?.message}`);
         }
     }
 }

@@ -1685,7 +1685,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
      */
     async getSkippedBookingAlerts(clinicId: string) {
         const pending = await this.prisma.skippedBookingAlert.findMany({
-            where: { clinicId, resolved: false },
+            where: { clinicId, resolved: false, startAt: { gte: new Date() } },
             orderBy: { startAt: 'desc' },
         });
 
