@@ -1621,6 +1621,124 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
      * disappears from Doctoralia. Active appointment -> POST/PATCH break.
      * Cancelled / no-show -> DELETE break.
      */
+    // ------------------------------------------------------------------
+    // Alertas de agendamentos pulados (médico sem vínculo)
+    // ------------------------------------------------------------------
+
+    private async recordSkippedBookingAlert(rec: any): Promise<void> {
+        try {
+            let doctorName: string | null = null;
+            const doc = await this.prisma.vismedDoctor.findUnique({ where: { id: rec.vismedDoctorId } });
+            doctorName = doc?.name || null;
+            await this.prisma.skippedBookingAlert.upsert({
+                where: { bookingSyncId: rec.id },
+                create: {
+                    clinicId: rec.clinicId,
+                    vismedDoctorId: rec.vismedDoctorId,
+                    doctorName,
+                    bookingSyncId: rec.id,
+                    startAt: rec.startAt,
+                    endAt: rec.endAt,
+                    patientName: rec.patientName || null,
+                    reason: 'DOCTOR_NOT_LINKED',
+                },
+                update: {
+                    startAt: rec.startAt,
+                    endAt: rec.endAt,
+                    doctorName,
+                    resolved: false,
+                    resolvedAt: null,
+                },
+            });
+        } catch (err: any) {
+            this.logger.warn(`[SKIPPED-ALERT] Falha ao registrar alerta para booking ${rec.id}: ${err?.message}`);
+        }
+    }
+
+    private async resolveSkippedAlertForBooking(bookingSyncId: string): Promise<void> {
+        try {
+            await this.prisma.skippedBookingAlert.updateMany({
+                where: { bookingSyncId, resolved: false },
+                data: { resolved: true, resolvedAt: new Date() },
+            });
+        } catch {}
+    }
+
+    async resolveSkippedAlertsForDoctor(clinicId: string, vismedDoctorId: string): Promise<number> {
+        try {
+            const res = await this.prisma.skippedBookingAlert.updateMany({
+                where: { clinicId, vismedDoctorId, resolved: false },
+                data: { resolved: true, resolvedAt: new Date() },
+            });
+            if (res.count > 0) {
+                this.logger.log(`[SKIPPED-ALERT] ${res.count} alerta(s) resolvidos para médico ${vismedDoctorId} (clínica ${clinicId})`);
+            }
+            return res.count;
+        } catch {
+            return 0;
+        }
+    }
+
+    /**
+     * Lista alertas pendentes por clínica, agrupados por médico.
+     * Auto-resolve alertas de médicos que já ganharam vínculo LINKED desde a última verificação.
+     */
+    async getSkippedBookingAlerts(clinicId: string) {
+        const pending = await this.prisma.skippedBookingAlert.findMany({
+            where: { clinicId, resolved: false },
+            orderBy: { startAt: 'desc' },
+        });
+
+        // Auto-resolução lazy: médico já vinculado → resolver os alertas dele.
+        const doctorIds = Array.from(new Set(pending.map((a) => a.vismedDoctorId)));
+        const stillPending: typeof pending = [];
+        for (const docId of doctorIds) {
+            const linked = await this.prisma.mapping.findFirst({
+                where: { clinicId, entityType: 'DOCTOR', vismedId: docId, status: 'LINKED', externalId: { not: null } },
+            });
+            if (linked) {
+                await this.resolveSkippedAlertsForDoctor(clinicId, docId);
+            } else {
+                stillPending.push(...pending.filter((a) => a.vismedDoctorId === docId));
+            }
+        }
+
+        const byDoctor = new Map<string, { vismedDoctorId: string; doctorName: string | null; count: number; latestAt: Date; appointments: any[] }>();
+        for (const a of stillPending) {
+            const entry = byDoctor.get(a.vismedDoctorId) || {
+                vismedDoctorId: a.vismedDoctorId,
+                doctorName: a.doctorName,
+                count: 0,
+                latestAt: a.createdAt,
+                appointments: [],
+            };
+            entry.count += 1;
+            if (a.createdAt > entry.latestAt) entry.latestAt = a.createdAt;
+            if (entry.appointments.length < 10) {
+                entry.appointments.push({
+                    id: a.id,
+                    startAt: a.startAt,
+                    endAt: a.endAt,
+                    patientName: a.patientName,
+                });
+            }
+            byDoctor.set(a.vismedDoctorId, entry);
+        }
+
+        return {
+            total: stillPending.length,
+            doctors: Array.from(byDoctor.values()).sort((x, y) => y.count - x.count),
+        };
+    }
+
+    async resolveSkippedBookingAlerts(clinicId: string, vismedDoctorId?: string): Promise<{ resolved: number }> {
+        const res = await this.prisma.skippedBookingAlert.updateMany({
+            where: { clinicId, resolved: false, ...(vismedDoctorId ? { vismedDoctorId } : {}) },
+            data: { resolved: true, resolvedAt: new Date() },
+        });
+        return { resolved: res.count };
+    }
+
     private async syncDoctoraliaBreak(bookingSyncId: string): Promise<void> {
         const rec = await this.prisma.bookingSync.findUnique({ where: { id: bookingSyncId } });
         if (!rec || rec.origin !== 'VISMED' || !rec.vismedDoctorId) return;
@@ -1635,7 +1753,18 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 status: 'LINKED',
             },
         });
-        if (!mapping || !mapping.externalId) return;
+        if (!mapping || !mapping.externalId) {
+            // Médico sem vínculo LINKED: o break não vai para a Doctoralia. Registrar alerta
+            // (dedup por bookingSyncId) para o dashboard, apenas para agendamentos ativos.
+            if (rec.status === 'BOOKED' || rec.status === 'CONFIRMED') {
+                await this.recordSkippedBookingAlert(rec);
+            } else {
+                await this.resolveSkippedAlertForBooking(rec.id);
+            }
+            return;
+        }
+        // Vínculo existe: resolver alertas pendentes deste médico nesta clínica.
+        await this.resolveSkippedAlertsForDoctor(rec.clinicId, rec.vismedDoctorId);
 
         const cd: any = mapping.conflictData || {};
         const facilityId = cd.facilityId;

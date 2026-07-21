@@ -1,14 +1,25 @@
 'use client';
 import { useState, useEffect } from 'react';
-import { CheckCircle2, Hourglass, AlertTriangle, Settings2, Users, Loader2, UserSquare2, CalendarDays, ExternalLink, Activity, ShieldCheck, ArrowUpRight } from 'lucide-react';
+import { CheckCircle2, Hourglass, AlertTriangle, Settings2, Users, Loader2, UserSquare2, CalendarDays, ExternalLink, Activity, ShieldCheck, ArrowUpRight, Link2Off, X } from 'lucide-react';
+import Link from 'next/link';
 import { api } from '@/lib/api';
 import { useClinic } from '@/lib/clinic-store';
 import { useAuthStore } from '@/lib/store';
+
+interface SkippedAlertDoctor {
+    vismedDoctorId: string;
+    doctorName: string | null;
+    count: number;
+    latestAt: string;
+    appointments: Array<{ id: string; startAt: string; endAt: string; patientName?: string | null }>;
+}
 
 export default function DashboardOverview() {
     const { user } = useAuthStore();
     const { activeClinic } = useClinic();
     const [isLoading, setIsLoading] = useState(true);
+    const [skippedAlerts, setSkippedAlerts] = useState<{ total: number; doctors: SkippedAlertDoctor[] }>({ total: 0, doctors: [] });
+    const [dismissingAlerts, setDismissingAlerts] = useState(false);
 
     const [metrics, setMetrics] = useState({
         activeUsers: 0,
@@ -31,7 +42,7 @@ export default function DashboardOverview() {
             try {
                 const clinicId = activeClinic.id;
 
-                const [usersRes, clinicsRes, syncRes, doctorsCountRes, calendarRes, doctorsRes, vismedRes] = await Promise.all([
+                const [usersRes, clinicsRes, syncRes, doctorsCountRes, calendarRes, doctorsRes, vismedRes, skippedRes] = await Promise.all([
                     api.get('/users').catch(() => ({ data: [] })),
                     api.get('/clinics').catch(() => ({ data: [] })),
                     api.get(`/sync/${clinicId}/history`).catch(() => ({ data: [] })),
@@ -39,7 +50,10 @@ export default function DashboardOverview() {
                     api.get('/appointments/calendar-status', { params: { clinicId } }).catch(() => ({ data: { calendarEnabled: false } })),
                     api.get('/doctors', { params: { clinicId } }).catch(() => ({ data: [] })),
                     api.get('/sync/vismed/stats').catch(() => ({ data: { units: 0, doctors: 0, specialties: 0 } })),
+                    api.get('/booking-sync/skipped-alerts', { params: { clinicId } }).catch(() => ({ data: { total: 0, doctors: [] } })),
                 ]);
+
+                setSkippedAlerts(skippedRes.data || { total: 0, doctors: [] });
 
                 const allUsers = usersRes.data || [];
                 const activeU = allUsers.filter((u: any) => u.active).length;
@@ -92,6 +106,19 @@ export default function DashboardOverview() {
         fetchDashboardData();
     }, [user, activeClinic]);
 
+    const handleDismissAlerts = async () => {
+        if (!activeClinic) return;
+        setDismissingAlerts(true);
+        try {
+            await api.post('/booking-sync/skipped-alerts/resolve', { clinicId: activeClinic.id });
+            setSkippedAlerts({ total: 0, doctors: [] });
+        } catch (err) {
+            console.error('Failed to dismiss skipped alerts', err);
+        } finally {
+            setDismissingAlerts(false);
+        }
+    };
+
     if (isLoading) {
         return (
             <div className="flex flex-col items-center justify-center min-h-[60vh] animate-in fade-in duration-700">
@@ -133,6 +160,62 @@ export default function DashboardOverview() {
                     </div>
                 </div>
             </div>
+
+            {/* Alerta: agendamentos não enviados por médico sem vínculo */}
+            {skippedAlerts.total > 0 && (
+                <div className="bg-amber-50/80 backdrop-blur-xl rounded-[32px] p-6 border-2 border-amber-200 shadow-lg shadow-amber-100/40 animate-in fade-in slide-in-from-top-2 duration-500">
+                    <div className="flex items-start justify-between gap-4">
+                        <div className="flex items-start gap-4">
+                            <div className="h-12 w-12 rounded-2xl bg-gradient-to-br from-amber-400 to-orange-500 flex items-center justify-center text-white shadow-lg shrink-0">
+                                <Link2Off className="h-6 w-6" />
+                            </div>
+                            <div>
+                                <h3 className="text-sm font-black text-amber-900 uppercase tracking-wide">
+                                    {skippedAlerts.total} agendamento{skippedAlerts.total > 1 ? 's' : ''} não enviado{skippedAlerts.total > 1 ? 's' : ''} à Doctoralia
+                                </h3>
+                                <p className="text-xs font-bold text-amber-700 mt-1">
+                                    Médico{skippedAlerts.doctors.length > 1 ? 's' : ''} sem vínculo com a Doctoralia — os horários abaixo continuam livres lá, com risco de overbooking. Vincule o{skippedAlerts.doctors.length > 1 ? 's' : ''} profissiona{skippedAlerts.doctors.length > 1 ? 'is' : 'l'} na Central de Mapeamento para resolver.
+                                </p>
+                                <div className="mt-3 flex flex-wrap gap-2">
+                                    {skippedAlerts.doctors.map((d) => (
+                                        <div key={d.vismedDoctorId} className="bg-white/70 border border-amber-200 rounded-2xl px-4 py-2.5">
+                                            <div className="flex items-center gap-2">
+                                                <AlertTriangle className="h-3.5 w-3.5 text-amber-500" />
+                                                <span className="text-xs font-black text-slate-800">{d.doctorName || 'Profissional desconhecido'}</span>
+                                                <span className="text-[10px] font-black text-white bg-amber-500 rounded-full px-2 py-0.5">{d.count}</span>
+                                            </div>
+                                            {d.appointments.slice(0, 3).map((a) => (
+                                                <div key={a.id} className="text-[10px] font-bold text-amber-800/80 mt-1 tabular-nums">
+                                                    {new Date(a.startAt).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' })}
+                                                    {a.patientName ? ` · ${a.patientName}` : ''}
+                                                </div>
+                                            ))}
+                                            {d.count > 3 && (
+                                                <div className="text-[10px] font-bold text-amber-600 mt-1">+{d.count - 3} outro{d.count - 3 > 1 ? 's' : ''}</div>
+                                            )}
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+                        <div className="flex flex-col items-end gap-2 shrink-0">
+                            <Link
+                                href="/mapping"
+                                className="flex items-center gap-2 bg-amber-500 hover:bg-amber-600 text-white px-5 py-2.5 rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-lg transition-all hover:-translate-y-0.5 active:scale-95"
+                            >
+                                Resolver vínculos <ArrowUpRight className="h-4 w-4" />
+                            </Link>
+                            <button
+                                onClick={handleDismissAlerts}
+                                disabled={dismissingAlerts}
+                                className="flex items-center gap-1.5 text-[10px] font-black uppercase tracking-widest text-amber-600 hover:text-amber-800 px-3 py-1.5 transition-colors disabled:opacity-50"
+                            >
+                                {dismissingAlerts ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <X className="h-3.5 w-3.5" />} Dispensar
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {/* KPI Grid - Glassmorphism Green Theme */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6 gap-6">

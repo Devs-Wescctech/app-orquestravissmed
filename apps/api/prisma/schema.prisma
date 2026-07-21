@@ -481,6 +481,27 @@ model BookingSync {
   @@index([clinicId, vismedDoctorId, startAt])
 }
 
+// Alerta de agendamento VisMed pulado (não enviado à Doctoralia) por médico sem vínculo LINKED.
+// Dedup por bookingSyncId: polls sucessivos do mesmo agendamento não geram alertas repetidos.
+model SkippedBookingAlert {
+  id             String    @id @default(uuid())
+  clinicId       String
+  vismedDoctorId String    // UUID do VismedDoctor
+  doctorName     String?
+  bookingSyncId  String    @unique
+  startAt        DateTime
+  endAt          DateTime
+  patientName    String?
+  reason         String    @default("DOCTOR_NOT_LINKED")
+  resolved       Boolean   @default(false)
+  resolvedAt     DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([clinicId, resolved])
+  @@index([clinicId, vismedDoctorId, resolved])
+}
+
 enum SyncJobStatus {
   PENDING
   RUNNING

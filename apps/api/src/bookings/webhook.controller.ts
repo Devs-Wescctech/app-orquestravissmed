@@ -85,6 +85,21 @@ export class BookingSyncController {
         return { ok: true };
     }
 
+    @Get('skipped-alerts')
+    async getSkippedAlerts(@Req() req: any, @Query('clinicId') clinicId: string) {
+        this.validateClinicAccess(req.user, clinicId);
+        return this.bookingSyncService.getSkippedBookingAlerts(clinicId);
+    }
+
+    @Post('skipped-alerts/resolve')
+    async resolveSkippedAlerts(
+        @Req() req: any,
+        @Body() body: { clinicId: string; vismedDoctorId?: string },
+    ) {
+        this.validateClinicAccess(req.user, body?.clinicId);
+        return this.bookingSyncService.resolveSkippedBookingAlerts(body.clinicId, body.vismedDoctorId);
+    }
+
     @Get('health')
     async getHealth(@Req() req: any) {
         const [queueMetrics, rateLimiterStats] = await Promise.all([
