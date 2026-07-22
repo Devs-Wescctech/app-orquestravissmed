@@ -91,6 +91,16 @@ export class BookingSyncController {
         return this.bookingSyncService.getSkippedBookingAlerts(clinicId);
     }
 
+    @Get('vismed-payload-preview/:bookingSyncId')
+    async previewVismedPayload(
+        @Req() req: any,
+        @Param('bookingSyncId') bookingSyncId: string,
+        @Query('clinicId') clinicId: string,
+    ) {
+        this.validateClinicAccess(req.user, clinicId);
+        return this.bookingSyncService.previewVismedCreatePayload(clinicId, bookingSyncId);
+    }
+
     @Post('skipped-alerts/resolve')
     async resolveSkippedAlerts(
         @Req() req: any,

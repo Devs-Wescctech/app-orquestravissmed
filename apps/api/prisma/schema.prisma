@@ -469,6 +469,11 @@ model BookingSync {
   lastMoveAt            DateTime?
   lastMoveTargetStartAt DateTime?         // horário para o qual movemos (eco se vier igual <5min)
   syncError             String?
+  // Auditoria da última tentativa de criação na VisMed (payload sanitizado, URL e resposta bruta)
+  vismedRequestPayload  Json?
+  vismedRequestUrl      String?
+  vismedResponse        Json?
+  vismedAttemptAt       DateTime?
   processedAt           DateTime?
   createdAt             DateTime          @default(now())
   updatedAt             DateTime          @updatedAt

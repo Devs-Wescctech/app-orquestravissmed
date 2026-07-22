@@ -12,7 +12,19 @@ interface SkippedAlertDoctor {
     reason?: string;
     count: number;
     latestAt: string;
-    appointments: Array<{ id: string; startAt: string; endAt: string; patientName?: string | null; errorMessage?: string | null }>;
+    appointments: Array<{
+        id: string;
+        bookingSyncId?: string;
+        startAt: string;
+        endAt: string;
+        patientName?: string | null;
+        errorMessage?: string | null;
+        vismedRequestPayload?: any;
+        vismedRequestUrl?: string | null;
+        vismedResponse?: any;
+        vismedAttemptAt?: string | null;
+        syncError?: string | null;
+    }>;
 }
 
 export default function DashboardOverview() {
@@ -200,6 +212,38 @@ export default function DashboardOverview() {
                                                         <div className="text-[10px] font-semibold text-red-700/90 mt-0.5 max-w-xs break-words">
                                                             {a.errorMessage}
                                                         </div>
+                                                    )}
+                                                    {d.reason === 'VISMED_CREATE_FAILED' && (a.vismedRequestPayload || a.vismedResponse || a.vismedAttemptAt) && (
+                                                        <details className="mt-1 max-w-xs">
+                                                            <summary className="text-[10px] font-black text-amber-700 cursor-pointer uppercase tracking-wide hover:text-amber-900">
+                                                                Ver diagnóstico técnico
+                                                            </summary>
+                                                            <div className="mt-1.5 bg-slate-900 rounded-xl p-3 text-left space-y-2">
+                                                                {a.vismedAttemptAt && (
+                                                                    <div className="text-[10px] text-slate-300">
+                                                                        <span className="font-black text-slate-400 uppercase">Última tentativa:</span>{' '}
+                                                                        {new Date(a.vismedAttemptAt).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}
+                                                                    </div>
+                                                                )}
+                                                                {a.vismedRequestUrl && (
+                                                                    <div className="text-[10px] text-slate-300 break-all">
+                                                                        <span className="font-black text-slate-400 uppercase">Endpoint:</span> {a.vismedRequestUrl}
+                                                                    </div>
+                                                                )}
+                                                                {a.vismedRequestPayload && (
+                                                                    <div>
+                                                                        <div className="text-[10px] font-black text-slate-400 uppercase">Dados enviados à VisMed</div>
+                                                                        <pre className="text-[9px] text-emerald-300 whitespace-pre-wrap break-all mt-0.5">{JSON.stringify(a.vismedRequestPayload, null, 1)}</pre>
+                                                                    </div>
+                                                                )}
+                                                                {a.vismedResponse && (
+                                                                    <div>
+                                                                        <div className="text-[10px] font-black text-slate-400 uppercase">Resposta da VisMed</div>
+                                                                        <pre className="text-[9px] text-red-300 whitespace-pre-wrap break-all mt-0.5">{JSON.stringify(a.vismedResponse, null, 1)}</pre>
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                        </details>
                                                     )}
                                                 </div>
                                             ))}

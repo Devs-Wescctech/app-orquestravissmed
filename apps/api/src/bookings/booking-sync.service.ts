@@ -1777,6 +1777,25 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             (a) => !(a.reason === 'DOCTOR_NOT_LINKED' && resolvedDoctorIds.has(a.vismedDoctorId)),
         );
 
+        // Diagnóstico persistido da última tentativa de criação na VisMed (payload/resposta/horário)
+        // para os alertas de falha de criação.
+        const failedIds = stillPending.filter((a) => a.reason === 'VISMED_CREATE_FAILED').map((a) => a.bookingSyncId);
+        const auditByBookingId = new Map<string, any>();
+        if (failedIds.length > 0) {
+            const recs = await this.prisma.bookingSync.findMany({
+                where: { id: { in: failedIds } },
+                select: {
+                    id: true,
+                    vismedRequestPayload: true,
+                    vismedRequestUrl: true,
+                    vismedResponse: true,
+                    vismedAttemptAt: true,
+                    syncError: true,
+                },
+            });
+            for (const r of recs) auditByBookingId.set(r.id, r);
+        }
+
         const byDoctor = new Map<string, { vismedDoctorId: string; doctorName: string | null; reason: string; count: number; latestAt: Date; appointments: any[] }>();
         for (const a of stillPending) {
             const key = `${a.vismedDoctorId}:${a.reason}`;
@@ -1791,12 +1810,21 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             entry.count += 1;
             if (a.createdAt > entry.latestAt) entry.latestAt = a.createdAt;
             if (entry.appointments.length < 10) {
+                const audit = auditByBookingId.get(a.bookingSyncId);
                 entry.appointments.push({
                     id: a.id,
+                    bookingSyncId: a.bookingSyncId,
                     startAt: a.startAt,
                     endAt: a.endAt,
                     patientName: a.patientName,
                     errorMessage: a.errorMessage,
+                    ...(audit ? {
+                        vismedRequestPayload: audit.vismedRequestPayload,
+                        vismedRequestUrl: audit.vismedRequestUrl,
+                        vismedResponse: audit.vismedResponse,
+                        vismedAttemptAt: audit.vismedAttemptAt,
+                        syncError: audit.syncError,
+                    } : {}),
                 });
             }
             byDoctor.set(key, entry);
@@ -1806,6 +1834,58 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             total: stillPending.length,
             doctors: Array.from(byDoctor.values()).sort((x, y) => y.count - x.count),
         };
+    }
+
+    /**
+     * Pré-visualização (dry-run) do payload que seria reenviado à VisMed para um booking
+     * que falhou. NÃO chama a API da VisMed — só monta o payload e devolve sanitizado,
+     * junto com a auditoria da última tentativa.
+     */
+    async previewVismedCreatePayload(clinicId: string, bookingSyncId: string) {
+        const rec = await this.prisma.bookingSync.findFirst({
+            where: { id: bookingSyncId, clinicId },
+        });
+        if (!rec) throw new Error('Booking não encontrado nesta clínica');
+        if (!rec.doctoraliaDoctorId) throw new Error('Booking sem médico Doctoralia associado');
+
+        const lastAttempt = {
+            payload: rec.vismedRequestPayload,
+            url: rec.vismedRequestUrl,
+            response: rec.vismedResponse,
+            attemptAt: rec.vismedAttemptAt,
+            syncError: rec.syncError,
+            status: rec.status,
+        };
+
+        const mapping = await this.prisma.mapping.findFirst({
+            where: { clinicId, entityType: 'DOCTOR', externalId: rec.doctoraliaDoctorId, status: 'LINKED' },
+        });
+        if (!mapping) {
+            return {
+                ok: false,
+                reason: 'Médico sem vínculo LINKED — o reenvio falharia. Vincule o profissional na Central de Mapeamento.',
+                lastAttempt,
+            };
+        }
+
+        const raw: any = rec.rawPayload;
+        const booking = raw?.data?.visit_booking;
+        if (!booking) {
+            return { ok: false, reason: 'Payload original da Doctoralia não está disponível para este booking.', lastAttempt };
+        }
+
+        try {
+            const { payload, url, categoriaSource } = await this.buildVismedCreatePayload(clinicId, mapping, booking);
+            return {
+                ok: true,
+                payload: this.sanitizeVismedPayloadForAudit(payload),
+                url,
+                categoriaSource,
+                lastAttempt,
+            };
+        } catch (err: any) {
+            return { ok: false, reason: String(err?.message || err), lastAttempt };
+        }
     }
 
     async resolveSkippedBookingAlerts(clinicId: string, vismedDoctorId?: string): Promise<{ resolved: number }> {
@@ -2201,7 +2281,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
 
                 if (!vismedAppointmentId) {
                 await this.rateLimiter.acquire('vismed');
-                const vismedCreateResult = await this.createVismedAppointment(clinicId, mapping, booking, data);
+                const vismedCreateResult = await this.createVismedAppointment(clinicId, mapping, booking, data, reserved.id);
 
                 if (this.isVismedLogicalFailure(vismedCreateResult)) {
                     // 200 com indicador de erro no corpo = agendamento NÃO criado na VisMed,
@@ -2218,6 +2298,19 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 }
 
                 this.logger.log(`[SLOT-BOOKED] Created VisMed appointment ${vismedAppointmentId} for booking ${bookingIdStr}`);
+
+                // Verificação pós-criação: 200 com ID não garante que o agendamento exista de fato.
+                const verify = await this.verifyVismedAppointmentExists(clinicId, mapping.vismedId, vismedAppointmentId, booking);
+                if (verify === 'not_found') {
+                    const ghostId = vismedAppointmentId;
+                    vismedAppointmentId = null;
+                    throw new Error(
+                        `VisMed retornou id=${ghostId}, mas o agendamento NÃO aparece na agenda (verificação pós-criação). Tratado como falha.`,
+                    );
+                }
+                if (verify === 'unverified') {
+                    this.logger.warn(`[SLOT-BOOKED] Não foi possível verificar o agendamento ${vismedAppointmentId} na agenda VisMed (leitura parcial) — mantendo BOOKED`);
+                }
                 }
             } catch (err: any) {
                 this.logger.error(`[SLOT-BOOKED] Failed to create VisMed appointment for booking ${bookingIdStr}: ${err.message}`);
@@ -2541,7 +2634,19 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         return { processed: true, action: 'booking_moved' };
     }
 
-    private async createVismedAppointment(clinicId: string, mapping: any, booking: any, notifData: any) {
+    /**
+     * Monta o payload de criação de agendamento na VisMed de forma determinística.
+     * - `idcategoriaservico`: preferir a especialidade do médico que está mapeada ao serviço
+     *   Doctoralia efetivamente agendado (SpecialtyServiceMapping aprovado); senão, a menor
+     *   especialidade (por vismedId) do próprio médico. NUNCA usa especialidade de outro
+     *   médico/unidade — se o médico não tiver especialidade cadastrada, falha com erro claro.
+     */
+    private async buildVismedCreatePayload(clinicId: string, mapping: any, booking: any): Promise<{
+        payload: any;
+        url: string;
+        baseUrl?: string;
+        categoriaSource: string;
+    }> {
         const conn = await this.prisma.integrationConnection.findFirst({
             where: { clinicId, provider: 'vismed' },
         });
@@ -2562,23 +2667,63 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             throw new Error(`VisMed doctor ${vismedDoctorId} not found`);
         }
 
+        const doctorSpecialties = (vismedDoctor.specialties || [])
+            .map((s: any) => s.specialty)
+            .filter((s: any) => s && s.vismedId)
+            .sort((a: any, b: any) => a.vismedId - b.vismedId);
+
         let idCategoriaServico = 0;
-        if (vismedDoctor.specialties && vismedDoctor.specialties.length > 0) {
-            idCategoriaServico = vismedDoctor.specialties[0].specialty.vismedId || 0;
+        let categoriaSource = '';
+
+        // 1) Preferir a especialidade do médico mapeada ao serviço Doctoralia agendado.
+        const addressServiceId = booking.address_service?.id ? String(booking.address_service.id) : null;
+        if (addressServiceId && doctorSpecialties.length > 0) {
+            const addrService = await this.prisma.doctoraliaAddressService.findUnique({
+                where: { doctoraliaAddressServiceId: addressServiceId },
+            });
+            if (addrService) {
+                const specIds = doctorSpecialties.map((s: any) => s.id);
+                const specMapping = await this.prisma.specialtyServiceMapping.findFirst({
+                    where: {
+                        doctoraliaServiceId: addrService.serviceId,
+                        vismedSpecialtyId: { in: specIds },
+                        isActive: true,
+                        requiresReview: false,
+                    },
+                    include: { vismedSpecialty: true },
+                    orderBy: { confidenceScore: 'desc' },
+                });
+                if (specMapping?.vismedSpecialty?.vismedId) {
+                    idCategoriaServico = specMapping.vismedSpecialty.vismedId;
+                    categoriaSource = `serviço agendado (${specMapping.vismedSpecialty.name})`;
+                }
+            }
         }
 
+        // 2) Fallback determinístico: especialidade do PRÓPRIO médico (menor vismedId).
+        if (!idCategoriaServico && doctorSpecialties.length > 0) {
+            idCategoriaServico = doctorSpecialties[0].vismedId;
+            categoriaSource = `especialidade do médico (${doctorSpecialties[0].name})`;
+        }
+
+        // 3) Sem especialidade do médico: falhar com erro claro (não usar especialidade
+        //    aleatória do banco — pode ser de outra unidade e gerar agendamento inválido).
         if (!idCategoriaServico) {
-            const anySpec = await this.prisma.vismedSpecialty.findFirst();
-            if (anySpec) idCategoriaServico = anySpec.vismedId;
+            throw new Error(
+                `Médico "${vismedDoctor.name}" não possui especialidade (categoria de serviço) cadastrada na VisMed — impossível determinar idcategoriaservico. Cadastre a especialidade do profissional na VisMed e rode o sync.`,
+            );
         }
 
         const startDate = new Date(booking.start_at);
+        if (isNaN(startDate.getTime())) {
+            throw new Error(`start_at inválido no booking Doctoralia: "${booking.start_at}"`);
+        }
         const { dateStr, timeStr } = this.extractBrtDateTime(startDate);
         const vismedProfId = vismedDoctor.vismedId;
         const horariosProfissional = `${vismedProfId}-${timeStr}`;
 
         this.logger.log(
-            `[VISMED-CREATE] booking ${booking.id}: raw start_at=${booking.start_at} → BRT date=${dateStr} time=${timeStr} (horarios_profissional=${horariosProfissional})`
+            `[VISMED-CREATE] booking ${booking.id}: raw start_at=${booking.start_at} → BRT date=${dateStr} time=${timeStr} (horarios_profissional=${horariosProfissional}, categoria=${idCategoriaServico} via ${categoriaSource})`
         );
 
         const patient = booking.patient || {};
@@ -2598,7 +2743,148 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             sexo: patient.gender === 'f' ? 1 : patient.gender === 'm' ? 2 : undefined,
         };
 
-        return await this.vismedService.createAppointment(payload, conn.domain || undefined);
+        const baseUrl = conn.domain || undefined;
+        return { payload, url: this.vismedService.getCreateAppointmentUrl(baseUrl), baseUrl, categoriaSource };
+    }
+
+    /** Mascara CPF e telefone para exibição/persistência segura no painel. */
+    private sanitizeVismedPayloadForAudit(payload: any): any {
+        if (!payload || typeof payload !== 'object') return payload;
+        const out: any = { ...payload };
+        if (out.cpf) {
+            const s = String(out.cpf);
+            out.cpf = s.length > 3 ? `***${s.slice(-3)}` : '***';
+        }
+        if (out.telefone) {
+            const s = String(out.telefone);
+            out.telefone = s.length > 4 ? `***${s.slice(-4)}` : '***';
+        }
+        return out;
+    }
+
+    /** Trunca com segurança uma resposta para persistência em Json (máx ~4KB serializado). */
+    private truncateForAudit(value: any): any {
+        try {
+            const str = JSON.stringify(value ?? null);
+            if (str.length <= 4000) return value ?? null;
+            return { truncated: true, preview: str.slice(0, 4000) };
+        } catch {
+            return { unserializable: true, preview: String(value).slice(0, 4000) };
+        }
+    }
+
+    /**
+     * Persiste a auditoria da tentativa de criação na VisMed no BookingSync.
+     * Nunca lança — auditoria não pode derrubar o fluxo principal.
+     */
+    private async persistVismedAudit(bookingSyncId: string, data: {
+        payload?: any;
+        url?: string;
+        response?: any;
+    }): Promise<void> {
+        try {
+            await this.prisma.bookingSync.update({
+                where: { id: bookingSyncId },
+                data: {
+                    ...(data.payload !== undefined ? { vismedRequestPayload: this.sanitizeVismedPayloadForAudit(data.payload) } : {}),
+                    ...(data.url !== undefined ? { vismedRequestUrl: String(data.url).slice(0, 500) } : {}),
+                    ...(data.response !== undefined ? { vismedResponse: this.truncateForAudit(data.response) } : {}),
+                    vismedAttemptAt: new Date(),
+                },
+            });
+        } catch (err: any) {
+            this.logger.warn(`[VISMED-AUDIT] Falha ao persistir auditoria do booking ${bookingSyncId}: ${err?.message}`);
+        }
+    }
+
+    /**
+     * Verificação pós-criação: confirma via getAgendamentos que o agendamento criado
+     * realmente existe na agenda da VisMed. Retorna:
+     * - 'confirmed'  → ID encontrado na agenda
+    * - 'not_found'  → leitura OK em todas as unidades e o ID NÃO apareceu (criação fantasma)
+     * - 'unverified' → não foi possível verificar (erro de rede/unidade) — não bloquear
+     */
+    private async verifyVismedAppointmentExists(
+        clinicId: string,
+        vismedDoctorUuid: string,
+        vismedAppointmentId: string,
+        booking: any,
+    ): Promise<'confirmed' | 'not_found' | 'unverified'> {
+        try {
+            const conn = await this.prisma.integrationConnection.findFirst({
+                where: { clinicId, provider: 'vismed' },
+            });
+            if (!conn) return 'unverified';
+            const vismedDoctor = await this.prisma.vismedDoctor.findUnique({ where: { id: vismedDoctorUuid } });
+            if (!vismedDoctor?.vismedId) return 'unverified';
+
+            const startDate = new Date(booking.start_at);
+            if (isNaN(startDate.getTime())) return 'unverified';
+            const { dateStr } = this.extractBrtDateTime(startDate);
+            const [yyyy, mm, dd] = dateStr.split('-');
+            const dataBr = `${dd}/${mm}/${yyyy}`;
+
+            const units = await this.prisma.vismedUnit.findMany({ where: { isActive: true } });
+            if (units.length === 0) return 'unverified';
+            const baseUrl = conn.domain || undefined;
+
+            let allUnitsRead = true;
+            for (const u of units) {
+                let agendamentos: any[];
+                try {
+                    await this.rateLimiter.acquire('vismed');
+                    agendamentos = await this.vismedService.getAgendamentos(u.vismedId, baseUrl, {
+                        dataini: dataBr,
+                        datafim: dataBr,
+                        profissional: vismedDoctor.vismedId,
+                    });
+                } catch (err: any) {
+                    this.logger.warn(`[VISMED-VERIFY] unidade ${u.vismedId} falhou (${err.message})`);
+                    allUnitsRead = false;
+                    continue;
+                }
+                if (!Array.isArray(agendamentos)) {
+                    allUnitsRead = false;
+                    continue;
+                }
+                for (const a of agendamentos) {
+                    if (a?.idpacienteagendamento && String(a.idpacienteagendamento) === String(vismedAppointmentId)) {
+                        return 'confirmed';
+                    }
+                }
+            }
+            // Só declara "not_found" se TODAS as unidades foram lidas com sucesso —
+            // leitura parcial não é prova de ausência.
+            return allUnitsRead ? 'not_found' : 'unverified';
+        } catch (err: any) {
+            this.logger.warn(`[VISMED-VERIFY] Erro inesperado na verificação: ${err?.message}`);
+            return 'unverified';
+        }
+    }
+
+    private async createVismedAppointment(clinicId: string, mapping: any, booking: any, notifData: any, bookingSyncId?: string) {
+        const { payload, url, baseUrl } = await this.buildVismedCreatePayload(clinicId, mapping, booking);
+
+        // Auditoria ANTES da chamada: se o processo cair no meio, o payload já está registrado.
+        if (bookingSyncId) {
+            await this.persistVismedAudit(bookingSyncId, { payload, url });
+        }
+
+        let response: any;
+        try {
+            response = await this.vismedService.createAppointment(payload, baseUrl);
+        } catch (err: any) {
+            if (bookingSyncId) {
+                await this.persistVismedAudit(bookingSyncId, { response: { error: String(err?.message || err).slice(0, 2000) } });
+            }
+            throw err;
+        }
+
+        // Auditoria da resposta bruta (sucesso ou falha lógica).
+        if (bookingSyncId) {
+            await this.persistVismedAudit(bookingSyncId, { response });
+        }
+        return response;
     }
 
     async bookOnDoctoraliaFromVismed(

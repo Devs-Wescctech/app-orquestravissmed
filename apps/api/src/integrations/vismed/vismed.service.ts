@@ -265,6 +265,11 @@ export class VismedService {
         }
     }
 
+    /** URL completa usada na criação de agendamento (para auditoria persistida). */
+    getCreateAppointmentUrl(baseUrl?: string): string {
+        return this.buildApiUrl('schedule/online/schedule/pacient', baseUrl);
+    }
+
     async createAppointment(payload: {
         tipo: string;
         idcategoriaservico: number;
