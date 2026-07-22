@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Body, Param, Query, UseGuards, Request } from '@nestjs/common';
+import { Controller, Get, Post, Body, Param, Query, UseGuards, Request, ForbiddenException } from '@nestjs/common';
 import { MappingsService } from './mappings.service';
 import { MatchingEngineService } from './matching-engine.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
@@ -14,6 +14,15 @@ export class MappingsController {
         private readonly matchingEngine: MatchingEngineService,
     ) { }
 
+    private validateUserClinicAccess(user: any, clinicId: string) {
+        const isSuperAdmin = user?.roles?.some((r: any) => r.role === 'SUPER_ADMIN');
+        if (isSuperAdmin) return;
+        const userClinicIds = (user?.roles || []).map((r: any) => r.clinicId);
+        if (!userClinicIds.includes(clinicId)) {
+            throw new ForbiddenException('Você não tem acesso a esta clínica.');
+        }
+    }
+
     @Get()
     findAll(
         @Request() req: any,
@@ -21,6 +30,7 @@ export class MappingsController {
         @Query('type') type?: MappingEntityType,
     ) {
         const finalClinicId = clinicId || req.user.roles[0]?.clinicId;
+        this.validateUserClinicAccess(req.user, finalClinicId);
         return this.mappingsService.findAll(finalClinicId, type);
     }
 
@@ -40,12 +50,14 @@ export class MappingsController {
     @Get('professionals')
     getProfessionalMappings(@Request() req: any, @Query('clinicId') clinicId: string) {
         const finalClinicId = clinicId || req.user.roles[0]?.clinicId;
+        this.validateUserClinicAccess(req.user, finalClinicId);
         return this.mappingsService.getProfessionalMappings(finalClinicId);
     }
 
     @Get('units')
     getUnitMappings(@Request() req: any, @Query('clinicId') clinicId: string) {
         const finalClinicId = clinicId || req.user.roles[0]?.clinicId;
+        this.validateUserClinicAccess(req.user, finalClinicId);
         return this.mappingsService.getUnitMappings(finalClinicId);
     }
 
@@ -113,18 +125,20 @@ export class MappingsController {
     @Post('insurance/approve')
     approveInsuranceMatch(
         @Request() req: any,
-        @Body() body: { mappingId: string; }
+        @Body() body: { mappingId: string; clinicId?: string; }
     ) {
-        const clinicId = req.user.roles[0]?.clinicId;
+        const clinicId = body.clinicId || req.user.roles[0]?.clinicId;
+        this.validateUserClinicAccess(req.user, clinicId);
         return this.mappingsService.approveInsuranceMatch(body.mappingId, clinicId, req.user.id);
     }
 
     @Post('insurance/reject')
     rejectInsuranceMatch(
         @Request() req: any,
-        @Body() body: { mappingId: string; }
+        @Body() body: { mappingId: string; clinicId?: string; }
     ) {
-        const clinicId = req.user.roles[0]?.clinicId;
+        const clinicId = body.clinicId || req.user.roles[0]?.clinicId;
+        this.validateUserClinicAccess(req.user, clinicId);
         return this.mappingsService.rejectInsuranceMatch(body.mappingId, clinicId, req.user.id);
     }
 }

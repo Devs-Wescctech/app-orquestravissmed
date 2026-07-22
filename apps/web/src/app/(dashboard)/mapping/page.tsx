@@ -202,7 +202,7 @@ export default function MappingHub() {
     const handleApproveInsurance = async (mappingId: string) => {
         setIsResolving(true);
         try {
-            await api.post('/mappings/insurance/approve', { mappingId });
+            await api.post('/mappings/insurance/approve', { mappingId, clinicId: activeClinic?.id });
             toast.success('Convênio aprovado com sucesso.');
             fetchData();
             if (activeClinic?.id) {
@@ -221,7 +221,7 @@ export default function MappingHub() {
         if (!confirm('Rejeitar este match de convênio?')) return;
         setIsResolving(true);
         try {
-            await api.post('/mappings/insurance/reject', { mappingId });
+            await api.post('/mappings/insurance/reject', { mappingId, clinicId: activeClinic?.id });
             toast.success('Convênio rejeitado.');
             fetchData();
         } catch (err: any) {
