@@ -380,7 +380,7 @@ export class MappingsService {
                     doctoraliaServiceId
                 }
             },
-            data: { requiresReview: false, invalidReason: null, invalidAt: null }
+            data: { requiresReview: false, matchType: 'MANUAL', invalidReason: null, invalidAt: null }
         });
 
         if (userId) {

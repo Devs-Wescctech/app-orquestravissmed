@@ -45,9 +45,23 @@ export class MatchingEngineService {
     }
 
     async onApplicationBootstrap(): Promise<void> {
+        // 1) Restauração one-shot: aprovações manuais antigas foram desfeitas por versões
+        //    anteriores desta rotina (que não distinguia decisão humana). Recupera do
+        //    AuditLog os pares cuja ÚLTIMA ação foi APPROVE e promove a MANUAL. Idempotente.
+        try {
+            const restored = await this.restoreManualApprovalsFromAudit();
+            if (restored > 0) {
+                this.logger.log(`[BOOT] Restored ${restored} manually-approved specialty mappings from audit log (promoted to MANUAL)`);
+            }
+        } catch (e: any) {
+            this.logger.warn(`[BOOT] Failed to restore manual approvals from audit log: ${e.message}`);
+        }
+
+        // 2) Reclassificação: só matches automáticos (APPROXIMATE). Decisões humanas
+        //    (MANUAL) e matches fortes (EXACT/SYNONYM) nunca voltam para revisão.
         try {
             const result = await this.prisma.specialtyServiceMapping.updateMany({
-                where: { confidenceScore: { lt: 0.90 }, requiresReview: false, isActive: true },
+                where: { confidenceScore: { lt: 0.90 }, requiresReview: false, isActive: true, matchType: 'APPROXIMATE' },
                 data: { requiresReview: true },
             });
             if (result.count > 0) {
@@ -56,6 +70,73 @@ export class MatchingEngineService {
         } catch (e: any) {
             this.logger.warn(`[BOOT] Failed to reclassify specialty mappings: ${e.message}`);
         }
+    }
+
+    /**
+     * Reconstrói o estado das aprovações manuais a partir do AuditLog:
+     * para cada par vismedSpecialtyId_doctoraliaServiceId, considera a última ação
+     * registrada (APPROVE_SPECIALTY_MATCH vs REJECT_SPECIALTY_MATCH). Se a última foi
+     * aprovação, promove o mapping ativo a matchType=MANUAL + requiresReview=false.
+     * Só toca em rows APPROXIMATE ativas — nunca sobrescreve decisões mais recentes.
+     */
+    private static readonly RESTORE_MARKER_ACTION = 'RESTORE_MANUAL_APPROVALS_DONE';
+
+    private async restoreManualApprovalsFromAudit(): Promise<number> {
+        // One-shot de verdade: se a migração já rodou (marker no AuditLog), não roda de novo.
+        const alreadyDone = await this.prisma.auditLog.findFirst({
+            where: { entity: 'SPECIALTY_MAPPING', action: MatchingEngineService.RESTORE_MARKER_ACTION },
+            select: { id: true },
+        });
+        if (alreadyDone) return 0;
+
+        const logs = await this.prisma.auditLog.findMany({
+            where: {
+                entity: 'SPECIALTY_MAPPING',
+                action: { in: ['APPROVE_SPECIALTY_MATCH', 'REJECT_SPECIALTY_MATCH'] },
+                entityId: { not: null },
+            },
+            orderBy: { timestamp: 'asc' },
+            select: { action: true, entityId: true },
+        });
+
+        // Última ação vence (logs em ordem cronológica: escritas posteriores sobrescrevem).
+        const lastAction = new Map<string, string>();
+        for (const l of logs) {
+            if (l.entityId) lastAction.set(l.entityId, l.action);
+        }
+
+        let restored = 0;
+        for (const [entityId, action] of lastAction) {
+            if (action !== 'APPROVE_SPECIALTY_MATCH') continue;
+            const sep = entityId.indexOf('_');
+            if (sep <= 0) continue;
+            const vismedSpecialtyId = entityId.slice(0, sep);
+            const doctoraliaServiceId = entityId.slice(sep + 1);
+
+            // Nunca reaprovar mapping invalidado pelo push-sync (invalidReason/invalidAt setados):
+            // a invalidação automática é posterior à aprovação humana e deve prevalecer.
+            const res = await this.prisma.specialtyServiceMapping.updateMany({
+                where: {
+                    vismedSpecialtyId,
+                    doctoraliaServiceId,
+                    isActive: true,
+                    matchType: 'APPROXIMATE',
+                    invalidReason: null,
+                    invalidAt: null,
+                },
+                data: { matchType: 'MANUAL', requiresReview: false },
+            });
+            restored += res.count;
+        }
+
+        await this.prisma.auditLog.create({
+            data: {
+                action: MatchingEngineService.RESTORE_MARKER_ACTION,
+                entity: 'SPECIALTY_MAPPING',
+                details: { restored } as any,
+            },
+        });
+        return restored;
     }
 
     /**
