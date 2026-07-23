@@ -47,7 +47,7 @@ interface VismedUnit {
 interface SpecialtyMatch {
     id: string; vismedSpecialtyId: string; doctoraliaServiceId: string;
     matchType: string; confidenceScore: number; requiresReview: boolean; isActive: boolean;
-    invalidReason?: string | null; invalidAt?: string | null;
+    invalidReason?: string | null; invalidAt?: string | null; overrideInvalid?: boolean;
     vismedSpecialty?: { name: string; normalizedName?: string } | null;
     doctoraliaService?: { name: string } | null;
 }
@@ -76,6 +76,12 @@ export default function MappingHub() {
     // Resolve modal (legacy Convênios tab)
     const [showResolveModal, setShowResolveModal] = useState(false);
     const [selectedMapping, setSelectedMapping] = useState<any>(null);
+
+    // Remap modal (Especialidades com serviço inválido)
+    const [remapTarget, setRemapTarget] = useState<SpecialtyMatch | null>(null);
+    const [remapCandidates, setRemapCandidates] = useState<Array<{ doctoraliaServiceId: string; dictServiceId: string; name: string; score: number; inUnitCatalog: boolean }>>([]);
+    const [remapLoading, setRemapLoading] = useState(false);
+    const [remapSelected, setRemapSelected] = useState<string | null>(null);
 
     const TABS = ['Profissionais', 'Especialidades', 'Convênios', 'Unidades'];
 
@@ -133,11 +139,58 @@ export default function MappingHub() {
         }
     };
 
-    const handleApprove = async (vismedSpecialtyId: string, doctoraliaServiceId: string) => {
+    const handleApprove = async (m: SpecialtyMatch) => {
+        if (m.invalidReason) {
+            const ok = confirm(
+                'ATENÇÃO: este serviço foi rejeitado pela Doctoralia.\n\n' +
+                `Motivo: ${m.invalidReason}\n\n` +
+                'Se você confirmar mesmo assim, o mapeamento sai da fila de pendentes, mas o serviço NÃO será enviado à Doctoralia até ser remapeado para um serviço válido.\n\n' +
+                'Recomendado: use "Remapear" para escolher um serviço válido do catálogo. Confirmar mesmo assim?'
+            );
+            if (!ok) return;
+        }
         setIsResolving(true);
         try {
-            await api.post('/mappings/specialties/approve', { vismedSpecialtyId, doctoraliaServiceId });
+            const res = await api.post('/mappings/specialties/approve', { vismedSpecialtyId: m.vismedSpecialtyId, doctoraliaServiceId: m.doctoraliaServiceId });
+            if (res.data?.overrideWarning) {
+                toast.warning(res.data.overrideWarning, { duration: 8000 });
+            } else {
+                toast.success('Mapeamento aprovado.');
+            }
             fetchData();
+        } catch (err: any) {
+            toast.error(`Falha ao aprovar: ${err.message || 'Erro desconhecido'}`);
+        } finally { setIsResolving(false); }
+    };
+
+    const openRemapModal = async (m: SpecialtyMatch) => {
+        setRemapTarget(m);
+        setRemapSelected(null);
+        setRemapCandidates([]);
+        setRemapLoading(true);
+        try {
+            const res = await api.get(`/mappings/specialties/${m.vismedSpecialtyId}/remap-candidates`);
+            setRemapCandidates(res.data || []);
+        } catch (err: any) {
+            toast.error(`Falha ao buscar serviços alternativos: ${err.message || 'Erro desconhecido'}`);
+        } finally {
+            setRemapLoading(false);
+        }
+    };
+
+    const handleRemapConfirm = async () => {
+        if (!remapTarget || !remapSelected) return;
+        setIsResolving(true);
+        try {
+            await api.post('/mappings/specialties/manual', {
+                vismedSpecialtyId: remapTarget.vismedSpecialtyId,
+                doctoraliaServiceId: remapSelected,
+            });
+            toast.success('Especialidade remapeada com sucesso. O novo serviço será sincronizado no próximo ciclo.');
+            setRemapTarget(null);
+            fetchData();
+        } catch (err: any) {
+            toast.error(`Falha ao remapear: ${err.message || 'Erro desconhecido'}`);
         } finally { setIsResolving(false); }
     };
 
@@ -625,22 +678,44 @@ export default function MappingHub() {
                                                         </span>
                                                     )}
                                                     {m.invalidReason && (
-                                                        <span title={m.invalidReason} className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest border border-rose-300 bg-rose-100 text-rose-700 max-w-[280px]">
-                                                            <AlertTriangle className="h-3 w-3 shrink-0" />
-                                                            <span className="truncate">Serviço inválido na Doctoralia</span>
-                                                        </span>
+                                                        <div className="flex flex-col items-center gap-1 max-w-[300px]">
+                                                            <span title={m.invalidReason} className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest border border-rose-300 bg-rose-100 text-rose-700 max-w-[280px]">
+                                                                <AlertTriangle className="h-3 w-3 shrink-0" />
+                                                                <span className="truncate">{m.overrideInvalid && !m.requiresReview ? 'Inválido — não sincronizado' : 'Serviço inválido na Doctoralia'}</span>
+                                                            </span>
+                                                            <span className="text-[9px] font-semibold text-rose-500 leading-snug text-center normal-case">{m.invalidReason}</span>
+                                                        </div>
                                                     )}
                                                     {m.requiresReview && (
-                                                        <div className="flex gap-3 animate-in fade-in zoom-in duration-300">
-                                                            <button onClick={() => handleApprove(m.vismedSpecialtyId, m.doctoraliaServiceId)} disabled={isResolving}
-                                                                className="text-[10px] font-black uppercase tracking-widest bg-primary text-white px-5 py-2.5 rounded-2xl hover:bg-emerald-600 transition-all shadow-lg active:scale-95 disabled:opacity-50">
-                                                                Confirmar
-                                                            </button>
+                                                        <div className="flex flex-wrap justify-center gap-3 animate-in fade-in zoom-in duration-300">
+                                                            {m.invalidReason ? (
+                                                                <>
+                                                                    <button onClick={() => openRemapModal(m)} disabled={isResolving}
+                                                                        className="text-[10px] font-black uppercase tracking-widest bg-primary text-white px-5 py-2.5 rounded-2xl hover:bg-emerald-600 transition-all shadow-lg active:scale-95 disabled:opacity-50">
+                                                                        Remapear
+                                                                    </button>
+                                                                    <button onClick={() => handleApprove(m)} disabled={isResolving}
+                                                                        className="text-[10px] font-black uppercase tracking-widest bg-white text-amber-600 border border-amber-200 px-5 py-2.5 rounded-2xl hover:bg-amber-50 transition-all active:scale-95 disabled:opacity-50">
+                                                                        Aprovar assim mesmo
+                                                                    </button>
+                                                                </>
+                                                            ) : (
+                                                                <button onClick={() => handleApprove(m)} disabled={isResolving}
+                                                                    className="text-[10px] font-black uppercase tracking-widest bg-primary text-white px-5 py-2.5 rounded-2xl hover:bg-emerald-600 transition-all shadow-lg active:scale-95 disabled:opacity-50">
+                                                                    Confirmar
+                                                                </button>
+                                                            )}
                                                             <button onClick={() => handleReject(m.vismedSpecialtyId, m.doctoraliaServiceId)} disabled={isResolving}
                                                                 className="text-[10px] font-black uppercase tracking-widest bg-white text-rose-600 border border-rose-100 px-5 py-2.5 rounded-2xl hover:bg-rose-50 transition-all active:scale-95 disabled:opacity-50">
                                                                 Ignorar
                                                             </button>
                                                         </div>
+                                                    )}
+                                                    {!m.requiresReview && m.invalidReason && (
+                                                        <button onClick={() => openRemapModal(m)} disabled={isResolving}
+                                                            className="text-[10px] font-black uppercase tracking-widest bg-primary text-white px-5 py-2.5 rounded-2xl hover:bg-emerald-600 transition-all shadow-lg active:scale-95 disabled:opacity-50 animate-in fade-in zoom-in duration-300">
+                                                            Remapear
+                                                        </button>
                                                     )}
                                                 </div>
                                             </td>
@@ -964,6 +1039,66 @@ export default function MappingHub() {
                             </div>
                         );
                     })}
+                </div>
+            )}
+
+            {/* ── MODAL DE REMAPEAMENTO (serviço inválido) ───────────── */}
+            {remapTarget && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4" onClick={() => setRemapTarget(null)}>
+                    <div className="bg-white rounded-[32px] shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+                        <div className="p-8 border-b border-slate-100">
+                            <h3 className="text-lg font-black text-slate-900 tracking-tight">Remapear especialidade</h3>
+                            <p className="text-sm text-slate-500 mt-1">
+                                <span className="font-bold text-slate-700">{remapTarget.vismedSpecialty?.name}</span> está mapeada para um serviço rejeitado pela Doctoralia
+                                {remapTarget.doctoraliaService?.name ? <> (<span className="font-semibold">{remapTarget.doctoraliaService.name}</span>)</> : null}.
+                                Escolha um serviço válido abaixo — os marcados como &quot;No catálogo&quot; existem de fato nas unidades sincronizadas.
+                            </p>
+                            {remapTarget.invalidReason && (
+                                <p className="mt-3 text-xs font-semibold text-rose-600 bg-rose-50 border border-rose-100 rounded-xl px-3 py-2">{remapTarget.invalidReason}</p>
+                            )}
+                        </div>
+                        <div className="flex-1 overflow-y-auto p-6 space-y-2">
+                            {remapLoading ? (
+                                <div className="py-16 flex flex-col items-center gap-3">
+                                    <Loader2 className="h-8 w-8 animate-spin text-primary" />
+                                    <span className="text-[10px] font-black text-slate-300 uppercase tracking-[3px]">Buscando serviços alternativos...</span>
+                                </div>
+                            ) : remapCandidates.length === 0 ? (
+                                <p className="py-16 text-center text-sm text-slate-400 font-semibold">Nenhum serviço alternativo encontrado no catálogo.</p>
+                            ) : remapCandidates.map(c => (
+                                <button
+                                    key={c.doctoraliaServiceId}
+                                    onClick={() => setRemapSelected(c.doctoraliaServiceId)}
+                                    className={`w-full flex items-center justify-between gap-3 px-4 py-3 rounded-2xl border text-left transition-all ${
+                                        remapSelected === c.doctoraliaServiceId
+                                            ? 'border-primary bg-emerald-50/60 shadow-sm'
+                                            : 'border-slate-100 hover:border-slate-200 hover:bg-slate-50/60'
+                                    }`}
+                                >
+                                    <div className="min-w-0">
+                                        <div className="font-bold text-sm text-slate-900 truncate">{c.name}</div>
+                                        <div className="text-[10px] font-semibold text-slate-400 mt-0.5">ID {c.dictServiceId} · similaridade {Math.round(c.score * 100)}%</div>
+                                    </div>
+                                    <div className="flex items-center gap-2 shrink-0">
+                                        {c.inUnitCatalog && (
+                                            <span className="text-[9px] font-black uppercase tracking-widest text-emerald-700 bg-emerald-50 border border-emerald-100 px-2 py-1 rounded-lg">No catálogo</span>
+                                        )}
+                                        {remapSelected === c.doctoraliaServiceId && <CheckCircle2 className="h-5 w-5 text-primary" />}
+                                    </div>
+                                </button>
+                            ))}
+                        </div>
+                        <div className="p-6 border-t border-slate-100 flex justify-end gap-3 bg-slate-50/50">
+                            <button onClick={() => setRemapTarget(null)} disabled={isResolving}
+                                className="text-[10px] font-black uppercase tracking-widest text-slate-500 bg-white border border-slate-200 px-6 py-3 rounded-2xl hover:bg-slate-100 transition-all active:scale-95">
+                                Cancelar
+                            </button>
+                            <button onClick={handleRemapConfirm} disabled={isResolving || !remapSelected}
+                                className="text-[10px] font-black uppercase tracking-widest bg-primary text-white px-6 py-3 rounded-2xl hover:bg-emerald-600 transition-all shadow-lg active:scale-95 disabled:opacity-40">
+                                {isResolving ? 'Remapeando...' : 'Remapear para este serviço'}
+                            </button>
+                        </div>
+                    </div>
                 </div>
             )}
 

@@ -341,7 +341,7 @@ export class MappingsService {
             whereClause.requiresReview = requiresReview;
         }
 
-        return this.prisma.specialtyServiceMapping.findMany({
+        const rows = await this.prisma.specialtyServiceMapping.findMany({
             where: whereClause,
             include: {
                 vismedSpecialty: true,
@@ -349,6 +349,23 @@ export class MappingsService {
             },
             orderBy: { confidenceScore: 'desc' }
         });
+
+        // DEDUP: especialidades VisMed duplicadas (mesmo normalizedName) geram mappings ativos
+        // idênticos apontando para o mesmo serviço Doctoralia — a lista mostrava a mesma linha 2x.
+        // Mantemos a primeira ocorrência (maior score, e dentro do empate a mais "resolvida":
+        // aprovada antes de pendente).
+        const seen = new Map<string, any>();
+        for (const row of rows) {
+            const specKey = row.vismedSpecialty?.normalizedName || row.vismedSpecialty?.name || row.vismedSpecialtyId;
+            const key = `${specKey}::${row.doctoraliaServiceId}`;
+            const existing = seen.get(key);
+            if (!existing) {
+                seen.set(key, row);
+            } else if (existing.requiresReview && !row.requiresReview) {
+                seen.set(key, row);
+            }
+        }
+        return Array.from(seen.values());
     }
 
     async getSpecialtyStats() {
@@ -373,28 +390,119 @@ export class MappingsService {
     }
 
     async approveSpecialtyMatch(vismedSpecialtyId: string, doctoraliaServiceId: string, userId?: string) {
+        const existing = await this.prisma.specialtyServiceMapping.findUnique({
+            where: {
+                vismedSpecialtyId_doctoraliaServiceId: { vismedSpecialtyId, doctoraliaServiceId }
+            }
+        });
+        if (!existing) {
+            throw new NotFoundException('Mapeamento de especialidade não encontrado.');
+        }
+
+        // Se o service_id já foi REJEITADO pela Doctoralia (invalidReason preenchido), aprovar o
+        // mesmo ID de novo entraria em loop: o push reenviaria, tomaria 404 e re-invalidaria.
+        // Tratamos como OVERRIDE CONSCIENTE: aprova (sai da fila de pendentes), mas MANTÉM o
+        // invalidReason visível e marca overrideInvalid=true — o push NÃO reenvia esse ID.
+        const wasInvalid = !!existing.invalidReason;
         const mapping = await this.prisma.specialtyServiceMapping.update({
             where: {
-                vismedSpecialtyId_doctoraliaServiceId: {
-                    vismedSpecialtyId,
-                    doctoraliaServiceId
-                }
+                vismedSpecialtyId_doctoraliaServiceId: { vismedSpecialtyId, doctoraliaServiceId }
             },
-            data: { requiresReview: false, matchType: 'MANUAL', invalidReason: null, invalidAt: null }
+            data: wasInvalid
+                ? { requiresReview: false, matchType: 'MANUAL', overrideInvalid: true }
+                : { requiresReview: false, matchType: 'MANUAL', invalidReason: null, invalidAt: null, overrideInvalid: false }
         });
 
         if (userId) {
             await this.prisma.auditLog.create({
                 data: {
                     userId,
-                    action: 'APPROVE_SPECIALTY_MATCH',
+                    action: wasInvalid ? 'APPROVE_SPECIALTY_MATCH_OVERRIDE_INVALID' : 'APPROVE_SPECIALTY_MATCH',
                     entity: 'SPECIALTY_MAPPING',
                     entityId: `${vismedSpecialtyId}_${doctoraliaServiceId}`,
-                    details: { previousState: 'REQUIRES_REVIEW', newState: 'APPROVED' } as any,
+                    details: {
+                        previousState: 'REQUIRES_REVIEW',
+                        newState: wasInvalid ? 'APPROVED_WITH_OVERRIDE' : 'APPROVED',
+                        ...(wasInvalid ? { invalidReason: existing.invalidReason } : {}),
+                    } as any,
                 }
             });
         }
-        return mapping;
+        return {
+            ...mapping,
+            overrideWarning: wasInvalid
+                ? 'Serviço já rejeitado pela Doctoralia: aprovado como override consciente. Este serviço NÃO será enviado à Doctoralia até ser remapeado para um serviço válido do catálogo da unidade.'
+                : undefined,
+        };
+    }
+
+    /**
+     * Sugere serviços Doctoralia alternativos para remapear uma especialidade cujo mapping foi
+     * invalidado. Prioriza serviços presentes no catálogo real das unidades (DoctoraliaAddressService)
+     * e ordena por similaridade de nome com a especialidade.
+     */
+    async getSpecialtyRemapCandidates(vismedSpecialtyId: string) {
+        const specialty = await this.prisma.vismedSpecialty.findUnique({ where: { id: vismedSpecialtyId } });
+        if (!specialty) {
+            throw new NotFoundException('Especialidade VisMed não encontrada.');
+        }
+
+        // Serviços que EXISTEM de fato em algum endereço sincronizado (catálogo real da unidade).
+        const addressServices = await this.prisma.doctoraliaAddressService.findMany({
+            select: { serviceId: true },
+            distinct: ['serviceId'],
+        });
+        const catalogServiceUuids = new Set(addressServices.map(a => a.serviceId));
+
+        const services = await this.prisma.doctoraliaService.findMany({
+            select: { id: true, doctoraliaServiceId: true, name: true, normalizedName: true },
+        });
+
+        const norm = (s: string) => (s || '')
+            .toLowerCase()
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .replace(/[^a-z0-9\s]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+        const target = norm(specialty.normalizedName || specialty.name);
+        const targetTokens = new Set(target.split(' ').filter(Boolean));
+
+        const scored = services.map(svc => {
+            const cand = norm(svc.normalizedName || svc.name);
+            let score = 0;
+            if (cand === target) score = 1;
+            else if (cand.includes(target) || target.includes(cand)) score = 0.8;
+            else {
+                const candTokens = cand.split(' ').filter(Boolean);
+                const common = candTokens.filter(t => targetTokens.has(t)).length;
+                const total = Math.max(targetTokens.size, candTokens.length, 1);
+                score = common / total;
+            }
+            return {
+                doctoraliaServiceId: svc.id,
+                dictServiceId: svc.doctoraliaServiceId,
+                name: svc.name,
+                score: Math.round(score * 100) / 100,
+                inUnitCatalog: catalogServiceUuids.has(svc.id),
+            };
+        });
+
+        const sorted = scored
+            .filter(c => c.score > 0.1 || c.inUnitCatalog)
+            .sort((a, b) => {
+                if (a.inUnitCatalog !== b.inUnitCatalog) return a.inUnitCatalog ? -1 : 1;
+                return b.score - a.score;
+            });
+
+        // Dedup por nome: o dicionário global tem serviços repetidos com o mesmo nome e dict_ids
+        // diferentes; mostramos só o melhor de cada nome para não poluir o seletor.
+        const byName = new Map<string, typeof sorted[number]>();
+        for (const c of sorted) {
+            const key = norm(c.name);
+            if (!byName.has(key)) byName.set(key, c);
+        }
+        return Array.from(byName.values()).slice(0, 25);
     }
 
     async rejectSpecialtyMatch(vismedSpecialtyId: string, doctoraliaServiceId: string, userId?: string) {
@@ -445,7 +553,8 @@ export class MappingsService {
                 requiresReview: false,
                 isActive: true,
                 invalidReason: null,
-                invalidAt: null
+                invalidAt: null,
+                overrideInvalid: false
             },
             create: {
                 vismedSpecialtyId,

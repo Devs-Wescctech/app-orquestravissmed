@@ -224,6 +224,16 @@ export class PushSyncService {
             if (spec && spec.mappings && spec.mappings.length > 0) {
                 const mapping = spec.mappings[0];
                 const dictId = mapping.doctoraliaService.doctoraliaServiceId;
+
+                // QUEBRA DO LOOP 404: mapping aprovado com OVERRIDE consciente (invalidReason
+                // preenchido + overrideInvalid) NUNCA volta ao push — o ID já foi rejeitado pela
+                // Doctoralia e reenviar só repetiria o 404 e re-invalidaria o mapping.
+                if (mapping.invalidReason && mapping.overrideInvalid) {
+                    this.logger.warn(`Doctor ${doctorName}: [SKIP OVERRIDE] "${spec.name}" (dict:${dictId}) aprovado com override apesar de inválido — NÃO será enviado. Motivo: ${mapping.invalidReason}`);
+                    await this.logEvent(syncRunId, 'SERVICE_PUSH', 'skipped_override_invalid', `Doctor ${doctorName}: "${spec.name}" (dict:${dictId}) aprovado com override, mas o service_id é inválido na Doctoralia — push suprimido. Remapeie em /mapping para sincronizar. Motivo: ${mapping.invalidReason}`);
+                    continue;
+                }
+
                 expectedDictIds.set(dictId, { specName: spec.name, mappingId: mapping.id });
                 matchedNames.push(`${spec.name} (→ dict:${dictId})`);
             }
@@ -311,7 +321,7 @@ export class PushSyncService {
                     // erro transitório: significa que a unidade não aceita esse ID. Marcar o mapping como
                     // inválido faz o cron parar de reenviar o mesmo POST inválido a cada 30 min.
                     if (this.isServiceIdRejected(error)) {
-                        const reason = `service_id ${dictId} rejeitado pela Doctoralia (${this.shortError(error.message)})`;
+                        const reason = await this.buildRejectionReason(dictId, facilityId, facilityCatalogIds);
                         await this.markMappingInvalid(mappingId, reason);
                         this.logger.warn(`Doctor ${doctorName}: [ADD REJECTED] Service dict:${dictId} (${specName}) — ${reason}. Mapping marcado para revisão.`);
                         await this.logEvent(syncRunId, 'SERVICE_PUSH', 'invalid_service_id', `Doctor ${doctorName}: "${specName}" (dict:${dictId}) rejeitado pela Doctoralia — mapping marcado para revisão em /mapping.`);
@@ -571,13 +581,46 @@ export class PushSyncService {
      */
     private async markMappingInvalid(mappingId: string, reason: string): Promise<void> {
         try {
+            const existing = await this.prisma.specialtyServiceMapping.findUnique({
+                where: { id: mappingId },
+                select: { overrideInvalid: true },
+            });
+            // Mapping aprovado com OVERRIDE consciente NÃO volta a pendente (quebra do loop
+            // aprovação↔invalidação); só atualizamos o motivo, que permanece visível na UI.
             await this.prisma.specialtyServiceMapping.update({
                 where: { id: mappingId },
-                data: { invalidReason: reason, invalidAt: new Date(), requiresReview: true },
+                data: {
+                    invalidReason: reason,
+                    invalidAt: new Date(),
+                    ...(existing?.overrideInvalid ? {} : { requiresReview: true }),
+                },
             });
         } catch (e: any) {
             this.logger.error(`Falha ao marcar mapping ${mappingId} como inválido: ${e.message}`);
         }
+    }
+
+    /**
+     * Constrói um motivo curto e ACIONÁVEL para a rejeição de um service_id pela Doctoralia,
+     * diagnosticando se o ID existe no dicionário global e/ou no catálogo da unidade — em vez
+     * de gravar o HTML/JSON bruto do erro 404.
+     */
+    private async buildRejectionReason(
+        dictId: string,
+        facilityId: string,
+        facilityCatalogIds: Set<string> | null,
+    ): Promise<string> {
+        const inDictionary = await this.prisma.doctoraliaService.findUnique({
+            where: { doctoraliaServiceId: dictId },
+            select: { id: true },
+        });
+        if (!inDictionary) {
+            return `service_id ${dictId} não existe no dicionário global da Doctoralia — remapeie para um serviço válido`;
+        }
+        if (facilityCatalogIds && !facilityCatalogIds.has(dictId)) {
+            return `serviço ${dictId} não disponível nesta unidade (${facilityId}) — remapeie para um serviço do catálogo da unidade`;
+        }
+        return `service_id ${dictId} rejeitado pela Doctoralia (não aceito pela unidade ${facilityId}) — remapeie para um serviço do catálogo da unidade`;
     }
 
     private async logEvent(syncRunId: string, entityType: string, action: string, message: string) {

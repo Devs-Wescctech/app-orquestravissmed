@@ -382,6 +382,10 @@ model SpecialtyServiceMapping {
   // reenviar automaticamente e o operador reaprova/remapeia em /mapping.
   invalidReason        String?
   invalidAt            DateTime?
+  // Override consciente: operador aprovou mesmo com invalidReason preenchido. O push NÃO
+  // reenvia esse service_id (quebra do loop 404) e o mapping NÃO volta a pendente; o selo
+  // de inválido permanece visível até o operador remapear para um serviço válido.
+  overrideInvalid      Boolean  @default(false)
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt
 

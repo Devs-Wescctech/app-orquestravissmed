@@ -114,6 +114,11 @@ export class MappingsController {
         return this.matchingEngine.recomputeAllSpecialtyScores(req.user?.id);
     }
 
+    @Get('specialties/:vismedSpecialtyId/remap-candidates')
+    getSpecialtyRemapCandidates(@Param('vismedSpecialtyId') vismedSpecialtyId: string) {
+        return this.mappingsService.getSpecialtyRemapCandidates(vismedSpecialtyId);
+    }
+
     @Post('specialties/manual')
     createManualSpecialtyMatch(
         @Request() req: any,
