@@ -106,6 +106,8 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
     }
 
     private polledClinicIds = new Set<string>();
+    // Contador de ciclos de polling sem notificações, por clínica (heartbeat de observabilidade).
+    private pollCycleCount = new Map<string, number>();
 
     private async refreshPollingSchedule() {
         try {
@@ -2072,12 +2074,19 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             const res = await client.getNotifications(100);
             const notifications = res?._items || (Array.isArray(res) ? res : []);
 
+            // Observabilidade do caminho de notificações: resumo por ciclo. Ciclos vazios
+            // logam em debug, mas um heartbeat periódico em nível log confirma que o polling
+            // está vivo (ajuda a diagnosticar "notificações não chegam").
             if (notifications.length === 0) {
+                const count = (this.pollCycleCount.get(conn.clinicId) || 0) + 1;
+                this.pollCycleCount.set(conn.clinicId, count);
+                if (count % 20 === 0) {
+                    this.logger.log(`[POLL] Clinic ${conn.clinicId}: polling ativo — 0 notificações nos últimos ${count} ciclos.`);
+                }
                 this.logger.debug(`[POLL] No notifications for clinic ${conn.clinicId}`);
                 return;
             }
-
-            this.logger.log(`[POLL] Enqueuing ${notifications.length} notification(s) for clinic ${conn.clinicId}`);
+            this.pollCycleCount.set(conn.clinicId, 0);
 
             const jobs = notifications
                 .filter((n: any) => ['slot-booked', 'booking-canceled', 'booking-moved'].includes(n?.name))
@@ -2091,6 +2100,8 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                         dedupKey: bookingId ? `${conn.clinicId}:${n.name}:${bookingId}` : undefined,
                     };
                 });
+
+            this.logger.log(`[POLL] Clinic ${conn.clinicId}: ${notifications.length} notificação(ões) recebida(s), ${jobs.length} enfileirada(s).`);
 
             if (jobs.length > 0) {
                 await this.queueService.enqueueBatch(jobs);
@@ -2345,6 +2356,23 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
 
         if (vismedAppointmentId) {
             await this.resolveSkippedAlertForBooking(reserved.id);
+        }
+
+        // Booking recuperado pela varredura de segurança: a notificação (webhook/polling)
+        // NUNCA chegou. Registrar alerta destacado no dashboard — mesmo quando a criação na
+        // VisMed deu certo — porque é forte indício de webhook/notificações quebrados.
+        if (rawNotification?.source === 'safety-sweep') {
+            this.logger.warn(
+                `[SAFETY-SWEEP] ⚠️ Booking ${bookingIdStr} recuperado pela varredura (notificação perdida) — VisMed ${vismedAppointmentId ? `criado (id=${vismedAppointmentId})` : 'NÃO criado'}.`,
+            );
+            const rec = { ...reserved, vismedDoctorId: vismedDoctorId || reserved.vismedDoctorId };
+            await this.recordSkippedBookingAlert(
+                rec,
+                'NOTIFICATION_MISSED',
+                vismedAppointmentId
+                    ? `Agendamento recuperado pela varredura de segurança e criado na VisMed (id=${vismedAppointmentId}), mas a notificação da Doctoralia nunca chegou — verifique o registro do webhook.`
+                    : 'Agendamento encontrado pela varredura de segurança (notificação da Doctoralia nunca chegou) e a criação na VisMed falhou.',
+            );
         }
 
         return { processed: true, action: 'slot_booked', vismedCreated: !!vismedAppointmentId };

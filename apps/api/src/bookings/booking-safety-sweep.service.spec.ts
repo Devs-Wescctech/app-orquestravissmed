@@ -1,0 +1,145 @@
+import { BookingSafetySweepService } from './booking-safety-sweep.service';
+
+describe('BookingSafetySweepService', () => {
+    let service: BookingSafetySweepService;
+    let prisma: any;
+    let docplanner: any;
+    let queue: any;
+    let rateLimiter: any;
+    let client: any;
+
+    const conn = {
+        clinicId: 'clinic-1',
+        provider: 'doctoralia',
+        status: 'connected',
+        clientId: 'cid',
+        clientSecret: 'secret',
+        domain: 'www.doctoralia.com.br',
+    };
+
+    const mapping = {
+        clinicId: 'clinic-1',
+        entityType: 'DOCTOR',
+        status: 'LINKED',
+        externalId: 'doc-123',
+        vismedId: 'vismed-uuid',
+        conflictData: { facilityId: 'fac-1', address: { id: 'addr-1' } },
+    };
+
+    beforeEach(() => {
+        client = { getBookings: jest.fn() };
+        prisma = {
+            integrationConnection: { findMany: jest.fn().mockResolvedValue([conn]) },
+            mapping: { findMany: jest.fn().mockResolvedValue([mapping]) },
+            doctoraliaDoctor: { findMany: jest.fn().mockResolvedValue([]) },
+            bookingSync: { findMany: jest.fn() },
+        };
+        // 1ª chamada em sweepClinic é a lista de bookings conhecidos; a 2ª é a fonte 3 de endereços.
+        prisma.bookingSync.findMany.mockImplementation((args: any) =>
+            Promise.resolve(args?.select?.doctoraliaBookingId ? [] : []),
+        );
+        docplanner = { createClient: jest.fn().mockReturnValue(client) };
+        queue = { enqueueBatch: jest.fn().mockResolvedValue(undefined) };
+        rateLimiter = { acquire: jest.fn().mockResolvedValue(undefined) };
+        service = new BookingSafetySweepService(prisma, docplanner, queue, rateLimiter);
+    });
+
+    const newBooking = (id: string, extra: any = {}) => ({
+        id,
+        start_at: '2026-08-11T08:00:00-03:00',
+        end_at: '2026-08-11T08:30:00-03:00',
+        duration: 30,
+        patient: { name: 'Paciente', surname: 'Teste' },
+        ...extra,
+    });
+
+    it('detecta booking novo fora da janela de reconciliação e enfileira pelo handler slot-booked', async () => {
+        client.getBookings.mockResolvedValue({ _items: [newBooking('225170337')] });
+
+        const enqueued = await service.sweepClinic(conn);
+
+        expect(enqueued).toBe(1);
+        expect(queue.enqueueBatch).toHaveBeenCalledTimes(1);
+        const jobs = queue.enqueueBatch.mock.calls[0][0];
+        expect(jobs).toHaveLength(1);
+        expect(jobs[0].type).toBe('slot-booked');
+        expect(jobs[0].clinicId).toBe('clinic-1');
+        // Mesma dedupKey do polling normal → notificação atrasada não duplica.
+        expect(jobs[0].dedupKey).toBe('clinic-1:slot-booked:225170337');
+        expect(jobs[0].payload.data.visit_booking.id).toBe('225170337');
+        expect(jobs[0].payload.data.doctor.id).toBe('doc-123');
+        expect(jobs[0].payload.data.facility.id).toBe('fac-1');
+        expect(jobs[0].payload.data.address.id).toBe('addr-1');
+        expect(jobs[0].payload.raw.source).toBe('safety-sweep');
+        expect(rateLimiter.acquire).toHaveBeenCalledWith('doctoralia');
+    });
+
+    it('não duplica booking já existente em BookingSync (idempotência por doctoraliaBookingId)', async () => {
+        prisma.bookingSync.findMany.mockImplementation((args: any) =>
+            Promise.resolve(
+                args?.select?.doctoraliaBookingId ? [{ doctoraliaBookingId: '225170337' }] : [],
+            ),
+        );
+        client.getBookings.mockResolvedValue({ _items: [newBooking('225170337')] });
+
+        const enqueued = await service.sweepClinic(conn);
+
+        expect(enqueued).toBe(0);
+        expect(queue.enqueueBatch).not.toHaveBeenCalled();
+    });
+
+    it('não cria booking cancelado na Doctoralia', async () => {
+        client.getBookings.mockResolvedValue({
+            _items: [
+                newBooking('111', { status: 'canceled' }),
+                newBooking('222', { cancelled_at: '2026-07-20T10:00:00-03:00' }),
+            ],
+        });
+
+        const enqueued = await service.sweepClinic(conn);
+
+        expect(enqueued).toBe(0);
+        expect(queue.enqueueBatch).not.toHaveBeenCalled();
+    });
+
+    it('deduplica o mesmo booking visto em mais de um endereço', async () => {
+        const mapping2 = { ...mapping, conflictData: { facilityId: 'fac-1', address: { id: 'addr-2' } } };
+        prisma.mapping.findMany.mockResolvedValue([mapping, mapping2]);
+        client.getBookings.mockResolvedValue({ _items: [newBooking('333')] });
+
+        const enqueued = await service.sweepClinic(conn);
+
+        expect(client.getBookings).toHaveBeenCalledTimes(2);
+        expect(enqueued).toBe(1);
+    });
+
+    it('falha em um endereço não derruba a varredura dos demais', async () => {
+        const mapping2 = { ...mapping, conflictData: { facilityId: 'fac-1', address: { id: 'addr-2' } } };
+        prisma.mapping.findMany.mockResolvedValue([mapping, mapping2]);
+        client.getBookings
+            .mockRejectedValueOnce(new Error('timeout'))
+            .mockResolvedValueOnce({ _items: [newBooking('444')] });
+
+        const enqueued = await service.sweepClinic(conn);
+
+        expect(enqueued).toBe(1);
+    });
+
+    it('sem médicos vinculados não chama a API da Doctoralia', async () => {
+        prisma.mapping.findMany.mockResolvedValue([]);
+
+        const enqueued = await service.sweepClinic(conn);
+
+        expect(enqueued).toBe(0);
+        expect(client.getBookings).not.toHaveBeenCalled();
+    });
+
+    it('runSweepAllClinics varre clínicas conectadas e soma os enfileirados', async () => {
+        client.getBookings.mockResolvedValue({ _items: [newBooking('555')] });
+
+        const result = await service.runSweepAllClinics();
+
+        expect(result.clinics).toBe(1);
+        expect(result.enqueued).toBe(1);
+    });
+});

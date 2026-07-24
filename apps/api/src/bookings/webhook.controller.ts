@@ -1,6 +1,7 @@
 import { Controller, Post, Body, Get, Query, UseGuards, Req, Logger, ForbiddenException, Delete, Param, Res, HttpStatus } from '@nestjs/common';
 import type { Response } from 'express';
 import { BookingSyncService } from './booking-sync.service';
+import { BookingSafetySweepService } from './booking-safety-sweep.service';
 import { QueueService } from './queue.service';
 import { RateLimiterService } from './rate-limiter.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
@@ -33,6 +34,7 @@ export class BookingSyncController {
 
     constructor(
         private readonly bookingSyncService: BookingSyncService,
+        private readonly safetySweepService: BookingSafetySweepService,
         private readonly queueService: QueueService,
         private readonly rateLimiter: RateLimiterService,
         private readonly prisma: PrismaService,
@@ -246,5 +248,22 @@ export class BookingSyncController {
         this.logger.log('[MANUAL] Triggering notification poll');
         await this.bookingSyncService.pollNotifications();
         return { ok: true, message: 'Polling completed' };
+    }
+
+    @Post('safety-sweep')
+    async triggerSafetySweep(@Req() req: any, @Body() body?: { clinicId?: string }) {
+        if (body?.clinicId) {
+            this.validateClinicAccess(req.user, body.clinicId);
+            const conn = await this.prisma.integrationConnection.findFirst({
+                where: { clinicId: body.clinicId, provider: 'doctoralia', status: 'connected' },
+            });
+            if (!conn) return { ok: false, reason: 'Sem integração Doctoralia conectada' };
+            this.logger.log(`[MANUAL] Varredura de segurança para clínica ${body.clinicId}`);
+            const enqueued = await this.safetySweepService.sweepClinic(conn);
+            return { ok: true, enqueued };
+        }
+        this.logger.log('[MANUAL] Varredura de segurança para todas as clínicas');
+        const result = await this.safetySweepService.runSweepAllClinics();
+        return { ok: true, ...result };
     }
 }
