@@ -401,13 +401,27 @@ export class SlotSyncService {
             insuranceProviderIds.sort((a, b) => a - b);
             insurancePlanIds.sort((a, b) => a - b);
 
+            // Duração real da grade do médico, inferida do scheduleDay (moda dos intervalos).
+            // Fallback 30 min quando não foi possível inferir (sem dados / fora da faixa sã).
+            // Determinística entre execuções → não quebra o skip incremental por hash.
+            let slotDurationMinutes = 30;
+            if (source === 'availability' && avail) {
+                const inferred = avail.getInferredStep(Number(doctor.vismedId));
+                if (inferred != null) {
+                    slotDurationMinutes = inferred;
+                    this.logger.log(`Doctor ${doctor.name} address ${addrId}: grade inferida = ${inferred} min.`);
+                } else {
+                    this.logger.log(`Doctor ${doctor.name} address ${addrId}: grade não inferível — fallback 30 min.`);
+                }
+            }
+
             const allSlots: any[] = [];
             for (const date of dates) {
                 let daySlots: any[];
                 if (source === 'availability' && avail) {
                     // Faixas REALMENTE livres deste profissional naquele dia (já sem turnos bloqueados).
                     const ranges = avail.getRanges(Number(doctor.vismedId), date);
-                    daySlots = this.buildDaySlotsFromRanges(date, ranges, addressServiceIds, '-03:00', 30, insuranceProviderIds, insurancePlanIds);
+                    daySlots = this.buildDaySlotsFromRanges(date, ranges, addressServiceIds, '-03:00', slotDurationMinutes, insuranceProviderIds, insurancePlanIds);
                 } else {
                     daySlots = this.buildDaySlots(date, doctor.turnoM, doctor.turnoT, doctor.turnoN, addressServiceIds, '-03:00', 30, insuranceProviderIds, insurancePlanIds);
                 }

@@ -19,6 +19,8 @@ export interface AvailRange {
 export class ClinicAvailability {
     private ranges = new Map<string, AvailRange[]>();
     private fetchFailed = new Set<string>();
+    /** Duração de grade (min) inferida por profissional — moda dos intervalos individuais do scheduleDay. */
+    private inferredStep = new Map<number, number>();
 
     private rangeKey(prof: number, date: string) {
         return `${prof}|${date}`;
@@ -37,6 +39,15 @@ export class ClinicAvailability {
 
     getRanges(prof: number, date: string): AvailRange[] {
         return this.ranges.get(this.rangeKey(prof, date)) || [];
+    }
+
+    setInferredStep(prof: number, minutes: number) {
+        this.inferredStep.set(prof, minutes);
+    }
+
+    /** Duração inferida da grade do profissional, ou null se não foi possível inferir. */
+    getInferredStep(prof: number): number | null {
+        return this.inferredStep.get(prof) ?? null;
     }
 
     /**
@@ -187,6 +198,41 @@ export class VismedAvailabilityService {
 
         const workers = Array.from({ length: Math.min(this.CONCURRENCY, tasks.length) }, () => worker());
         await Promise.all(workers);
+
+        // Inferência da grade real por profissional: moda das durações dos intervalos
+        // individuais do scheduleDay (ANTES do coalesce), agregando TODOS os dias da janela.
+        // Só durações sãs (5–120 min) contam; empate resolve pela menor duração (determinístico).
+        const durationCounts = new Map<number, Map<number, number>>();
+        for (const [key, raw] of rawByProfDate.entries()) {
+            const prof = Number(key.split('|')[0]);
+            let counts = durationCounts.get(prof);
+            if (!counts) {
+                counts = new Map<number, number>();
+                durationCounts.set(prof, counts);
+            }
+            for (const h of raw) {
+                const s = this.toMinutes(h.inicio);
+                const e = this.toMinutes(h.fim);
+                if (s == null || e == null) continue; // malformado (ex.: "012:0") → ignora
+                const dur = e - s;
+                if (dur < 5 || dur > 120) continue;
+                counts.set(dur, (counts.get(dur) || 0) + 1);
+            }
+        }
+        for (const [prof, counts] of durationCounts.entries()) {
+            let best: number | null = null;
+            let bestCount = 0;
+            for (const [dur, count] of counts.entries()) {
+                if (count > bestCount || (count === bestCount && best != null && dur < best)) {
+                    best = dur;
+                    bestCount = count;
+                }
+            }
+            if (best != null) {
+                availability.setInferredStep(prof, best);
+                this.logger.log(`[AVAIL] Profissional ${prof}: grade inferida = ${best} min (${bestCount} intervalo(s) na moda).`);
+            }
+        }
 
         // Coalesce por (prof, data)
         for (const [key, raw] of rawByProfDate.entries()) {
