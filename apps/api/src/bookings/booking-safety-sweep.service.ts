@@ -134,14 +134,18 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
             return 0;
         }
 
-        // Conjunto de bookings já conhecidos (idempotência primária, além da dedupKey da fila).
-        const known = new Set(
-            (
-                await this.prisma.bookingSync.findMany({
-                    where: { clinicId: conn.clinicId, doctoraliaBookingId: { not: null } },
-                    select: { doctoraliaBookingId: true },
-                })
-            ).map(r => r.doctoraliaBookingId!),
+        // Bookings já conhecidos (idempotência primária, além da dedupKey da fila).
+        // Guardamos também quais estão SEM nome de paciente (resgates antigos da varredura,
+        // que enfileiravam sem os dados do paciente) para completar retroativamente.
+        const knownRecords = await this.prisma.bookingSync.findMany({
+            where: { clinicId: conn.clinicId, doctoraliaBookingId: { not: null } },
+            select: { id: true, doctoraliaBookingId: true, origin: true, patientName: true },
+        });
+        const known = new Set(knownRecords.map(r => r.doctoraliaBookingId!));
+        const nameless = new Map(
+            knownRecords
+                .filter(r => r.origin === 'DOCTORALIA' && !(r.patientName || '').trim())
+                .map(r => [r.doctoraliaBookingId!, r.id]),
         );
 
         const client = this.docplannerService.createClient(
@@ -153,6 +157,7 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
         const { startIso, endIso } = this.horizonWindow();
         const jobs: Array<{ clinicId: string; type: string; payload: any; priority?: number; dedupKey?: string }> = [];
         const seenInSweep = new Set<string>();
+        let backfillsThisCycle = 0;
 
         for (const pair of pairs) {
             if (this.isShuttingDown) break;
@@ -164,9 +169,28 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
 
                 for (const booking of bookings) {
                     const bid = booking?.id ? String(booking.id) : '';
-                    if (!bid || known.has(bid) || seenInSweep.has(bid)) continue;
+                    if (!bid || seenInSweep.has(bid)) continue;
+
+                    // Auto-correção retroativa: registro conhecido mas SEM nome do paciente
+                    // (resgates antigos criados sem os dados do paciente).
+                    if (known.has(bid)) {
+                        // Limite por ciclo para não alongar a varredura; o restante fica para o próximo ciclo.
+                        if (nameless.has(bid) && !this.isCancelled(booking) && backfillsThisCycle < 25) {
+                            seenInSweep.add(bid);
+                            backfillsThisCycle++;
+                            await this.backfillPatientData(client, pair, bid, nameless.get(bid)!, booking);
+                        }
+                        continue;
+                    }
                     if (this.isCancelled(booking)) continue;
                     seenInSweep.add(bid);
+
+                    // A listagem de bookings pode vir sem os dados do paciente; buscar
+                    // o detalhe do booking para que a criação na VisMed leve o nome.
+                    if (!booking?.patient?.name) {
+                        const detail = await this.fetchBookingDetail(client, pair, bid);
+                        if (detail?.patient) booking.patient = detail.patient;
+                    }
 
                     // Booking existe na Doctoralia mas NUNCA chegou via webhook/notificações —
                     // forte indício de que o caminho de notificações está quebrado.
@@ -205,6 +229,53 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
             await this.queueService.enqueueBatch(jobs);
         }
         return jobs.length;
+    }
+
+    /**
+     * Busca o detalhe de um booking na Doctoralia (a listagem pode omitir os dados
+     * do paciente). Falha de forma silenciosa: sem detalhe, o fluxo segue como antes.
+     */
+    private async fetchBookingDetail(client: any, pair: any, bookingId: string): Promise<any | null> {
+        try {
+            await this.rateLimiter.acquire('doctoralia');
+            const res = await client.getBooking(pair.facilityId, pair.doctorId, pair.addressId, bookingId);
+            return res?.visit_booking || res?._items?.[0] || res || null;
+        } catch (err: any) {
+            this.logger.warn(`[SAFETY-SWEEP] Falha ao buscar detalhe do booking ${bookingId}: ${err?.message}`);
+            return null;
+        }
+    }
+
+    /**
+     * Completa retroativamente os dados do paciente em registros criados pela
+     * varredura sem nome (resgates antigos). Atualiza só o BookingSync (painel);
+     * o agendamento já criado na VisMed precisa ser completado manualmente lá.
+     */
+    private async backfillPatientData(client: any, pair: any, bookingId: string, bookingSyncId: string, listBooking: any) {
+        let patient = listBooking?.patient;
+        if (!patient?.name) {
+            const detail = await this.fetchBookingDetail(client, pair, bookingId);
+            patient = detail?.patient;
+        }
+        if (!patient?.name) return;
+
+        try {
+            await this.prisma.bookingSync.update({
+                where: { id: bookingSyncId },
+                data: {
+                    patientName: patient.name || '',
+                    patientSurname: patient.surname || '',
+                    patientPhone: patient.phone ? String(patient.phone) : '',
+                    patientEmail: patient.email || '',
+                    patientCpf: patient.nin || '',
+                },
+            });
+            this.logger.log(
+                `[SAFETY-SWEEP] Nome do paciente completado retroativamente no booking ${bookingId}: "${`${patient.name} ${patient.surname || ''}`.trim()}"`,
+            );
+        } catch (err: any) {
+            this.logger.warn(`[SAFETY-SWEEP] Falha ao completar paciente do booking ${bookingId}: ${err?.message}`);
+        }
     }
 
     private horizonWindow(): { startIso: string; endIso: string } {

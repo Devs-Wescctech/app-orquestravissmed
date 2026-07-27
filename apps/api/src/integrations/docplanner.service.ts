@@ -191,6 +191,10 @@ export class DocplannerClient {
         return this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/bookings?start=${encodeURIComponent(s)}&end=${encodeURIComponent(e)}`);
     }
 
+    async getBooking(facilityId: string, doctorId: string, addressId: string, bookingId: string): Promise<any> {
+        return this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/bookings/${bookingId}`);
+    }
+
     async getSlots(facilityId: string, doctorId: string, addressId: string, start: string, end: string): Promise<any> {
         const s = start.includes('T') ? start : `${start}T00:00:00-03:00`;
         const e = end.includes('T') ? end : `${end}T23:59:59-03:00`;
