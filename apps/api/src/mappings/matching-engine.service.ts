@@ -620,6 +620,34 @@ export class MatchingEngineService {
         return newMatchesCount + newDocsCount + newInsCount;
     }
 
+    // Títulos/honoríficos ignorados na comparação de nomes de profissionais.
+    private static readonly DOCTOR_TITLE_TOKENS = new Set([
+        'dr', 'dra', 'doutor', 'doutora', 'prof', 'professor', 'professora', 'enf', 'enfa',
+    ]);
+
+    private tokenizeDoctorName(name: string): string[] {
+        return this.normalizeString(name)
+            .replace(/[^a-z0-9\s]/g, ' ')
+            .split(/\s+/)
+            .filter(t => t.length > 0 && !MatchingEngineService.DOCTOR_TITLE_TOKENS.has(t));
+    }
+
+    /**
+     * Regra de "subconjunto de nome": casa quando o nome mais curto (>= 2 tokens) tem o MESMO
+     * primeiro nome do mais longo e TODOS os seus tokens aparecem no mais longo (acentos/ç
+     * ignorados). Cobre "Daniela Buçard" ⊆ "Daniela Nogueira Furtado Bucard".
+     */
+    isDoctorNameSubsetMatch(nameA: string, nameB: string): boolean {
+        const ta = this.tokenizeDoctorName(nameA || '');
+        const tb = this.tokenizeDoctorName(nameB || '');
+        if (ta.length === 0 || tb.length === 0) return false;
+        const [short, long] = ta.length <= tb.length ? [ta, tb] : [tb, ta];
+        if (short.length < 2) return false; // exige pelo menos primeiro nome + um sobrenome
+        if (short[0] !== long[0]) return false; // primeiro nome precisa coincidir
+        const longSet = new Set(long);
+        return short.every(t => longSet.has(t));
+    }
+
     async runMatchingForDoctor(vismedDoctorId: string): Promise<boolean> {
         const doc = await this.prisma.vismedDoctor.findUnique({
             where: { id: vismedDoctorId }
@@ -644,6 +672,27 @@ export class MatchingEngineService {
         if (exactMatch) {
             await this.createDoctorMapping(doc.id, exactMatch.id);
             return true;
+        }
+
+        // Layer 1.5: Name-Subset Match (primeiro nome + sobrenomes contidos no nome completo).
+        // Só vincula automaticamente quando NÃO há ambiguidade: exatamente um médico Doctoralia
+        // casa por subconjunto E nenhum outro médico VisMed também casa com esse mesmo candidato.
+        const subsetMatches = dDoctors.filter(d => this.isDoctorNameSubsetMatch(doc.name, d.name));
+        if (subsetMatches.length === 1) {
+            const candidate = subsetMatches[0];
+            const otherVismedDocs = await this.prisma.vismedDoctor.findMany({
+                where: { id: { not: doc.id } },
+                select: { id: true, name: true },
+            });
+            const ambiguous = otherVismedDocs.some(o => o.name && this.isDoctorNameSubsetMatch(o.name, candidate.name));
+            if (!ambiguous) {
+                await this.createDoctorMapping(doc.id, candidate.id);
+                this.logger.log(`Doctor name-subset match: "${doc.name}" → "${candidate.name}" — AUTO-LINKED`);
+                return true;
+            }
+            this.logger.warn(`Doctor name-subset match ambíguo (outro médico VisMed também casa com "${candidate.name}") — pulando auto-link para "${doc.name}"`);
+        } else if (subsetMatches.length > 1) {
+            this.logger.warn(`Doctor name-subset match ambíguo (${subsetMatches.length} candidatos Doctoralia) — pulando auto-link para "${doc.name}"`);
         }
 
         // Layer 2: Fuzzy Match
@@ -728,6 +777,32 @@ export class MatchingEngineService {
                             status: 'LINKED'
                         }
                     });
+                }
+
+                // Sem mapping por externalId: os rows criados pelo sync usam vismedId (sem
+                // externalId). Sem este ramo, o Mapping ficava UNLINKED mesmo após o match,
+                // e alertas DOCTOR_NOT_LINKED nunca auto-resolviam.
+                if (mappings.length === 0) {
+                    const byVismed = await this.prisma.mapping.findMany({
+                        where: { entityType: 'DOCTOR', vismedId: vismedDoctorId }
+                    });
+                    for (const map of byVismed) {
+                        const competing = await this.prisma.mapping.findFirst({
+                            where: {
+                                clinicId: map.clinicId,
+                                entityType: 'DOCTOR',
+                                externalId: extId,
+                                id: { not: map.id }
+                            }
+                        });
+                        if (competing) {
+                            await this.prisma.mapping.delete({ where: { id: competing.id } });
+                        }
+                        await this.prisma.mapping.update({
+                            where: { id: map.id },
+                            data: { externalId: extId, status: 'LINKED' }
+                        });
+                    }
                 }
             }
         } catch (e: any) {

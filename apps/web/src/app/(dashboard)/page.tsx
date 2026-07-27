@@ -188,8 +188,12 @@ export default function DashboardOverview() {
                                 </h3>
                                 <p className="text-xs font-bold text-amber-700 mt-1">
                                     {skippedAlerts.doctors.some((d) => d.reason === 'VISMED_CREATE_FAILED')
-                                        ? 'Alguns agendamentos precisam de atenção: médico sem vínculo com a Doctoralia e/ou agendamento da Doctoralia que a VisMed não confirmou — nestes últimos, agende manualmente na VisMed.'
-                                        : `Médico${skippedAlerts.doctors.length > 1 ? 's' : ''} sem vínculo com a Doctoralia — os horários abaixo continuam livres lá, com risco de overbooking. Vincule o${skippedAlerts.doctors.length > 1 ? 's' : ''} profissiona${skippedAlerts.doctors.length > 1 ? 'is' : 'l'} na Central de Mapeamento para resolver.`}
+                                        ? 'Alguns agendamentos precisam de atenção: médico sem vínculo com a Doctoralia e/ou agendamento da Doctoralia que a VisMed não confirmou — nestes últimos, agende manualmente na VisMed. Os vínculos de médico são resolvidos na '
+                                        : `Médico${skippedAlerts.doctors.length > 1 ? 's' : ''} sem vínculo com a Doctoralia — os horários abaixo continuam livres lá, com risco de overbooking. Vincule o${skippedAlerts.doctors.length > 1 ? 's' : ''} profissiona${skippedAlerts.doctors.length > 1 ? 'is' : 'l'} na `}
+                                    <Link href="/mapping" className="underline decoration-2 underline-offset-2 text-amber-800 hover:text-amber-900">
+                                        Central de Mapeamento
+                                    </Link>
+                                    {skippedAlerts.doctors.some((d) => d.reason === 'VISMED_CREATE_FAILED') ? '.' : ' para resolver.'}
                                 </p>
                                 <div className="mt-3 flex flex-wrap gap-2">
                                     {skippedAlerts.doctors.map((d) => (

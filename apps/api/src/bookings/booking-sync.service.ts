@@ -4,6 +4,7 @@ import { DocplannerService } from '../integrations/docplanner.service';
 import { VismedService } from '../integrations/vismed/vismed.service';
 import { QueueService } from './queue.service';
 import { RateLimiterService } from './rate-limiter.service';
+import { MatchingEngineService } from '../mappings/matching-engine.service';
 
 const POLL_BASE_INTERVAL_MS = 30 * 1000;
 const STAGGER_PER_CLINIC_MS = 2000;
@@ -22,6 +23,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         private vismedService: VismedService,
         private queueService: QueueService,
         private rateLimiter: RateLimiterService,
+        private matchingEngine: MatchingEngineService,
     ) {}
 
     // Normaliza qualquer status vindo da Doctoralia para detectar cancelamento de forma robusta
@@ -230,7 +232,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                         const vid = a?.idpacienteagendamento ? String(a.idpacienteagendamento) : null;
                         if (vid) seenVismedIds.add(vid);
                         try {
-                            const upserted = await this.upsertVismedAppointment(conn.clinicId, a);
+                            const upserted = await this.upsertVismedAppointment(conn.clinicId, a, { idEmpresaGestora, baseUrl });
                             if (upserted) totalUpserts++;
                         } catch (innerErr: any) {
                             this.logger.debug(`[VISMED-POLL] Skipping appointment: ${innerErr.message}`);
@@ -944,7 +946,103 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         }
     }
 
-    private async upsertVismedAppointment(clinicId: string, a: any): Promise<boolean> {
+    // Cache curto (5 min) da lista de profissionais da VisMed por clínica, usado apenas quando
+    // um agendamento chega com médico desconhecido — evita martelar getProfissionais no poll.
+    private profListCache = new Map<string, { at: number; byId: Map<number, any> }>();
+
+    private async lookupVismedProfessional(
+        clinicId: string,
+        idEmpresaGestora: number | undefined,
+        baseUrl: string | undefined,
+        idProf: number,
+    ): Promise<any | null> {
+        if (!idEmpresaGestora) return null;
+        const TTL_MS = 5 * 60 * 1000;
+        let entry = this.profListCache.get(clinicId);
+        if (!entry || Date.now() - entry.at > TTL_MS) {
+            try {
+                const list = await this.vismedService.getProfissionais(idEmpresaGestora, baseUrl);
+                const byId = new Map<number, any>();
+                for (const p of Array.isArray(list) ? list : []) {
+                    if (p?.idprofissional) byId.set(Number(p.idprofissional), p);
+                }
+                entry = { at: Date.now(), byId };
+                this.profListCache.set(clinicId, entry);
+            } catch (err: any) {
+                this.logger.warn(`[VISMED-POLL] lookupVismedProfessional: getProfissionais falhou: ${err.message}`);
+                return null;
+            }
+        }
+        return entry.byId.get(Number(idProf)) || null;
+    }
+
+    /**
+     * Um agendamento chegou com um médico que NÃO existe na lista de profissionais sincronizada.
+     * Sem isso, o médico ficava invisível na Central de Mapeamento (o alerta vem dos agendamentos,
+     * a Central vem do getProfissionais — caminhos independentes). Criamos o VismedDoctor
+     * (com dados reais se a VisMed retornar, senão placeholder), garantimos o Mapping pendente
+     * e tentamos o auto-match com a Doctoralia.
+     */
+    private async ensureVismedDoctorFromAppointment(
+        clinicId: string,
+        idProf: number,
+        opts?: { idEmpresaGestora?: number; baseUrl?: string },
+    ): Promise<any | null> {
+        try {
+            const p = await this.lookupVismedProfessional(clinicId, opts?.idEmpresaGestora, opts?.baseUrl, idProf);
+            const name = p?.nomecompleto || `Profissional VisMed #${idProf}`;
+            const doctor = await this.prisma.vismedDoctor.upsert({
+                where: { vismedId: idProf },
+                create: {
+                    vismedId: idProf,
+                    name,
+                    formalName: p?.nomeformal || null,
+                    cpf: p?.cpf || null,
+                    documentNumber: p?.numerodocumento || null,
+                    documentType: p?.siglaprofissionaltipodocumento || null,
+                    gender: p?.sexo || null,
+                    isActive: p ? p.ativo === '1' : true,
+                },
+                update: {},
+            });
+
+            await this.prisma.mapping.upsert({
+                where: {
+                    clinicId_entityType_vismedId: {
+                        clinicId,
+                        entityType: 'DOCTOR',
+                        vismedId: doctor.id,
+                    },
+                },
+                create: {
+                    clinicId,
+                    entityType: 'DOCTOR',
+                    vismedId: doctor.id,
+                    status: 'UNLINKED',
+                },
+                update: {},
+            });
+
+            this.logger.log(
+                `[VISMED-POLL] Médico ${idProf} ("${name}") criado a partir de agendamento (não veio no getProfissionais${p ? ' anterior' : ''}) — visível na Central de Mapeamento`,
+            );
+
+            await this.matchingEngine.runMatchingForDoctor(doctor.id).catch(err =>
+                this.logger.warn(`[VISMED-POLL] auto-match do médico ${idProf} falhou: ${err.message}`),
+            );
+
+            return this.prisma.vismedDoctor.findUnique({ where: { id: doctor.id } });
+        } catch (err: any) {
+            this.logger.warn(`[VISMED-POLL] ensureVismedDoctorFromAppointment(${idProf}) falhou: ${err.message}`);
+            return null;
+        }
+    }
+
+    private async upsertVismedAppointment(
+        clinicId: string,
+        a: any,
+        opts?: { idEmpresaGestora?: number; baseUrl?: string },
+    ): Promise<boolean> {
         const vismedAppointmentId = a?.idpacienteagendamento ? String(a.idpacienteagendamento) : null;
         const dataAg = a?.dataagendamento;
         const horaIni = a?.horarioagendamento;
@@ -953,9 +1051,15 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
 
         if (!vismedAppointmentId || !dataAg || !horaIni || !idProf) return false;
 
-        const doctor = await this.prisma.vismedDoctor.findUnique({
+        let doctor = await this.prisma.vismedDoctor.findUnique({
             where: { vismedId: Number(idProf) },
         });
+
+        // Médico ausente da base local: importar a partir do agendamento (aparece como
+        // "Pendente" na Central de Mapeamento em vez de ficar invisível para vínculo).
+        if (!doctor) {
+            doctor = await this.ensureVismedDoctorFromAppointment(clinicId, Number(idProf), opts);
+        }
 
         // Resolve linked Doctoralia doctor so the appointment shows up when
         // the dashboard filters by doctoraliaDoctorId.
