@@ -15,7 +15,12 @@ export class DocplannerClient {
     }
 
     setBaseUrl(url: string) {
-        this.baseUrl = url.replace(/\/$/, '');
+        let u = url.replace(/\/$/, '');
+        // Normaliza domínios Doctoralia/ZnanyLekarz sem "www": a Doctoralia passou a
+        // responder 301 no domínio raiz, e o redirect converte o POST de autenticação
+        // em GET (→ 405 com página de verificação do WAF). Sempre usar o host www.
+        u = u.replace(/^(https?:\/\/)?(doctoralia\.[a-z.]+|znanylekarz\.pl)$/i, (_m, proto, host) => `${proto || ''}www.${host}`);
+        this.baseUrl = u;
     }
 
     private getBaseUrl(): string {
