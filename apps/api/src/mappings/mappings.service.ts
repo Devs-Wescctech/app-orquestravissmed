@@ -1,10 +1,160 @@
-import { Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
+import { Injectable, BadRequestException, NotFoundException, ConflictException, ForbiddenException, forwardRef, Inject } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { MappingEntityType, Prisma } from '@prisma/client';
+import { MatchingEngineService } from './matching-engine.service';
 
 @Injectable()
 export class MappingsService {
-    constructor(private prisma: PrismaService) { }
+    constructor(
+        private prisma: PrismaService,
+        @Inject(forwardRef(() => MatchingEngineService))
+        private matchingEngine: MatchingEngineService,
+    ) { }
+
+    // ------------------------------------------------------------------------------------------
+    // FILA DE REVISÃO — Médicos com nomes ambíguos (DoctorMatchReview)
+    // ------------------------------------------------------------------------------------------
+
+    /**
+     * IDs de médicos VisMed pertencentes à clínica (via tabela Mapping, entityType DOCTOR).
+     * É a mesma fronteira de tenant usada por getProfessionalMappings.
+     */
+    private async getClinicVismedDoctorIds(clinicId: string): Promise<string[]> {
+        const rows = await this.prisma.mapping.findMany({
+            where: { clinicId, entityType: 'DOCTOR', vismedId: { not: null } },
+            select: { vismedId: true },
+        });
+        return rows.map(r => r.vismedId!).filter(Boolean);
+    }
+
+    private async assertReviewInClinic(review: { vismedDoctorId: string }, clinicId: string): Promise<void> {
+        const inClinic = await this.prisma.mapping.findFirst({
+            where: { clinicId, entityType: 'DOCTOR', vismedId: review.vismedDoctorId },
+            select: { id: true },
+        });
+        if (!inClinic) {
+            throw new ForbiddenException('Esta revisão pertence a um médico de outra clínica.');
+        }
+    }
+
+    async getDoctorReviews(clinicId: string) {
+        const clinicDoctorIds = await this.getClinicVismedDoctorIds(clinicId);
+        if (clinicDoctorIds.length === 0) return [];
+        const reviews = await this.prisma.doctorMatchReview.findMany({
+            where: { status: 'PENDING', vismedDoctorId: { in: clinicDoctorIds } },
+            orderBy: { createdAt: 'asc' },
+            include: {
+                vismedDoctor: {
+                    select: {
+                        id: true, vismedId: true, name: true, formalName: true,
+                        documentNumber: true, documentType: true, isActive: true,
+                        unit: { select: { name: true, cityName: true } },
+                    },
+                },
+            },
+        });
+
+        // Enriquecer candidatos: sinaliza se o Doctoralia doctor já está vinculado a outro médico.
+        return Promise.all(reviews.map(async (r) => {
+            const rawCandidates = (r.candidates as any[]) || [];
+            const candidates = await Promise.all(rawCandidates.map(async (c) => {
+                const linked = c.doctoraliaDoctorUuid ? await this.prisma.professionalUnifiedMapping.findFirst({
+                    where: { doctoraliaDoctorId: c.doctoraliaDoctorUuid, isActive: true },
+                    include: { vismedDoctor: { select: { name: true } } },
+                }) : null;
+                return {
+                    ...c,
+                    alreadyLinkedTo: linked?.vismedDoctor?.name || null,
+                };
+            }));
+            return { ...r, candidates };
+        }));
+    }
+
+    async approveDoctorReview(reviewId: string, doctoraliaDoctorUuid: string, clinicId: string, userId?: string) {
+        const review = await this.prisma.doctorMatchReview.findUnique({
+            where: { id: reviewId },
+            include: { vismedDoctor: { select: { name: true } } },
+        });
+        if (!review) throw new NotFoundException('Revisão de médico não encontrada.');
+        await this.assertReviewInClinic(review, clinicId);
+        if (review.status !== 'PENDING') throw new BadRequestException('Esta revisão já foi resolvida ou descartada.');
+
+        const candidates = (review.candidates as any[]) || [];
+        const chosen = candidates.find(c => c.doctoraliaDoctorUuid === doctoraliaDoctorUuid);
+        if (!chosen) throw new BadRequestException('O candidato escolhido não faz parte desta revisão.');
+
+        const dDoc = await this.prisma.doctoraliaDoctor.findUnique({ where: { id: doctoraliaDoctorUuid } });
+        if (!dDoc) throw new NotFoundException('Médico Doctoralia não encontrado (pode ter sido removido no último sync).');
+
+        // Bloqueia dupla vinculação: o mesmo médico Doctoralia não pode ficar ativo em dois vínculos.
+        const alreadyLinked = await this.prisma.professionalUnifiedMapping.findFirst({
+            where: { doctoraliaDoctorId: doctoraliaDoctorUuid, isActive: true, vismedDoctorId: { not: review.vismedDoctorId } },
+            include: { vismedDoctor: { select: { name: true } } },
+        });
+        if (alreadyLinked) {
+            throw new ConflictException(
+                `O médico Doctoralia "${dDoc.name}" já está vinculado a "${alreadyLinked.vismedDoctor?.name}". Desfaça esse vínculo antes de aprovar este.`
+            );
+        }
+
+        // Mesmo caminho do auto-link: cria ProfessionalUnifiedMapping + reconcilia tabela Mapping.
+        // (createDoctorMapping também marca reviews PENDING deste médico como RESOLVED.)
+        await this.matchingEngine.createDoctorMapping(review.vismedDoctorId, doctoraliaDoctorUuid);
+
+        const updated = await this.prisma.doctorMatchReview.update({
+            where: { id: reviewId },
+            data: {
+                status: 'RESOLVED',
+                resolvedDoctoraliaDoctorId: doctoraliaDoctorUuid,
+                resolvedBy: userId || null,
+                resolvedAt: new Date(),
+            },
+        });
+
+        if (userId) {
+            await this.prisma.auditLog.create({
+                data: {
+                    userId,
+                    action: 'APPROVE_DOCTOR_MATCH_REVIEW',
+                    entity: 'DOCTOR_MATCH_REVIEW',
+                    entityId: reviewId,
+                    details: {
+                        vismedDoctorId: review.vismedDoctorId,
+                        vismedDoctorName: review.vismedDoctor?.name,
+                        doctoraliaDoctorUuid,
+                        doctoraliaDoctorName: dDoc.name,
+                    } as any,
+                },
+            });
+        }
+        return updated;
+    }
+
+    async dismissDoctorReview(reviewId: string, clinicId: string, userId?: string) {
+        const review = await this.prisma.doctorMatchReview.findUnique({ where: { id: reviewId } });
+        if (!review) throw new NotFoundException('Revisão de médico não encontrada.');
+        await this.assertReviewInClinic(review, clinicId);
+        if (review.status !== 'PENDING') throw new BadRequestException('Esta revisão já foi resolvida ou descartada.');
+
+        const updated = await this.prisma.doctorMatchReview.update({
+            where: { id: reviewId },
+            data: { status: 'DISMISSED', resolvedBy: userId || null, resolvedAt: new Date() },
+        });
+
+        if (userId) {
+            await this.prisma.auditLog.create({
+                data: {
+                    userId,
+                    action: 'DISMISS_DOCTOR_MATCH_REVIEW',
+                    entity: 'DOCTOR_MATCH_REVIEW',
+                    entityId: reviewId,
+                    details: { vismedDoctorId: review.vismedDoctorId } as any,
+                },
+            });
+        }
+        return updated;
+    }
 
     async findAll(clinicId: string, entityType?: MappingEntityType) {
         const whereClause: any = { clinicId };

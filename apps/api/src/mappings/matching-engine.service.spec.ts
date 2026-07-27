@@ -111,8 +111,18 @@ describe('MatchingEngineService — doctor name subset matching', () => {
                     findMany: jest.fn().mockResolvedValue([]),
                     findFirst: jest.fn().mockResolvedValue(null),
                 },
+                doctorMatchReview: {
+                    findFirst: jest.fn().mockResolvedValue(null),
+                    create: jest.fn().mockImplementation(({ data }: any) => {
+                        reviews.push(data);
+                        return Promise.resolve({ id: 'r1', ...data });
+                    }),
+                    update: jest.fn(),
+                    updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+                },
             };
-            return { prisma, created };
+            const reviews: any[] = [];
+            return { prisma, created, reviews };
         }
 
         it('auto-vincula quando há exatamente um candidato e nenhum outro VisMed casa com ele', async () => {
@@ -151,6 +161,52 @@ describe('MatchingEngineService — doctor name subset matching', () => {
             for (const c of created) {
                 expect(c.doctoraliaDoctorId).not.toBe('d1');
             }
+        });
+
+        it('cria DoctorMatchReview quando há múltiplos candidatos subset (ambiguidade direta)', async () => {
+            const { prisma, created, reviews } = buildPrisma({
+                dDoctors: [
+                    { id: 'd1', name: 'Daniela Nogueira Furtado' },
+                    { id: 'd2', name: 'Daniela Bucard' },
+                ],
+            });
+            const svc = new MatchingEngineService(prisma);
+
+            await expect(svc.runMatchingForDoctor('v1')).resolves.toBe(false);
+            expect(created).toHaveLength(0);
+            expect(reviews).toHaveLength(1);
+            const cands = reviews[0].candidates as any[];
+            expect(cands.map(c => c.doctoraliaDoctorUuid).sort()).toEqual(['d1', 'd2']);
+            expect(reviews[0].status).toBe('PENDING');
+        });
+
+        it('cria DoctorMatchReview na ambiguidade reversa (outro VisMed casa com o mesmo candidato)', async () => {
+            const { prisma, reviews } = buildPrisma({
+                dDoctors: [{ id: 'd1', name: 'Daniela Bucard' }],
+                otherVismedDocs: [{ id: 'v2', name: 'Daniela Bucard Silva Mendes' }],
+            });
+            const svc = new MatchingEngineService(prisma);
+
+            await expect(svc.runMatchingForDoctor('v1')).resolves.toBe(false);
+            expect(reviews).toHaveLength(1);
+            expect((reviews[0].candidates as any[])[0].doctoraliaDoctorUuid).toBe('d1');
+            expect(reviews[0].reason).toContain('Daniela Bucard Silva Mendes');
+        });
+
+        it('NÃO recria review se a última decisão foi DISMISSED com os mesmos candidatos', async () => {
+            const { prisma, reviews } = buildPrisma({
+                dDoctors: [{ id: 'd1', name: 'Daniela Bucard' }],
+                otherVismedDocs: [{ id: 'v2', name: 'Daniela Bucard Silva Mendes' }],
+            });
+            prisma.doctorMatchReview.findFirst = jest.fn().mockImplementation(({ where }: any) =>
+                Promise.resolve(where.status === 'DISMISSED'
+                    ? { id: 'old', candidates: [{ doctoraliaDoctorUuid: 'd1' }], status: 'DISMISSED' }
+                    : null)
+            );
+            const svc = new MatchingEngineService(prisma);
+
+            await expect(svc.runMatchingForDoctor('v1')).resolves.toBe(false);
+            expect(reviews).toHaveLength(0);
         });
 
         it('NÃO vincula quando outro médico VisMed também casa com o mesmo candidato (ambiguidade reversa)', async () => {

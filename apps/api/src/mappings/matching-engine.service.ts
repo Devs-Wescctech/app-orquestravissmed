@@ -681,22 +681,25 @@ export class MatchingEngineService {
         // Candidatos marcados como ambíguos pela camada 1.5: a camada fuzzy (2) NUNCA pode
         // auto-vincular um deles — senão a proteção de ambiguidade seria contornada.
         const ambiguousCandidateIds = new Set<string>();
+        let ambiguityReason: string | null = null;
         if (subsetMatches.length === 1) {
             const candidate = subsetMatches[0];
             const otherVismedDocs = await this.prisma.vismedDoctor.findMany({
                 where: { id: { not: doc.id } },
                 select: { id: true, name: true },
             });
-            const ambiguous = otherVismedDocs.some(o => o.name && this.isDoctorNameSubsetMatch(o.name, candidate.name));
-            if (!ambiguous) {
+            const conflicting = otherVismedDocs.filter(o => o.name && this.isDoctorNameSubsetMatch(o.name, candidate.name));
+            if (conflicting.length === 0) {
                 await this.createDoctorMapping(doc.id, candidate.id);
                 this.logger.log(`Doctor name-subset match: "${doc.name}" → "${candidate.name}" — AUTO-LINKED`);
                 return true;
             }
             ambiguousCandidateIds.add(candidate.id);
+            ambiguityReason = `Outro(s) médico(s) VisMed também casa(m) com "${candidate.name}" por subconjunto de nome: ${conflicting.map(c => `"${c.name}"`).join(', ')}`;
             this.logger.warn(`Doctor name-subset match ambíguo (outro médico VisMed também casa com "${candidate.name}") — pulando auto-link para "${doc.name}"`);
         } else if (subsetMatches.length > 1) {
             for (const m of subsetMatches) ambiguousCandidateIds.add(m.id);
+            ambiguityReason = `${subsetMatches.length} médicos Doctoralia casam com "${doc.name}" por subconjunto de nome`;
             this.logger.warn(`Doctor name-subset match ambíguo (${subsetMatches.length} candidatos Doctoralia) — pulando auto-link para "${doc.name}"`);
         }
 
@@ -718,17 +721,89 @@ export class MatchingEngineService {
                 // A camada 1.5 marcou este candidato como ambíguo — o fuzzy não pode
                 // contornar a proteção. Caso fica para revisão/vínculo manual.
                 this.logger.warn(`Doctor fuzzy match (${(bestScore * 100).toFixed(0)}%) bloqueado: candidato "${bestMatch.name}" foi marcado como ambíguo pela camada de subconjunto — sem auto-link para "${doc.name}"`);
+                await this.upsertDoctorMatchReview(doc.id, subsetMatches, ambiguityReason, bestMatch, bestScore);
                 return false;
             }
             await this.createDoctorMapping(doc.id, bestMatch.id);
             return true;
         }
 
+        // Ambiguidade detectada e o fuzzy também não resolveu: enfileira para revisão manual.
+        if (ambiguousCandidateIds.size > 0) {
+            await this.upsertDoctorMatchReview(doc.id, subsetMatches, ambiguityReason, bestMatch, bestScore);
+            return false;
+        }
+
         this.logger.debug(`No match found for doctor: ${doc.name}`);
         return false;
     }
 
-    private async createDoctorMapping(vismedDoctorId: string, doctoraliaDoctorId: string) {
+    /**
+     * Cria/atualiza a fila de revisão manual para um médico com match ambíguo.
+     * - Se já existe review PENDING, apenas atualiza candidatos/motivo.
+     * - Se a última decisão foi DISMISSED com o MESMO conjunto de candidatos, não recria
+     *   (respeita o descarte do operador). Candidatos novos reabrem o caso.
+     */
+    private async upsertDoctorMatchReview(
+        vismedDoctorId: string,
+        subsetMatches: Array<{ id: string; doctoraliaDoctorId: string; name: string }>,
+        reason: string | null,
+        fuzzyBest: { id: string; doctoraliaDoctorId: string; name: string } | null,
+        fuzzyScore: number,
+    ): Promise<void> {
+        try {
+            const candidates: any[] = subsetMatches.map(m => ({
+                doctoraliaDoctorUuid: m.id,
+                doctoraliaDoctorId: m.doctoraliaDoctorId,
+                name: m.name,
+                source: 'NAME_SUBSET',
+                score: fuzzyBest && fuzzyBest.id === m.id ? Math.round(fuzzyScore * 100) / 100 : undefined,
+            }));
+            if (fuzzyBest && fuzzyScore >= 0.75 && !candidates.some(c => c.doctoraliaDoctorUuid === fuzzyBest.id)) {
+                candidates.push({
+                    doctoraliaDoctorUuid: fuzzyBest.id,
+                    doctoraliaDoctorId: fuzzyBest.doctoraliaDoctorId,
+                    name: fuzzyBest.name,
+                    source: 'FUZZY',
+                    score: Math.round(fuzzyScore * 100) / 100,
+                });
+            }
+            if (candidates.length === 0) return;
+
+            const candidateKey = candidates.map(c => c.doctoraliaDoctorUuid).sort().join(',');
+
+            const pending = await this.prisma.doctorMatchReview.findFirst({
+                where: { vismedDoctorId, status: 'PENDING' },
+            });
+            if (pending) {
+                await this.prisma.doctorMatchReview.update({
+                    where: { id: pending.id },
+                    data: { candidates: candidates as any, reason },
+                });
+                return;
+            }
+
+            // Respeita descarte anterior se o conjunto de candidatos não mudou.
+            const lastDismissed = await this.prisma.doctorMatchReview.findFirst({
+                where: { vismedDoctorId, status: 'DISMISSED' },
+                orderBy: { updatedAt: 'desc' },
+            });
+            if (lastDismissed) {
+                const prevKey = ((lastDismissed.candidates as any[]) || [])
+                    .map(c => c.doctoraliaDoctorUuid).sort().join(',');
+                if (prevKey === candidateKey) return;
+            }
+
+            await this.prisma.doctorMatchReview.create({
+                data: { vismedDoctorId, candidates: candidates as any, reason, status: 'PENDING' },
+            });
+            this.logger.log(`Doctor match review criado para vismedDoctorId=${vismedDoctorId} com ${candidates.length} candidato(s)`);
+        } catch (e: any) {
+            this.logger.error(`Falha ao registrar review de médico ambíguo: ${e.message}`);
+        }
+    }
+
+    async createDoctorMapping(vismedDoctorId: string, doctoraliaDoctorId: string) {
         // Find existing to avoid unique constraint if we just want to reactivate
         const existingUnified = await this.prisma.professionalUnifiedMapping.findFirst({
             where: { vismedDoctorId, doctoraliaDoctorId }
@@ -818,6 +893,16 @@ export class MatchingEngineService {
             }
         } catch (e: any) {
             this.logger.error(`Error reconciling doctor mapping: ${e.message}`);
+        }
+
+        // Vínculo criado: reviews pendentes deste médico ficam obsoletos.
+        try {
+            await this.prisma.doctorMatchReview.updateMany({
+                where: { vismedDoctorId, status: 'PENDING' },
+                data: { status: 'RESOLVED', resolvedDoctoraliaDoctorId: doctoraliaDoctorId, resolvedAt: new Date() },
+            });
+        } catch (e: any) {
+            this.logger.warn(`Falha ao resolver reviews pendentes do médico ${vismedDoctorId}: ${e.message}`);
         }
 
         this.logger.log(`Mapped Vismed Doctor ${vismedDoctorId} to Doctoralia Doctor ${doctoraliaDoctorId}`);

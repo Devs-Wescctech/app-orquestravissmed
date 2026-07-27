@@ -25,6 +25,16 @@ export async function fetchSpecialtyMatches(clinicId: string, requiresReview?: b
   }
 }
 
+export async function fetchDoctorReviews(clinicId: string) {
+  try {
+    const response = await api.get('/mappings/doctors/reviews', { params: clinicId ? { clinicId } : {} });
+    return response.data || [];
+  } catch (error) {
+    console.error('fetchDoctorReviews error:', error);
+    return [];
+  }
+}
+
 export async function fetchUnitMappings(clinicId: string) {
   try {
     const response = await api.get('/mappings/units', { 

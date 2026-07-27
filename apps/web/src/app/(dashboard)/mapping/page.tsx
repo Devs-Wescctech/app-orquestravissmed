@@ -6,7 +6,7 @@ import {
     Calendar, CalendarOff, ToggleLeft, ToggleRight, Activity
 } from 'lucide-react';
 import { api } from '@/lib/api';
-import { fetchProfessionalMappings, fetchSpecialtyMatches, fetchUnitMappings, fetchLegacyMappings, fetchSpecialtyStats } from '@/lib/mapping-data';
+import { fetchProfessionalMappings, fetchSpecialtyMatches, fetchUnitMappings, fetchLegacyMappings, fetchSpecialtyStats, fetchDoctorReviews } from '@/lib/mapping-data';
 import { useAuthStore } from '@/lib/store';
 import { useClinic } from '@/lib/clinic-store';
 import { toast } from 'sonner';
@@ -29,6 +29,28 @@ interface VismedProfessional {
     doctoraliaCounterpart?: {
         name: string; doctoraliaDoctorId: string; services: string[];
         calendarStatus?: 'enabled' | 'disabled' | 'unknown';
+    } | null;
+}
+
+interface DoctorReviewCandidate {
+    doctoraliaDoctorUuid: string;
+    doctoraliaDoctorId: string;
+    name: string;
+    source: 'NAME_SUBSET' | 'FUZZY';
+    score?: number;
+    alreadyLinkedTo?: string | null;
+}
+
+interface DoctorMatchReview {
+    id: string;
+    status: string;
+    reason?: string | null;
+    createdAt: string;
+    candidates: DoctorReviewCandidate[];
+    vismedDoctor?: {
+        id: string; vismedId: number; name: string; formalName?: string;
+        documentNumber?: string; documentType?: string; isActive: boolean;
+        unit?: { name: string; cityName?: string } | null;
     } | null;
 }
 
@@ -67,6 +89,8 @@ export default function MappingHub() {
 
     // Per-tab data
     const [professionals, setProfessionals] = useState<VismedProfessional[]>([]);
+    const [doctorReviews, setDoctorReviews] = useState<DoctorMatchReview[]>([]);
+    const [reviewActionIds, setReviewActionIds] = useState<Set<string>>(new Set());
     const [units, setUnits] = useState<VismedUnit[]>([]);
     const [specialtyMatches, setSpecialtyMatches] = useState<SpecialtyMatch[]>([]);
     const [specialtyFilter, setSpecialtyFilter] = useState<'all' | 'pending' | 'approved'>('pending');
@@ -94,8 +118,12 @@ export default function MappingHub() {
         try {
             const clinicId = activeClinic?.id || '';
             if (activeTab === 'Profissionais') {
-                const data = await fetchProfessionalMappings(clinicId);
+                const [data, reviews] = await Promise.all([
+                    fetchProfessionalMappings(clinicId),
+                    fetchDoctorReviews(clinicId),
+                ]);
                 setProfessionals(data || []);
+                setDoctorReviews(reviews || []);
             } else if (activeTab === 'Especialidades') {
                 const [data, stats] = await Promise.all([
                     fetchSpecialtyMatches(clinicId),
@@ -204,6 +232,40 @@ export default function MappingHub() {
     };
 
 
+
+    const handleApproveDoctorReview = async (review: DoctorMatchReview, candidate: DoctorReviewCandidate) => {
+        const ok = confirm(
+            `Vincular "${review.vismedDoctor?.name || 'médico VisMed'}" a "${candidate.name}" na Doctoralia?\n\n` +
+            'O vínculo será criado e passará a ser usado pela sincronização.'
+        );
+        if (!ok) return;
+        setReviewActionIds(prev => new Set(prev).add(review.id));
+        try {
+            await api.post(`/mappings/doctors/reviews/${review.id}/approve`, { doctoraliaDoctorUuid: candidate.doctoraliaDoctorUuid, clinicId: activeClinic?.id });
+            toast.success(`Vínculo criado: ${review.vismedDoctor?.name} → ${candidate.name}`);
+            fetchData();
+        } catch (err: any) {
+            const msg = err?.response?.data?.message || err.message || 'Erro desconhecido';
+            toast.error(`Falha ao aprovar vínculo: ${msg}`);
+        } finally {
+            setReviewActionIds(prev => { const next = new Set(prev); next.delete(review.id); return next; });
+        }
+    };
+
+    const handleDismissDoctorReview = async (review: DoctorMatchReview) => {
+        if (!confirm(`Descartar a revisão de "${review.vismedDoctor?.name || 'médico VisMed'}"?\n\nO médico permanecerá sem vínculo e este caso sairá da fila (volta se surgirem candidatos novos).`)) return;
+        setReviewActionIds(prev => new Set(prev).add(review.id));
+        try {
+            await api.post(`/mappings/doctors/reviews/${review.id}/dismiss`, { clinicId: activeClinic?.id });
+            toast.success('Revisão descartada.');
+            fetchData();
+        } catch (err: any) {
+            const msg = err?.response?.data?.message || err.message || 'Erro desconhecido';
+            toast.error(`Falha ao descartar: ${msg}`);
+        } finally {
+            setReviewActionIds(prev => { const next = new Set(prev); next.delete(review.id); return next; });
+        }
+    };
 
     const handleToggleCalendar = async (professionalId: string, doctoraliaDoctorId: string, currentStatus: string) => {
         const newStatus = currentStatus === 'enabled' ? 'disabled' : 'enabled';
@@ -372,6 +434,106 @@ export default function MappingHub() {
             </div>
 
             {/* ── PROFISSIONAIS ─────────────────────────────────────── */}
+            {/* ── FILA DE REVISÃO — Médicos com nomes ambíguos ─────────── */}
+            {activeTab === 'Profissionais' && !isLoading && doctorReviews.length > 0 && (
+                <div className="bg-amber-50/60 backdrop-blur-xl rounded-[32px] shadow-sm border border-amber-200/70 overflow-hidden mb-8 animate-in fade-in slide-in-from-top-4 duration-500">
+                    <div className="p-8 border-b border-amber-100/80 flex items-center gap-4">
+                        <div className="h-11 w-11 rounded-2xl bg-amber-100 text-amber-600 flex items-center justify-center shrink-0 border border-amber-200">
+                            <AlertTriangle className="h-5 w-5" />
+                        </div>
+                        <div>
+                            <h3 className="text-[12px] font-black text-slate-900 uppercase tracking-[2px]">Vínculos Ambíguos — Revisão Manual</h3>
+                            <p className="text-[10px] font-bold text-amber-700/80 mt-1">
+                                {doctorReviews.length} médico(s) com mais de um candidato possível na Doctoralia. Escolha o vínculo correto ou descarte.
+                            </p>
+                        </div>
+                    </div>
+                    <div className="divide-y divide-amber-100/70">
+                        {doctorReviews.map(r => {
+                            const busy = reviewActionIds.has(r.id);
+                            return (
+                                <div key={r.id} className="p-8">
+                                    <div className="flex flex-wrap items-start justify-between gap-4">
+                                        <div className="min-w-0">
+                                            <div className="flex items-center gap-3">
+                                                <div className="h-10 w-10 rounded-2xl bg-white text-slate-900 flex items-center justify-center shrink-0 font-black text-base border border-amber-200 shadow-sm">
+                                                    {(r.vismedDoctor?.name || '?').charAt(0).toUpperCase()}
+                                                </div>
+                                                <div className="min-w-0">
+                                                    <div className="font-black text-sm text-slate-900 leading-tight truncate">{r.vismedDoctor?.name || 'Médico VisMed'}</div>
+                                                    <div className="flex flex-wrap items-center gap-2 mt-1">
+                                                        {r.vismedDoctor?.documentNumber && (
+                                                            <span className="text-[9px] font-black text-slate-400 bg-white px-1.5 py-0.5 rounded uppercase tracking-wider border border-slate-100">
+                                                                {r.vismedDoctor.documentType || 'CRM'}: {r.vismedDoctor.documentNumber}
+                                                            </span>
+                                                        )}
+                                                        {r.vismedDoctor?.unit?.name && (
+                                                            <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider">{r.vismedDoctor.unit.name}</span>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            {r.reason && (
+                                                <p className="text-[10px] font-semibold text-amber-700/90 mt-3 max-w-xl leading-relaxed">{r.reason}</p>
+                                            )}
+                                        </div>
+                                        <button
+                                            onClick={() => handleDismissDoctorReview(r)}
+                                            disabled={busy}
+                                            className="px-4 py-2 rounded-xl text-[9px] font-black uppercase tracking-wider bg-white text-slate-400 border border-slate-200 hover:text-rose-500 hover:border-rose-200 transition-all disabled:opacity-50"
+                                        >
+                                            Descartar
+                                        </button>
+                                    </div>
+                                    <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                                        {r.candidates.map(c => (
+                                            <div key={c.doctoraliaDoctorUuid} className="bg-white rounded-2xl border border-slate-100 p-4 flex flex-col gap-3 shadow-sm">
+                                                <div className="flex items-start gap-3">
+                                                    <div className="h-9 w-9 rounded-xl bg-primary/10 text-primary flex items-center justify-center shrink-0 border border-primary/20">
+                                                        <ShieldCheck className="h-4 w-4" />
+                                                    </div>
+                                                    <div className="min-w-0">
+                                                        <div className="text-xs font-black text-slate-900 leading-tight truncate">{c.name}</div>
+                                                        <div className="flex flex-wrap items-center gap-1.5 mt-1">
+                                                            <span className="text-[8px] font-black text-slate-400 bg-slate-50 px-1.5 py-0.5 rounded uppercase tracking-wider border border-slate-100">
+                                                                {c.source === 'NAME_SUBSET' ? 'Nome contido' : 'Similaridade'}
+                                                            </span>
+                                                            {typeof c.score === 'number' && (
+                                                                <span className="text-[8px] font-black text-blue-500 bg-blue-50 px-1.5 py-0.5 rounded uppercase tracking-wider border border-blue-100">
+                                                                    {Math.round(c.score * 100)}%
+                                                                </span>
+                                                            )}
+                                                            {c.alreadyLinkedTo && (
+                                                                <span className="text-[8px] font-black text-rose-500 bg-rose-50 px-1.5 py-0.5 rounded uppercase tracking-wider border border-rose-100" title={`Já vinculado a ${c.alreadyLinkedTo}`}>
+                                                                    Já vinculado
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                        {c.alreadyLinkedTo && (
+                                                            <p className="text-[9px] font-semibold text-rose-500/90 mt-1 leading-tight">Vinculado a {c.alreadyLinkedTo}</p>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                                <button
+                                                    onClick={() => handleApproveDoctorReview(r, c)}
+                                                    disabled={busy || !!c.alreadyLinkedTo}
+                                                    className={`w-full inline-flex items-center justify-center gap-2 px-4 py-2 rounded-xl text-[9px] font-black uppercase tracking-wider transition-all ${c.alreadyLinkedTo
+                                                        ? 'bg-slate-50 text-slate-300 cursor-not-allowed'
+                                                        : 'bg-emerald-500 text-white hover:bg-emerald-600 shadow-sm'} disabled:opacity-60`}
+                                                >
+                                                    {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Link2 className="h-3.5 w-3.5" />}
+                                                    Vincular este
+                                                </button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+                </div>
+            )}
+
             {activeTab === 'Profissionais' && (
                 <div className="bg-white/70 backdrop-blur-xl rounded-[32px] shadow-sm border border-slate-100/80 overflow-hidden animate-in fade-in slide-in-from-top-4 duration-500">
                     <div className="p-8 border-b border-slate-100/60 flex justify-between items-center bg-white/40">

@@ -149,6 +149,7 @@ model VismedDoctor {
 
   specialties VismedProfessionalSpecialty[]
   unifiedMappings ProfessionalUnifiedMapping[]
+  matchReviews DoctorMatchReview[]
 }
 
 model VismedSpecialty {
@@ -421,6 +422,34 @@ model ProfessionalUnifiedMapping {
   mapping                    SpecialtyServiceMapping? @relation(fields: [specialtyServiceMappingId], references: [id], onDelete: Cascade)
 
   @@unique([vismedDoctorId, doctoraliaDoctorId])
+}
+
+enum DoctorReviewStatus {
+  PENDING
+  RESOLVED
+  DISMISSED
+}
+
+// Fila de revisão manual para vínculos ambíguos de médicos: quando o motor de matching
+// detecta ambiguidade (múltiplos candidatos Doctoralia, ou outro médico VisMed casando
+// com o mesmo candidato), o auto-link é bloqueado e o caso vem para cá.
+model DoctorMatchReview {
+  id                          String             @id @default(uuid())
+  vismedDoctorId              String
+  // Array de candidatos: { doctoraliaDoctorUuid, doctoraliaDoctorId, name, source, score? }
+  candidates                  Json
+  reason                      String?
+  status                      DoctorReviewStatus @default(PENDING)
+  resolvedDoctoraliaDoctorId  String?            // uuid do DoctoraliaDoctor escolhido na aprovação
+  resolvedBy                  String?
+  resolvedAt                  DateTime?
+  createdAt                   DateTime           @default(now())
+  updatedAt                   DateTime           @updatedAt
+
+  vismedDoctor                VismedDoctor       @relation(fields: [vismedDoctorId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+  @@index([vismedDoctorId])
 }
 
 enum BookingOrigin {

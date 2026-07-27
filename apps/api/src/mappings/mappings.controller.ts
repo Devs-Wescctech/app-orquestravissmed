@@ -127,6 +127,39 @@ export class MappingsController {
         return this.mappingsService.createManualSpecialtyMatch(body.vismedSpecialtyId, body.doctoraliaServiceId, req.user.id);
     }
 
+    // ------------------------------------------------------------------------------------------
+    // FILA DE REVISÃO — Médicos com nomes ambíguos
+    // ------------------------------------------------------------------------------------------
+
+    @Get('doctors/reviews')
+    getDoctorReviews(@Request() req: any, @Query('clinicId') clinicId?: string) {
+        const finalClinicId = clinicId || req.user.roles[0]?.clinicId;
+        this.validateUserClinicAccess(req.user, finalClinicId);
+        return this.mappingsService.getDoctorReviews(finalClinicId);
+    }
+
+    @Post('doctors/reviews/:id/approve')
+    approveDoctorReview(
+        @Request() req: any,
+        @Param('id') id: string,
+        @Body() body: { doctoraliaDoctorUuid: string; clinicId?: string },
+    ) {
+        const finalClinicId = body.clinicId || req.user.roles[0]?.clinicId;
+        this.validateUserClinicAccess(req.user, finalClinicId);
+        return this.mappingsService.approveDoctorReview(id, body.doctoraliaDoctorUuid, finalClinicId, req.user.id);
+    }
+
+    @Post('doctors/reviews/:id/dismiss')
+    dismissDoctorReview(
+        @Request() req: any,
+        @Param('id') id: string,
+        @Body() body: { clinicId?: string },
+    ) {
+        const finalClinicId = body?.clinicId || req.user.roles[0]?.clinicId;
+        this.validateUserClinicAccess(req.user, finalClinicId);
+        return this.mappingsService.dismissDoctorReview(id, finalClinicId, req.user.id);
+    }
+
     @Post('insurance/approve')
     approveInsuranceMatch(
         @Request() req: any,
