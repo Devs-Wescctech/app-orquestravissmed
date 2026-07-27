@@ -125,19 +125,22 @@ export class QueueService implements OnModuleInit, OnModuleDestroy {
     }
 
     private async claimJob() {
-        const now = new Date();
-
+        // IMPORTANTE: usar (now() AT TIME ZONE 'utc') em vez de passar um Date do Node.
+        // As colunas são "timestamp without time zone" e o Prisma grava instantes em UTC;
+        // um parâmetro Date em $queryRaw chega como timestamptz e o Postgres o converte
+        // para o fuso do SERVIDOR na comparação. Em produção (banco em America/Sao_Paulo,
+        // UTC-3) isso fazia cada job só se tornar elegível 3 HORAS depois de criado.
         const jobs = await this.prisma.$queryRaw<any[]>`
             UPDATE "SyncJob"
             SET status = 'RUNNING',
-                "lockedAt" = ${now},
+                "lockedAt" = (now() AT TIME ZONE 'utc'),
                 "lockedBy" = ${WORKER_ID},
                 attempts = attempts + 1,
-                "updatedAt" = ${now}
+                "updatedAt" = (now() AT TIME ZONE 'utc')
             WHERE id = (
                 SELECT id FROM "SyncJob"
                 WHERE status IN ('PENDING', 'FAILED')
-                AND "nextRunAt" <= ${now}
+                AND "nextRunAt" <= (now() AT TIME ZONE 'utc')
                 AND (status != 'FAILED' OR attempts < "maxAttempts")
                 ORDER BY priority DESC, "nextRunAt" ASC
                 LIMIT 1
