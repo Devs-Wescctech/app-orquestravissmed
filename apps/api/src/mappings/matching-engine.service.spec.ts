@@ -166,6 +166,33 @@ describe('MatchingEngineService — doctor name subset matching', () => {
             expect(created).toHaveLength(0);
         });
 
+        it('fuzzy NÃO resgata candidato marcado como ambíguo pela 1.5 (ambiguidade reversa + dice >= 0.75)', async () => {
+            const { prisma, created } = buildPrisma({
+                // "Daniela Nogueira Furtado" é subset de v1 E de v2 (ambiguidade reversa),
+                // e tem dice alto (>= 0.75) contra o nome completo de v1 — sem a proteção,
+                // a camada fuzzy auto-vincularia o mesmo candidato ambíguo.
+                dDoctors: [{ id: 'd1', name: 'Daniela Nogueira Furtado' }],
+                otherVismedDocs: [{ id: 'v2', name: 'Daniela Nogueira Furtado Lima' }],
+            });
+            const svc = new MatchingEngineService(prisma);
+
+            await expect(svc.runMatchingForDoctor('v1')).resolves.toBe(false);
+            expect(created).toHaveLength(0);
+        });
+
+        it('fuzzy NÃO resgata quando há múltiplos candidatos subset (ambiguidade direta) mesmo com dice >= 0.75', async () => {
+            const { prisma, created } = buildPrisma({
+                dDoctors: [
+                    { id: 'd1', name: 'Daniela Nogueira Furtado' }, // dice alto vs nome completo
+                    { id: 'd2', name: 'Daniela Bucard' },
+                ],
+            });
+            const svc = new MatchingEngineService(prisma);
+
+            await expect(svc.runMatchingForDoctor('v1')).resolves.toBe(false);
+            expect(created).toHaveLength(0);
+        });
+
         it('NÃO vincula por subset quando o primeiro nome difere (cai para fuzzy e falha)', async () => {
             const { prisma, created } = buildPrisma({
                 dDoctors: [{ id: 'd1', name: 'Mariana Bucard' }],

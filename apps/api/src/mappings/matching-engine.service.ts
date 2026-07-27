@@ -678,6 +678,9 @@ export class MatchingEngineService {
         // Só vincula automaticamente quando NÃO há ambiguidade: exatamente um médico Doctoralia
         // casa por subconjunto E nenhum outro médico VisMed também casa com esse mesmo candidato.
         const subsetMatches = dDoctors.filter(d => this.isDoctorNameSubsetMatch(doc.name, d.name));
+        // Candidatos marcados como ambíguos pela camada 1.5: a camada fuzzy (2) NUNCA pode
+        // auto-vincular um deles — senão a proteção de ambiguidade seria contornada.
+        const ambiguousCandidateIds = new Set<string>();
         if (subsetMatches.length === 1) {
             const candidate = subsetMatches[0];
             const otherVismedDocs = await this.prisma.vismedDoctor.findMany({
@@ -690,8 +693,10 @@ export class MatchingEngineService {
                 this.logger.log(`Doctor name-subset match: "${doc.name}" → "${candidate.name}" — AUTO-LINKED`);
                 return true;
             }
+            ambiguousCandidateIds.add(candidate.id);
             this.logger.warn(`Doctor name-subset match ambíguo (outro médico VisMed também casa com "${candidate.name}") — pulando auto-link para "${doc.name}"`);
         } else if (subsetMatches.length > 1) {
+            for (const m of subsetMatches) ambiguousCandidateIds.add(m.id);
             this.logger.warn(`Doctor name-subset match ambíguo (${subsetMatches.length} candidatos Doctoralia) — pulando auto-link para "${doc.name}"`);
         }
 
@@ -709,6 +714,12 @@ export class MatchingEngineService {
 
         // Lower threshold for people names, 0.75 is reasonable if "Dr. Fulano" vs "Fulano"
         if (bestMatch && bestScore >= 0.75) {
+            if (ambiguousCandidateIds.has(bestMatch.id)) {
+                // A camada 1.5 marcou este candidato como ambíguo — o fuzzy não pode
+                // contornar a proteção. Caso fica para revisão/vínculo manual.
+                this.logger.warn(`Doctor fuzzy match (${(bestScore * 100).toFixed(0)}%) bloqueado: candidato "${bestMatch.name}" foi marcado como ambíguo pela camada de subconjunto — sem auto-link para "${doc.name}"`);
+                return false;
+            }
             await this.createDoctorMapping(doc.id, bestMatch.id);
             return true;
         }
