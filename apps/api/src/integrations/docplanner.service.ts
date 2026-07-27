@@ -38,6 +38,9 @@ export class DocplannerClient {
                 headers: {
                     'Content-Type': 'application/x-www-form-urlencoded',
                     'Authorization': `Basic ${basicAuth}`,
+                    // O fetch do Node não envia User-Agent; o WAF da Doctoralia pontua
+                    // requisições sem identificação como robô suspeito.
+                    'User-Agent': 'Orquestrador/1.0 (VisMed integration)',
                 },
                 body: 'grant_type=client_credentials&scope=integration',
             });
@@ -67,6 +70,7 @@ export class DocplannerClient {
         try {
             const headers: any = {
                 'Authorization': `Bearer ${this.accessToken}`,
+                'User-Agent': 'Orquestrador/1.0 (VisMed integration)',
             };
 
             const options: RequestInit = {
