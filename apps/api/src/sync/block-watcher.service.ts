@@ -107,6 +107,13 @@ export class BlockWatcherService implements OnModuleInit {
         // Sem integração completa não há o que sincronizar.
         if (!vismedConn || !doctoraliaConn) return;
 
+        // Respeita a pausa da Central de Sincronização: clínica pausada não deve gerar
+        // NENHUMA requisição à Doctoralia (inclusive OAuth) até ser retomada.
+        if (vismedConn.status === 'paused' || doctoraliaConn.status === 'paused') {
+            this.logger.debug(`[BLOCK-WATCHER] Clínica "${clinicName}": fila pausada — pulando vigia de bloqueios.`);
+            return;
+        }
+
         const idEmpresaGestora = vismedConn.clientId ? Number(vismedConn.clientId) : 286;
         const baseUrl = vismedConn.domain || undefined;
 
