@@ -82,6 +82,24 @@ export class DocplannerClient {
         return token;
     }
 
+    /** IP público de saída no instante da chamada (cache de 5min; falha vira "desconhecido"). */
+    private static egressIpCache: { ip: string; at: number } | null = null;
+    private async getEgressIp(): Promise<string> {
+        const c = DocplannerClient.egressIpCache;
+        if (c && Date.now() - c.at < 5 * 60 * 1000) return c.ip;
+        try {
+            const ctrl = new AbortController();
+            const t = setTimeout(() => ctrl.abort(), 5000);
+            const res = await fetch('https://api.ipify.org', { signal: ctrl.signal });
+            clearTimeout(t);
+            const ip = (await res.text()).trim();
+            DocplannerClient.egressIpCache = { ip, at: Date.now() };
+            return ip;
+        } catch {
+            return 'desconhecido';
+        }
+    }
+
     private async fetchNewToken(domain: string, cacheKey: string): Promise<string> {
         const url = `https://${domain}/oauth/v2/token`;
         const basicAuth = Buffer.from(`${this.clientId}:${this.clientSecret}`).toString('base64');
@@ -100,8 +118,27 @@ export class DocplannerClient {
 
         if (!response.ok) {
             const errorText = await response.text();
+            // Diagnóstico forense do bloqueio WAF: registra cabeçalhos da resposta,
+            // content-type e o IP público de saída NO INSTANTE da falha, para
+            // comparação entre execuções que funcionam e que falham.
+            const diag = [
+                `content-type=${response.headers.get('content-type')}`,
+                `server=${response.headers.get('server')}`,
+                `via=${response.headers.get('via')}`,
+                `x-amzn-waf-action=${response.headers.get('x-amzn-waf-action')}`,
+                `x-amzn-requestid=${response.headers.get('x-amzn-requestid')}`,
+                `x-amz-cf-id=${response.headers.get('x-amz-cf-id')}`,
+                `x-amz-cf-pop=${response.headers.get('x-amz-cf-pop')}`,
+                `x-cache=${response.headers.get('x-cache')}`,
+            ].join(' | ');
+            const egressIp = await this.getEgressIp();
+            this.logger.error(
+                `[AUTH-DIAG] Falha OAuth ${response.status} em ${url} | ip_saida=${egressIp} | ${diag} | corpo(200c)=${errorText.slice(0, 200).replace(/\s+/g, ' ')}`,
+            );
             throw new Error(`Failed to authenticate with Docplanner: ${response.status} ${errorText}`);
         }
+
+        this.logger.log(`[AUTH-DIAG] OAuth OK em ${url} | ip_saida=${await this.getEgressIp()}`);
 
         const data = await response.json() as any;
         // expires_in em segundos (padrão OAuth); margem de 60s para não usar token na iminência
