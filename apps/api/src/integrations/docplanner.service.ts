@@ -1,12 +1,31 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
+interface CachedToken {
+    token: string;
+    /** epoch ms após o qual o token não deve mais ser usado */
+    expiresAt: number;
+}
+
 @Injectable()
 export class DocplannerClient {
     private readonly logger = new Logger(DocplannerClient.name);
+
+    /**
+     * Cache GLOBAL de tokens OAuth por (domínio + clientId), compartilhado entre todas as
+     * instâncias do cliente. Sem isso, cada polling/sync/teste pedia um token novo
+     * (~milhares de POSTs /oauth/v2/token por dia), o que o AWS WAF da Doctoralia pontua
+     * como comportamento de robô abusivo e passa a responder com página de verificação
+     * (405 + captcha). Um token vale ~1h; reutilizá-lo reduz a ~24 autenticações/dia.
+     */
+    private static tokenCache = new Map<string, CachedToken>();
+    private static inflightAuth = new Map<string, Promise<string>>();
+
     private accessToken: string;
     private baseUrl: string;
     private authPromise: Promise<string> | null = null;
+    private clientId: string | null = null;
+    private clientSecret: string | null = null;
 
     constructor(private configService: ConfigService) {}
 
@@ -28,38 +47,80 @@ export class DocplannerClient {
     }
 
     async authenticate(clientId: string, clientSecret: string): Promise<string> {
-        this.authPromise = (async () => {
-            const domain = this.getBaseUrl().replace(/^https?:\/\//, '');
-            const url = `https://${domain}/oauth/v2/token`;
-            const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
-
-            const response = await fetch(url, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'Authorization': `Basic ${basicAuth}`,
-                    // O fetch do Node não envia User-Agent; o WAF da Doctoralia pontua
-                    // requisições sem identificação como robô suspeito.
-                    'User-Agent': 'Orquestrador/1.0 (VisMed integration)',
-                },
-                body: 'grant_type=client_credentials&scope=integration',
-            });
-
-            if (!response.ok) {
-                const errorText = await response.text();
-                throw new Error(`Failed to authenticate with Docplanner: ${response.status} ${errorText}`);
-            }
-
-            const data = await response.json() as any;
-            this.accessToken = data.access_token;
-            return this.accessToken;
-        })();
-        
+        this.clientId = clientId;
+        this.clientSecret = clientSecret;
+        this.authPromise = this.getToken(false);
         return this.authPromise;
     }
 
-    private async request(method: string, path: string, data?: any): Promise<any> {
-        if (this.authPromise) {
+    /** Obtém um token: do cache global se ainda válido; senão autentica (com dedupe de chamadas concorrentes). */
+    private async getToken(forceRefresh: boolean): Promise<string> {
+        const domain = this.getBaseUrl().replace(/^https?:\/\//, '');
+        const cacheKey = `${domain}|${this.clientId}`;
+
+        if (!forceRefresh) {
+            const cached = DocplannerClient.tokenCache.get(cacheKey);
+            if (cached && cached.expiresAt > Date.now()) {
+                this.accessToken = cached.token;
+                return cached.token;
+            }
+        } else {
+            DocplannerClient.tokenCache.delete(cacheKey);
+        }
+
+        // Dedupe: se outra instância já está autenticando este mesmo clientId, aguarda-a
+        // em vez de disparar outro POST /oauth/v2/token.
+        let inflight = DocplannerClient.inflightAuth.get(cacheKey);
+        if (!inflight) {
+            inflight = this.fetchNewToken(domain, cacheKey).finally(() => {
+                DocplannerClient.inflightAuth.delete(cacheKey);
+            });
+            DocplannerClient.inflightAuth.set(cacheKey, inflight);
+        }
+        const token = await inflight;
+        this.accessToken = token;
+        return token;
+    }
+
+    private async fetchNewToken(domain: string, cacheKey: string): Promise<string> {
+        const url = `https://${domain}/oauth/v2/token`;
+        const basicAuth = Buffer.from(`${this.clientId}:${this.clientSecret}`).toString('base64');
+
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Authorization': `Basic ${basicAuth}`,
+                // O fetch do Node não envia User-Agent; o WAF da Doctoralia pontua
+                // requisições sem identificação como robô suspeito.
+                'User-Agent': 'Orquestrador/1.0 (VisMed integration)',
+            },
+            body: 'grant_type=client_credentials&scope=integration',
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Failed to authenticate with Docplanner: ${response.status} ${errorText}`);
+        }
+
+        const data = await response.json() as any;
+        // expires_in em segundos (padrão OAuth); margem de 60s para não usar token na iminência
+        // de expirar. Fallback conservador de 50min se o campo não vier.
+        const ttlMs = (typeof data.expires_in === 'number' && data.expires_in > 120)
+            ? (data.expires_in - 60) * 1000
+            : 50 * 60 * 1000;
+        DocplannerClient.tokenCache.set(cacheKey, { token: data.access_token, expiresAt: Date.now() + ttlMs });
+        this.logger.log(`Novo token OAuth obtido para ${cacheKey.split('|')[0]} (válido por ~${Math.round(ttlMs / 60000)}min).`);
+        return data.access_token;
+    }
+
+    private async request(method: string, path: string, data?: any, isRetry = false): Promise<any> {
+        if (this.clientId) {
+            // Sempre passa pelo cache: pega token válido, renova se expirado, e re-tenta
+            // autenticar mesmo que a autenticação inicial (fire-and-forget do createClient)
+            // tenha falhado por um erro transitório — falha de auth não é cacheada.
+            await this.getToken(false);
+        } else if (this.authPromise) {
             await this.authPromise;
         }
         const domain = this.getBaseUrl().replace(/^https?:\/\//, '');
@@ -92,6 +153,13 @@ export class DocplannerClient {
             }
 
             if (!response.ok) {
+                // Token do cache pode ter sido revogado/expirado no servidor: renova UMA vez e repete.
+                if (response.status === 401 && !isRetry && this.clientId) {
+                    this.logger.warn(`401 em ${method} ${path} — renovando token OAuth e repetindo a chamada.`);
+                    await response.text().catch(() => undefined);
+                    await this.getToken(true);
+                    return this.request(method, path, data, true);
+                }
                 const errorText = await response.text();
                 this.logger.error(`Docplanner API Error: ${response.status} ${errorText} URL: ${url}`);
                 const error = new Error(`Docplanner API Error: ${response.status} ${errorText}`);
