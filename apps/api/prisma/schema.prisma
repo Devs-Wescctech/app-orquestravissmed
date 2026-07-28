@@ -77,6 +77,10 @@ model IntegrationConnection {
   clientSecret String?
   status       String   @default("disconnected") // connected, disconnected, error
   lastTestAt   DateTime?
+  // Token OAuth persistido (Doctoralia: validade ~24h). Sobrevive a restarts do container,
+  // para que UMA autenticação bem-sucedida por dia baste mesmo sob desafio do WAF.
+  cachedToken    String?
+  tokenExpiresAt DateTime?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 }

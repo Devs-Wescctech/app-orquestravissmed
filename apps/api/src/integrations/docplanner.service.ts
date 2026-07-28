@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { PrismaService } from '../prisma/prisma.service';
 
 interface CachedToken {
     token: string;
@@ -26,8 +27,16 @@ export class DocplannerClient {
     private authPromise: Promise<string> | null = null;
     private clientId: string | null = null;
     private clientSecret: string | null = null;
+    /** Persistência opcional do token (banco), para sobreviver a restarts do container. */
+    private persistLoad: (() => Promise<CachedToken | null>) | null = null;
+    private persistSave: ((t: CachedToken) => Promise<void>) | null = null;
 
     constructor(private configService: ConfigService) {}
+
+    setPersistence(load: () => Promise<CachedToken | null>, save: (t: CachedToken) => Promise<void>) {
+        this.persistLoad = load;
+        this.persistSave = save;
+    }
 
     setAccessToken(token: string) {
         this.accessToken = token;
@@ -53,6 +62,18 @@ export class DocplannerClient {
         return this.authPromise;
     }
 
+    /**
+     * Força a obtenção de um token NOVO (ignora memória e banco). Usado pelo renovador
+     * em segundo plano quando o token atual está perto de expirar — sem forçar, o
+     * getToken(false) devolveria o token ainda-válido e a renovação nunca aconteceria.
+     */
+    async forceTokenRefresh(clientId: string, clientSecret: string): Promise<string> {
+        this.clientId = clientId;
+        this.clientSecret = clientSecret;
+        this.authPromise = this.getToken(true);
+        return this.authPromise;
+    }
+
     /** Obtém um token: do cache global se ainda válido; senão autentica (com dedupe de chamadas concorrentes). */
     private async getToken(forceRefresh: boolean): Promise<string> {
         const domain = this.getBaseUrl().replace(/^https?:\/\//, '');
@@ -63,6 +84,20 @@ export class DocplannerClient {
             if (cached && cached.expiresAt > Date.now()) {
                 this.accessToken = cached.token;
                 return cached.token;
+            }
+            // Memória vazia (ex.: restart do container): tenta o token persistido no banco.
+            if (this.persistLoad) {
+                try {
+                    const persisted = await this.persistLoad();
+                    if (persisted && persisted.expiresAt > Date.now()) {
+                        DocplannerClient.tokenCache.set(cacheKey, persisted);
+                        this.accessToken = persisted.token;
+                        this.logger.log(`Token OAuth recuperado do banco para ${cacheKey.split('|')[0]} (válido por ~${Math.round((persisted.expiresAt - Date.now()) / 60000)}min).`);
+                        return persisted.token;
+                    }
+                } catch (err: any) {
+                    this.logger.warn(`Falha ao ler token persistido: ${err?.message}`);
+                }
             }
         } else {
             DocplannerClient.tokenCache.delete(cacheKey);
@@ -146,8 +181,12 @@ export class DocplannerClient {
         const ttlMs = (typeof data.expires_in === 'number' && data.expires_in > 120)
             ? (data.expires_in - 60) * 1000
             : 50 * 60 * 1000;
-        DocplannerClient.tokenCache.set(cacheKey, { token: data.access_token, expiresAt: Date.now() + ttlMs });
+        const entry: CachedToken = { token: data.access_token, expiresAt: Date.now() + ttlMs };
+        DocplannerClient.tokenCache.set(cacheKey, entry);
         this.logger.log(`Novo token OAuth obtido para ${cacheKey.split('|')[0]} (válido por ~${Math.round(ttlMs / 60000)}min).`);
+        if (this.persistSave) {
+            this.persistSave(entry).catch(err => this.logger.warn(`Falha ao persistir token: ${err?.message}`));
+        }
         return data.access_token;
     }
 
@@ -420,11 +459,31 @@ export class DocplannerClient {
 
 @Injectable()
 export class DocplannerService {
-    constructor(private configService: ConfigService) { }
+    constructor(
+        private configService: ConfigService,
+        private prisma: PrismaService,
+    ) { }
 
     createClient(domain: string, clientId: string, clientSecret: string): DocplannerClient {
         const client = new DocplannerClient(this.configService);
         client.setBaseUrl(domain);
+        // Persistência do token no banco (sobrevive a restarts; token Doctoralia vale ~24h).
+        client.setPersistence(
+            async () => {
+                const conn = await this.prisma.integrationConnection.findFirst({
+                    where: { provider: 'doctoralia', clientId },
+                    select: { cachedToken: true, tokenExpiresAt: true },
+                });
+                if (!conn?.cachedToken || !conn.tokenExpiresAt) return null;
+                return { token: conn.cachedToken, expiresAt: conn.tokenExpiresAt.getTime() };
+            },
+            async (t) => {
+                await this.prisma.integrationConnection.updateMany({
+                    where: { provider: 'doctoralia', clientId },
+                    data: { cachedToken: t.token, tokenExpiresAt: new Date(t.expiresAt) },
+                });
+            },
+        );
         // We start authentication but don't await here to match existing sync usage pattern.
         // In a real scenario, the first call to the client would await this or authenticate would be called explicitly.
         client.authenticate(clientId, clientSecret).catch(err => {
