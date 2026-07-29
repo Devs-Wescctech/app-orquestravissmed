@@ -14,6 +14,7 @@ import { MappingsModule } from './mappings/mappings.module';
 import { DoctorsModule } from './doctors/doctors.module';
 import { AppointmentsModule } from './appointments/appointments.module';
 import { BookingsModule } from './bookings/bookings.module';
+import { SettingsModule } from './settings/settings.module';
 
 @Module({
   imports: [
@@ -42,6 +43,7 @@ import { BookingsModule } from './bookings/bookings.module';
     }),
     SyncModule,
     MappingsModule,
+    SettingsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

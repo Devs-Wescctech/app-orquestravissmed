@@ -1,5 +1,4 @@
 'use client';
-import { useState } from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import {
@@ -18,6 +17,7 @@ import {
 import { cn } from '@/lib/utils';
 import { useAuthStore } from '@/lib/store';
 import { useClinicStore } from '@/lib/clinic-store';
+import { useUIStore } from '@/lib/ui-store';
 import Cookies from 'js-cookie';
 
 export function Sidebar() {
@@ -26,7 +26,8 @@ export function Sidebar() {
     const user = useAuthStore((state) => state.user);
     const logout = useAuthStore((state) => state.logout);
     const clearClinic = useClinicStore((s) => s.clearClinic);
-    const [isCollapsed, setIsCollapsed] = useState(false);
+    const isCollapsed = useUIStore((s) => s.sidebarCollapsed);
+    const toggleSidebar = useUIStore((s) => s.toggleSidebar);
 
     const isSuperAdmin = user?.roles?.some((r: any) => r.role === 'SUPER_ADMIN');
 
@@ -66,7 +67,7 @@ export function Sidebar() {
                             <div className="font-semibold text-lg tracking-tight text-slate-100 whitespace-nowrap drop-shadow-md">VisMed</div>
                         </div>
                         <button 
-                            onClick={() => setIsCollapsed(!isCollapsed)} 
+                            onClick={toggleSidebar} 
                             className="p-1.5 rounded-lg text-slate-500 hover:bg-slate-800 hover:text-slate-200 transition-all flex items-center justify-center group"
                             title={isCollapsed ? "Expandir Menu" : "Recolher Menu"}
                         >
@@ -164,12 +165,15 @@ export function Sidebar() {
                     <Link
                         href="/settings"
                         className={cn(
-                            "flex items-center gap-3 py-2.5 rounded-lg text-sm font-medium text-slate-400 hover:bg-slate-800 hover:text-slate-200 transition-all duration-200 mb-2 w-full group",
+                            "flex items-center gap-3 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 mb-2 w-full group",
+                            pathname === '/settings' || pathname.startsWith('/settings/')
+                                ? "bg-emerald-500/10 text-emerald-400"
+                                : "text-slate-400 hover:bg-slate-800 hover:text-slate-200",
                             isCollapsed ? "justify-center px-0" : "px-3"
                         )}
                         title={isCollapsed ? "Configurações" : undefined}
                     >
-                        <Settings className={cn("h-[18px] w-[18px] shrink-0 text-slate-500 group-hover:text-slate-300 transition-transform", isCollapsed && "group-hover:rotate-90")} />
+                        <Settings className={cn("h-[18px] w-[18px] shrink-0 transition-transform", (pathname === '/settings' || pathname.startsWith('/settings/')) ? "text-emerald-400" : "text-slate-500 group-hover:text-slate-300", isCollapsed && "group-hover:rotate-90")} />
                         {!isCollapsed && <span className="whitespace-nowrap overflow-hidden text-ellipsis">Configurações</span>}
                     </Link>
                     
