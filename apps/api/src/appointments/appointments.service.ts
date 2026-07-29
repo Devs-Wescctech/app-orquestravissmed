@@ -39,6 +39,9 @@ export class AppointmentsService {
 
     // ────────────────────── Calendar Status ──────────────────────
 
+    // Clinics with a background calendar-status refresh already in flight (avoid stampede).
+    private static refreshingClinics = new Set<string>();
+
     async getCalendarStatus(clinicId: string) {
         const startTime = Date.now();
 
@@ -55,28 +58,16 @@ export class AppointmentsService {
                 where: { clinicId, entityType: 'DOCTOR', status: 'LINKED' },
             });
 
-            const client = this.docplanner.createClient(conn.domain || 'doctoralia.com.br', conn.clientId, conn.clientSecret || '');
-
-            let facilityId: string | null = null;
-            const needsEnrich = mappings.some(m => {
-                const c = m.conflictData as any || {};
-                return (!c.facilityId || !c.address?.id) && m.externalId;
-            });
-            if (needsEnrich) {
-                facilityId = await this.resolveFacilityId(client);
-            }
-
+            // Responde IMEDIATAMENTE com os dados persistidos no banco.
+            // As chamadas à Doctoralia (enriquecimento + refresh de status) rodam em
+            // segundo plano: com o rate-limit global elas podem esperar minutos na fila
+            // e derrubavam o proxy do painel (socket hang up / 500).
             const doctors: any[] = [];
+            let needsBackgroundRefresh = false;
             for (const m of mappings) {
-                let cd = m.conflictData as any || {};
-
-                if ((!cd.facilityId || !cd.address?.id) && m.externalId && facilityId) {
-                    cd = await this.enrichDoctorData(m, cd, client, facilityId, m.externalId);
-                }
-
-                if ((!cd.calendarStatus || cd.calendarStatus === 'unknown') && cd.facilityId && cd.address?.id) {
-                    cd = await this.refreshCalendarStatus(m, cd, client, m.externalId);
-                }
+                const cd = m.conflictData as any || {};
+                if ((!cd.facilityId || !cd.address?.id) && m.externalId) needsBackgroundRefresh = true;
+                if ((!cd.calendarStatus || cd.calendarStatus === 'unknown') && cd.facilityId && cd.address?.id) needsBackgroundRefresh = true;
 
                 doctors.push({
                     externalId: m.externalId,
@@ -85,6 +76,13 @@ export class AppointmentsService {
                     addressId: cd.address?.id || null,
                     facilityId: cd.facilityId || null,
                 });
+            }
+
+            if (needsBackgroundRefresh && !AppointmentsService.refreshingClinics.has(clinicId)) {
+                AppointmentsService.refreshingClinics.add(clinicId);
+                this.refreshCalendarStatusInBackground(clinicId, conn, mappings)
+                    .catch(e => this.logger.warn(`Background calendar refresh failed for clinic ${clinicId}: ${e?.message}`))
+                    .finally(() => AppointmentsService.refreshingClinics.delete(clinicId));
             }
 
             const hasAnyEnabled = doctors.some(d => d.calendarStatus === 'enabled');
@@ -110,6 +108,40 @@ export class AppointmentsService {
                 timedOut: isTimeout,
             };
         }
+    }
+
+    // ────────────────────── Background Calendar Refresh ──────────────────────
+
+    /**
+     * Roda em segundo plano (sem bloquear a resposta do painel): enriquece
+     * facility/endereço e atualiza o calendarStatus dos médicos na Doctoralia,
+     * persistindo em mapping.conflictData. A próxima carga do painel já lê os
+     * dados atualizados direto do banco.
+     */
+    private async refreshCalendarStatusInBackground(clinicId: string, conn: any, mappings: any[]) {
+        const client = this.docplanner.createClient(conn.domain || 'doctoralia.com.br', conn.clientId, conn.clientSecret || '');
+
+        let facilityId: string | null = null;
+        const needsEnrich = mappings.some(m => {
+            const c = m.conflictData as any || {};
+            return (!c.facilityId || !c.address?.id) && m.externalId;
+        });
+        if (needsEnrich) {
+            facilityId = await this.resolveFacilityId(client);
+        }
+
+        for (const m of mappings) {
+            let cd = m.conflictData as any || {};
+
+            if ((!cd.facilityId || !cd.address?.id) && m.externalId && facilityId) {
+                cd = await this.enrichDoctorData(m, cd, client, facilityId, m.externalId);
+            }
+
+            if ((!cd.calendarStatus || cd.calendarStatus === 'unknown') && cd.facilityId && cd.address?.id) {
+                await this.refreshCalendarStatus(m, cd, client, m.externalId);
+            }
+        }
+        this.logger.log(`Background calendar refresh concluído para clinic ${clinicId} (${mappings.length} mapping(s))`);
     }
 
     // ────────────────────── Resolve Facility ID ──────────────────────
