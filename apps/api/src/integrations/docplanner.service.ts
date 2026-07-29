@@ -22,6 +22,47 @@ export class DocplannerClient {
     private static tokenCache = new Map<string, CachedToken>();
     private static inflightAuth = new Map<string, Promise<string>>();
 
+    /**
+     * Limitador GLOBAL de vazão (todas as instâncias/conexões): o AWS WAF da Doctoralia
+     * barra IPs fora do Brasil que excedem 500 requisições por janela de 5 minutos
+     * (informado pelo suporte em 29/07/2026). Limitamos a 400/5min (margem de 20%),
+     * enfileirando o excedente em vez de estourar a regra — o sync fica mais lento
+     * nos picos, mas nunca dispara o bloqueio.
+     */
+    private static readonly RATE_LIMIT = 400;
+    private static readonly RATE_WINDOW_MS = 5 * 60 * 1000;
+    /** Timestamps (epoch ms) das requisições feitas dentro da janela corrente. */
+    private static rateTimestamps: number[] = [];
+    /** Fila FIFO: garante ordem de chegada e evita estouro por corrida entre chamadas concorrentes. */
+    private static rateQueue: Promise<void> = Promise.resolve();
+    private static lastThrottleLogAt = 0;
+
+    /** Aguarda (se necessário) até haver espaço na janela de vazão e registra a requisição. */
+    private static acquireRateSlot(logger: Logger): Promise<void> {
+        const run = async (): Promise<void> => {
+            for (;;) {
+                const now = Date.now();
+                const cutoff = now - DocplannerClient.RATE_WINDOW_MS;
+                const ts = DocplannerClient.rateTimestamps;
+                while (ts.length && ts[0] <= cutoff) ts.shift();
+                if (ts.length < DocplannerClient.RATE_LIMIT) {
+                    ts.push(now);
+                    return;
+                }
+                const waitMs = Math.max(ts[0] + DocplannerClient.RATE_WINDOW_MS - now, 250);
+                if (now - DocplannerClient.lastThrottleLogAt > 30_000) {
+                    DocplannerClient.lastThrottleLogAt = now;
+                    logger.warn(`[RATE-LIMIT] Janela de ${DocplannerClient.RATE_LIMIT} req/5min cheia — segurando requisições por ~${Math.ceil(waitMs / 1000)}s para não disparar o WAF da Doctoralia.`);
+                }
+                await new Promise(r => setTimeout(r, waitMs));
+            }
+        };
+        // Encadeia na fila para preservar ordem de chegada; a fila nunca rejeita.
+        const slot = DocplannerClient.rateQueue.then(run);
+        DocplannerClient.rateQueue = slot.catch(() => undefined);
+        return slot;
+    }
+
     private accessToken: string;
     private baseUrl: string;
     private authPromise: Promise<string> | null = null;
@@ -139,6 +180,7 @@ export class DocplannerClient {
         const url = `https://${domain}/oauth/v2/token`;
         const basicAuth = Buffer.from(`${this.clientId}:${this.clientSecret}`).toString('base64');
 
+        await DocplannerClient.acquireRateSlot(this.logger);
         const response = await fetch(url, {
             method: 'POST',
             headers: {
@@ -201,6 +243,9 @@ export class DocplannerClient {
         }
         const domain = this.getBaseUrl().replace(/^https?:\/\//, '');
         const url = `https://${domain}${path}`;
+        // Adquire o slot ANTES de armar o timeout de 30s — a espera na fila de vazão
+        // não pode consumir o tempo da requisição em si.
+        await DocplannerClient.acquireRateSlot(this.logger);
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 30000);
 
