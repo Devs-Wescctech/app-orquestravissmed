@@ -139,7 +139,7 @@ export default function ClinicsManagement() {
 
             // Then save integrations sequentially
             for (const integration of integrations) {
-                // For VisMed, if domain is provided but clientId is not explicit, we might need a better check
+                // For VissMed, if domain is provided but clientId is not explicit, we might need a better check
                 // but usually both are provided.
                 if (integration.clientId || integration.domain || integration.facilityId) {
                     await api.put(`/clinics/${clinicId}`, { integrationArgs: integration });
@@ -185,7 +185,7 @@ export default function ClinicsManagement() {
                             </span>
                         </div>
                         <h1 className="text-4xl font-black text-slate-900 tracking-tighter uppercase leading-none">CLÍNICAS</h1>
-                        <p className="text-sm text-slate-500 font-bold uppercase tracking-wide mt-1">Gerenciamento completo do cluster de unidades e hubs VisMed.</p>
+                        <p className="text-sm text-slate-500 font-bold uppercase tracking-wide mt-1">Gerenciamento completo do cluster de unidades e hubs VissMed.</p>
                     </div>
                 </div>
                 <button onClick={handleCreateNew} className="flex items-center gap-2 bg-slate-900 hover:bg-black text-white px-7 py-3.5 rounded-2xl text-[10px] font-black uppercase tracking-[2px] shadow-xl transition-all hover:-translate-y-1 active:scale-95 group">
@@ -275,7 +275,7 @@ export default function ClinicsManagement() {
                                         <div className={`h-12 w-12 rounded-2xl flex items-center justify-center border-2 transition-all duration-700 ${clinicIntegrations(selectedClinic).doctoralia ? 'bg-emerald-50 border-emerald-100 text-primary shadow-lg shadow-emerald-100/50' : 'bg-slate-50 border-slate-100 text-slate-300'}`} title="Doctoralia">
                                             <Globe className="h-6 w-6" />
                                         </div>
-                                        <div className={`h-12 w-12 rounded-2xl flex items-center justify-center border-2 transition-all duration-700 ${clinicIntegrations(selectedClinic).vismed ? 'bg-primary/5 border-primary/20 text-primary shadow-lg shadow-primary/10' : 'bg-slate-50 border-slate-100 text-slate-300'}`} title="VisMed">
+                                        <div className={`h-12 w-12 rounded-2xl flex items-center justify-center border-2 transition-all duration-700 ${clinicIntegrations(selectedClinic).vismed ? 'bg-primary/5 border-primary/20 text-primary shadow-lg shadow-primary/10' : 'bg-slate-50 border-slate-100 text-slate-300'}`} title="VissMed">
                                             <Activity className="h-6 w-6" />
                                         </div>
                                     </div>
@@ -345,7 +345,7 @@ export default function ClinicsManagement() {
                                                 <div className="h-10 w-10 rounded-xl bg-slate-900 flex items-center justify-center text-primary shadow-lg">
                                                     <Globe className="h-5 w-5" />
                                                 </div>
-                                                <h4 className="text-[13px] font-black text-slate-900 uppercase tracking-[2px]">Endereço VisMed / Sincronismo Global</h4>
+                                                <h4 className="text-[13px] font-black text-slate-900 uppercase tracking-[2px]">Endereço VissMed / Sincronismo Global</h4>
                                             </div>
 
                                             <div className="grid grid-cols-12 gap-6 mb-6">
@@ -383,7 +383,7 @@ export default function ClinicsManagement() {
 
                                 {activeTab === 'Canais de Integração' && (
                                     <div className="space-y-10 max-w-3xl animate-in fade-in duration-700">
-                                        {/* VisMed Integration Card */}
+                                        {/* VissMed Integration Card */}
                                         <div className="p-8 rounded-[32px] bg-gradient-to-br from-primary/5 to-white border border-primary/10 shadow-sm flex flex-col gap-8 transition-all hover:shadow-xl group">
                                             <div className="flex flex-col sm:flex-row justify-between items-center gap-8">
                                                 <div className="flex gap-6">
@@ -391,7 +391,7 @@ export default function ClinicsManagement() {
                                                         <Activity className="h-8 w-8 text-primary" />
                                                     </div>
                                                     <div>
-                                                        <h4 className="text-xl font-black text-slate-900 tracking-tighter uppercase">Infrastrutura Central VisMed</h4>
+                                                        <h4 className="text-xl font-black text-slate-900 tracking-tighter uppercase">Infrastrutura Central VissMed</h4>
                                                         <div className="flex items-center gap-2 mt-2">
                                                             <div className={`h-1.5 w-1.5 rounded-full ${clinicIntegrations(selectedClinic).vismed ? "bg-primary" : "bg-rose-500"}`}></div>
                                                             <p className="text-[10px] font-black text-slate-400 uppercase tracking-[2px]">Bridge: <span className={clinicIntegrations(selectedClinic).vismed ? "text-primary" : "text-rose-500"}>{clinicIntegrations(selectedClinic).vismed ? "Link Estabelecido" : "Offline"}</span></p>
@@ -404,7 +404,7 @@ export default function ClinicsManagement() {
                                                     type="button"
                                                     className="w-full sm:w-auto h-14 px-8 rounded-2xl bg-white border-2 border-slate-200 text-slate-900 font-black text-[10px] uppercase tracking-[2px] hover:border-primary hover:text-primary transition-all active:scale-95 disabled:opacity-50"
                                                 >
-                                                    {testingId === `vismed-${selectedClinic.id}` ? 'Validando...' : 'Checar Fluxo VisMed'}
+                                                    {testingId === `vismed-${selectedClinic.id}` ? 'Validando...' : 'Checar Fluxo VissMed'}
                                                 </button>
                                             </div>
 
@@ -480,7 +480,7 @@ export default function ClinicsManagement() {
                 </div>
 
                 <div className="pt-10 border-t border-slate-100/40 text-center col-span-12">
-                    <p className="text-[10px] font-black text-slate-400 uppercase tracking-[5px] opacity-30 hover:opacity-100 transition-opacity">Clinic Governance Shield • VisMed v2.4.0 • Enterprise Edition</p>
+                    <p className="text-[10px] font-black text-slate-400 uppercase tracking-[5px] opacity-30 hover:opacity-100 transition-opacity">Clinic Governance Shield • VissMed v2.4.0 • Enterprise Edition</p>
                 </div>
             </div>
 

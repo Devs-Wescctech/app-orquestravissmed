@@ -95,7 +95,7 @@ export default function AdminClinicsPage() {
 
             if (editingClinic) {
                 await api.put(`/clinics/${editingClinic.id}`, payload);
-                // Save VisMed integration
+                // Save VissMed integration
                 if (formVismedNotes || formVismedActive) {
                     await api.put(`/clinics/${editingClinic.id}`, {
                         integrationArgs: {
@@ -151,7 +151,7 @@ export default function AdminClinicsPage() {
                     </div>
                     <h1 className="text-5xl font-black tracking-tighter text-slate-900 uppercase">Clínicas</h1>
                     <p className="text-slate-400 font-bold uppercase text-[10px] tracking-[4px]">
-                        Gerenciamento completo do cluster de unidades e hubs VisMed.
+                        Gerenciamento completo do cluster de unidades e hubs VissMed.
                     </p>
                 </div>
                 <button
@@ -183,7 +183,7 @@ export default function AdminClinicsPage() {
                             <th className="px-10 py-6 font-black">Cluster Clínico</th>
                             <th className="px-10 py-6 font-black">Cadastro Fiscal</th>
                             <th className="px-10 py-6 text-center font-black">Status Operacional</th>
-                            <th className="px-10 py-6 text-center font-black">Ecossistema VisMed</th>
+                            <th className="px-10 py-6 text-center font-black">Ecossistema VissMed</th>
                             <th className="px-10 py-6 text-right font-black">Ações</th>
                         </tr>
                     </thead>
@@ -243,7 +243,7 @@ export default function AdminClinicsPage() {
                                                     onClick={() => handleTestVismedIntegration(clinic.id)}
                                                     disabled={testingId === `vismed-${clinic.id}`}
                                                     className="p-2 bg-white rounded-xl border border-slate-100 text-slate-400 hover:text-primary hover:border-primary/30 hover:shadow-lg transition-all active:scale-90"
-                                                    title="Validar Bridge VisMed"
+                                                    title="Validar Bridge VissMed"
                                                 >
                                                     {testingId === `vismed-${clinic.id}` ? (
                                                         <Loader2 className="h-4 w-4 animate-spin" />
@@ -319,7 +319,7 @@ export default function AdminClinicsPage() {
                                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
                                     <div className="space-y-2">
                                         <label className="text-[10px] font-black text-slate-400 uppercase tracking-[2px] ml-1">Razão Social / Nome Fantasia *</label>
-                                        <input value={formName} onChange={(e) => setFormName(e.target.value)} className="w-full h-14 rounded-[20px] border-2 border-slate-100 bg-white px-5 text-[15px] font-black shadow-sm focus:border-primary focus:ring-4 focus:ring-primary/5 outline-none transition-all" placeholder="Ex: Matriz VisMed" />
+                                        <input value={formName} onChange={(e) => setFormName(e.target.value)} className="w-full h-14 rounded-[20px] border-2 border-slate-100 bg-white px-5 text-[15px] font-black shadow-sm focus:border-primary focus:ring-4 focus:ring-primary/5 outline-none transition-all" placeholder="Ex: Matriz VissMed" />
                                     </div>
                                     <div className="space-y-2">
                                         <label className="text-[10px] font-black text-slate-400 uppercase tracking-[2px] ml-1">CNPJ / Registro Fiscal</label>
@@ -397,13 +397,13 @@ export default function AdminClinicsPage() {
                                 </div>
                             </div>
 
-                            {/* VisMed Integration Hub */}
+                            {/* VissMed Integration Hub */}
                             <div className="space-y-6 border-t border-slate-100 pt-10">
                                 <div className="flex items-center gap-3">
                                     <div className="h-8 w-8 rounded-lg bg-emerald-50 flex items-center justify-center text-primary">
                                         <Plug className="h-4 w-4" />
                                     </div>
-                                    <h3 className="text-[12px] font-black text-slate-900 uppercase tracking-[2px]">Hub de Integração VisMed Central</h3>
+                                    <h3 className="text-[12px] font-black text-slate-900 uppercase tracking-[2px]">Hub de Integração VissMed Central</h3>
                                 </div>
                                 <div className="bg-emerald-50/50 border border-emerald-100 rounded-[24px] p-6 space-y-6">
                                     <label className="flex items-center gap-3 cursor-pointer group">

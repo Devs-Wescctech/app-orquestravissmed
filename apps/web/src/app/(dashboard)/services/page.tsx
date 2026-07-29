@@ -88,7 +88,7 @@ export default function ServicesCatalogPage() {
           Catálogo de Serviços <span className="text-emerald-500">Doctoralia</span>
         </h1>
         <p className="text-slate-500 mt-1">
-          Pesquise no catálogo global de serviços integrados ao sistema VisMed.
+          Pesquise no catálogo global de serviços integrados ao sistema VissMed.
         </p>
       </div>
 

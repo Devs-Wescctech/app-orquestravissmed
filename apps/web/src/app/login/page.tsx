@@ -47,7 +47,7 @@ export default function LoginPage() {
                     </div>
                 </div>
                 <h2 className="mt-6 text-center text-3xl font-extrabold text-slate-900">
-                    Entrar no VisMed
+                    Entrar no VissMed
                 </h2>
                 <p className="mt-2 text-center text-sm text-slate-600">
                     Suíte Executiva & Gestão de Integrações

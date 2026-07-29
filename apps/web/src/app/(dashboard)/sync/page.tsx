@@ -229,11 +229,11 @@ export default function SyncDashboardPage() {
                     </div>
                 </div>
 
-                {/* VisMed Base */}
+                {/* VissMed Base */}
                 <div className="bg-slate-900 rounded-[32px] p-6 shadow-2xl flex flex-col justify-between h-40 transition-all duration-300 hover:scale-[1.02] hover:shadow-primary/20 group relative overflow-hidden">
                     <div className="absolute top-0 right-0 w-32 h-32 bg-primary/20 rounded-full blur-3xl -mr-16 -mt-16 animate-pulse"></div>
                     <div className="flex justify-between items-start relative z-10">
-                        <h3 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest leading-tight">VisMed<br />Ecosystem</h3>
+                        <h3 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest leading-tight">VissMed<br />Ecosystem</h3>
                         <div className={`h-10 w-10 rounded-2xl flex items-center justify-center backdrop-blur-sm transition-all ${
                             status?.vismed.connected ? 'bg-white/10 text-primary group-hover:bg-primary group-hover:text-white' : 'bg-rose-500/20 text-rose-400'
                         }`}>
@@ -280,14 +280,14 @@ export default function SyncDashboardPage() {
                 {/* Especialidades */}
                 <div className="bg-white/70 backdrop-blur-xl rounded-[32px] p-6 shadow-sm border border-slate-100/60 flex flex-col justify-between h-40 transition-all duration-300 hover:shadow-xl hover:-translate-y-1 group">
                     <div className="flex justify-between items-start">
-                        <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest leading-tight">Especialidades<br />VisMed</h3>
+                        <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest leading-tight">Especialidades<br />VissMed</h3>
                         <div className="h-10 w-10 bg-slate-50 text-slate-400 rounded-2xl flex items-center justify-center transition-all group-hover:bg-blue-600 group-hover:text-white group-hover:shadow-lg">
                             <Stethoscope className="h-5 w-5" />
                         </div>
                     </div>
                     <div>
                         <div className="text-4xl font-black text-slate-900 tracking-tighter">{status?.vismed.stats.specialties || 0}</div>
-                        <p className="text-[10px] font-black text-slate-500 mt-1 uppercase tracking-widest">Na Base VisMed</p>
+                        <p className="text-[10px] font-black text-slate-500 mt-1 uppercase tracking-widest">Na Base VissMed</p>
                     </div>
                 </div>
 
@@ -301,7 +301,7 @@ export default function SyncDashboardPage() {
                     </div>
                     <div>
                         <div className="text-4xl font-black text-slate-900 tracking-tighter">{status?.vismed.stats.units || 0}</div>
-                        <p className="text-[10px] font-black text-slate-500 mt-1 uppercase tracking-widest">Rede VisMed</p>
+                        <p className="text-[10px] font-black text-slate-500 mt-1 uppercase tracking-widest">Rede VissMed</p>
                     </div>
                 </div>
             </div>
@@ -382,13 +382,13 @@ export default function SyncDashboardPage() {
             {/* Integration Cards */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
 
-                {/* VisMed API Card */}
+                {/* VissMed API Card */}
                 <div className="bg-white/70 backdrop-blur-2xl rounded-[32px] shadow-sm border border-slate-100/80 overflow-hidden flex flex-col group/container transition-all hover:shadow-xl">
                     <div className="p-8 border-b border-slate-100/60 flex justify-between items-center bg-white/40">
                         <div>
                             <h2 className="text-lg font-black text-slate-900 flex items-center gap-3 tracking-tighter uppercase">
                                 <Zap className="h-5 w-5 text-primary" />
-                                VisMed API
+                                VissMed API
                             </h2>
                             <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mt-1">Central de Dados</p>
                         </div>
@@ -523,7 +523,7 @@ export default function SyncDashboardPage() {
                                         </div>
                                         <div>
                                             <h4 className="font-black text-base text-slate-900 leading-none group-hover/item:text-primary transition-colors">
-                                                {run.type === 'full' ? 'Doctoralia (Completa)' : run.type === 'vismed-full' ? 'VisMed (Completa)' : 'Parcial'}
+                                                {run.type === 'full' ? 'Doctoralia (Completa)' : run.type === 'vismed-full' ? 'VissMed (Completa)' : 'Parcial'}
                                             </h4>
                                             <div className="flex items-center gap-3 mt-2">
                                                 <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest bg-slate-100 px-2 py-0.5 rounded-lg">ID #{run.id.slice(0, 6)}</span>
@@ -584,7 +584,7 @@ export default function SyncDashboardPage() {
                             </pre>
                         </div>
                         <div className="p-6 border-t border-white/5 bg-[#1e1e1e] flex justify-between items-center">
-                            <span className="text-[10px] font-black text-slate-500 uppercase tracking-[3px]">VisMed Secure Logs</span>
+                            <span className="text-[10px] font-black text-slate-500 uppercase tracking-[3px]">VissMed Secure Logs</span>
                             <button onClick={() => navigator.clipboard.writeText(JSON.stringify(selectedRunData, null, 4))} className="bg-white/5 hover:bg-white/10 text-white px-6 py-3 rounded-2xl text-[10px] font-black uppercase tracking-[2px] transition-all">
                                 Copiar Objeto
                             </button>
@@ -595,7 +595,7 @@ export default function SyncDashboardPage() {
 
             <div className="text-center pt-8 border-t border-slate-100/40">
                 <p className="text-[10px] font-black text-slate-400 uppercase tracking-[4px] leading-relaxed opacity-50 transition-opacity hover:opacity-100">
-                    Sincronização Integrada • VisMed + Doctoralia Pipeline • 2026 Build
+                    Sincronização Integrada • VissMed + Doctoralia Pipeline • 2026 Build
                 </p>
             </div>
         </div>

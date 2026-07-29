@@ -188,7 +188,7 @@ export default function DashboardOverview() {
                                 </h3>
                                 <p className="text-xs font-bold text-amber-700 mt-1">
                                     {skippedAlerts.doctors.some((d) => d.reason === 'VISMED_CREATE_FAILED')
-                                        ? 'Alguns agendamentos precisam de atenção: médico sem vínculo com a Doctoralia e/ou agendamento da Doctoralia que a VisMed não confirmou — nestes últimos, agende manualmente na VisMed. Os vínculos de médico são resolvidos na '
+                                        ? 'Alguns agendamentos precisam de atenção: médico sem vínculo com a Doctoralia e/ou agendamento da Doctoralia que a VissMed não confirmou — nestes últimos, agende manualmente na VissMed. Os vínculos de médico são resolvidos na '
                                         : `Médico${skippedAlerts.doctors.length > 1 ? 's' : ''} sem vínculo com a Doctoralia — os horários abaixo continuam livres lá, com risco de overbooking. Vincule o${skippedAlerts.doctors.length > 1 ? 's' : ''} profissiona${skippedAlerts.doctors.length > 1 ? 'is' : 'l'} na `}
                                     <Link href="/mapping" className="underline decoration-2 underline-offset-2 text-amber-800 hover:text-amber-900">
                                         Central de Mapeamento
@@ -204,7 +204,7 @@ export default function DashboardOverview() {
                                                 <span className="text-[10px] font-black text-white bg-amber-500 rounded-full px-2 py-0.5">{d.count}</span>
                                             </div>
                                             {d.reason === 'VISMED_CREATE_FAILED' && (
-                                                <div className="text-[10px] font-black text-red-600 mt-1 uppercase tracking-wide">Falha ao criar na VisMed — agendar manualmente</div>
+                                                <div className="text-[10px] font-black text-red-600 mt-1 uppercase tracking-wide">Falha ao criar na VissMed — agendar manualmente</div>
                                             )}
                                             {d.appointments.slice(0, 3).map((a) => (
                                                 <div key={a.id} className="mt-1">
@@ -236,13 +236,13 @@ export default function DashboardOverview() {
                                                                 )}
                                                                 {a.vismedRequestPayload && (
                                                                     <div>
-                                                                        <div className="text-[10px] font-black text-slate-400 uppercase">Dados enviados à VisMed</div>
+                                                                        <div className="text-[10px] font-black text-slate-400 uppercase">Dados enviados à VissMed</div>
                                                                         <pre className="text-[9px] text-emerald-300 whitespace-pre-wrap break-all mt-0.5">{JSON.stringify(a.vismedRequestPayload, null, 1)}</pre>
                                                                     </div>
                                                                 )}
                                                                 {a.vismedResponse && (
                                                                     <div>
-                                                                        <div className="text-[10px] font-black text-slate-400 uppercase">Resposta da VisMed</div>
+                                                                        <div className="text-[10px] font-black text-slate-400 uppercase">Resposta da VissMed</div>
                                                                         <pre className="text-[9px] text-red-300 whitespace-pre-wrap break-all mt-0.5">{JSON.stringify(a.vismedResponse, null, 1)}</pre>
                                                                     </div>
                                                                 )}
@@ -304,7 +304,7 @@ export default function DashboardOverview() {
                 <div className="bg-slate-900 rounded-[32px] p-6 shadow-2xl flex flex-col justify-between h-40 transition-all duration-300 hover:scale-[1.02] hover:shadow-primary/20 group relative overflow-hidden">
                     <div className="absolute top-0 right-0 w-32 h-32 bg-primary/20 rounded-full blur-3xl -mr-16 -mt-16 animate-pulse"></div>
                     <div className="flex justify-between items-start relative z-10">
-                        <h3 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest leading-tight">VisMed<br />Ecosystem</h3>
+                        <h3 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest leading-tight">VissMed<br />Ecosystem</h3>
                         <div className="h-10 w-10 bg-white/10 rounded-2xl flex items-center justify-center text-primary backdrop-blur-sm transition-all group-hover:bg-primary group-hover:text-white">
                             <Activity className="h-5 w-5" />
                         </div>
@@ -356,7 +356,7 @@ export default function DashboardOverview() {
                     </div>
                     <div>
                         <div className="text-4xl font-black text-slate-900 tracking-tighter">{metrics.activeClinics}</div>
-                        <p className="text-[10px] font-black text-slate-500 mt-1 uppercase tracking-widest">Rede VisMed</p>
+                        <p className="text-[10px] font-black text-slate-500 mt-1 uppercase tracking-widest">Rede VissMed</p>
                     </div>
                 </div>
 
@@ -484,7 +484,7 @@ export default function DashboardOverview() {
 
             <div className="text-center pt-8 border-t border-slate-100/40">
                 <p className="text-[10px] font-black text-slate-400 uppercase tracking-[4px] leading-relaxed opacity-50 transition-opacity hover:opacity-100">
-                    Sincronização Ativa • VisMed Integrated Ecosystem • 2026 Build
+                    Sincronização Ativa • VissMed Integrated Ecosystem • 2026 Build
                 </p>
             </div>
         </div>

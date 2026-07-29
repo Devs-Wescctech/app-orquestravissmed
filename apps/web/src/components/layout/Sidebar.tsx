@@ -64,7 +64,7 @@ export function Sidebar() {
                     <div className={cn("h-16 flex items-center border-b border-slate-900 transition-all duration-300", isCollapsed ? "justify-center" : "justify-between px-4")}>
                         <div className={cn("flex items-center gap-2.5 overflow-hidden transition-all duration-300", isCollapsed ? "w-0 opacity-0 hidden" : "w-auto opacity-100 pl-2")}>
                             <ShieldPlus className="text-emerald-500 h-6 w-6 shrink-0" />
-                            <div className="font-semibold text-lg tracking-tight text-slate-100 whitespace-nowrap drop-shadow-md">VisMed</div>
+                            <div className="font-semibold text-lg tracking-tight text-slate-100 whitespace-nowrap drop-shadow-md">VissMed</div>
                         </div>
                         <button 
                             onClick={toggleSidebar} 

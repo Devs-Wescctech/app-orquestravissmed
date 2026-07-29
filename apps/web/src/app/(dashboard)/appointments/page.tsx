@@ -239,7 +239,7 @@ export default function AppointmentsPage() {
                     new Date(m.startAt).getTime() === newStartMs,
                 );
                 if (dupIdx >= 0) {
-                    // Preserva o nome real do paciente (vindo do registro VisMed) se a
+                    // Preserva o nome real do paciente (vindo do registro VissMed) se a
                     // Doctoralia devolveu apenas placeholder "Paciente".
                     if ((!b.patient?.name || b.patient.name === 'Paciente') && merged[dupIdx].patientName) {
                         newRec.patientName = merged[dupIdx].patientName;
@@ -363,7 +363,7 @@ export default function AppointmentsPage() {
                                 <ArrowRightLeft className="h-3 w-3" /> Sync Bidirecional
                             </span>
                         </div>
-                        <p className="text-sm text-slate-500 font-medium mt-0.5">VisMed + Doctoralia</p>
+                        <p className="text-sm text-slate-500 font-medium mt-0.5">VissMed + Doctoralia</p>
                     </div>
                 </div>
 
@@ -538,7 +538,7 @@ export default function AppointmentsPage() {
                                                     key={idx}
                                                     onClick={() => setSelectedBooking(b)}
                                                     className={`w-full text-left flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[9px] font-bold transition-all hover:bg-slate-100 ${isCancelled ? 'line-through opacity-50' : 'text-slate-600'}`}
-                                                    title={isVismed ? 'Origem: VisMed' : 'Origem: Doctoralia'}
+                                                    title={isVismed ? 'Origem: VissMed' : 'Origem: Doctoralia'}
                                                 >
                                                     <div className={`h-1.5 w-1.5 rounded-full shrink-0 ${dotColor}`}></div>
                                                     <span className="font-black text-slate-500">{formatTime(b.startAt)}</span>
@@ -589,7 +589,7 @@ export default function AppointmentsPage() {
                                                 : isVismed ? 'text-violet-700'
                                                 : 'text-blue-700';
                                             const dotColor = isCancelled ? 'bg-red-400' : isVismed ? 'bg-violet-500' : 'bg-blue-500';
-                                            const originLabel = isVismed ? 'VisMed' : 'Doctoralia';
+                                            const originLabel = isVismed ? 'VissMed' : 'Doctoralia';
                                             const originBadge = isVismed
                                                 ? 'bg-violet-100 text-violet-700 border-violet-200'
                                                 : 'bg-blue-100 text-blue-700 border-blue-200';
@@ -743,7 +743,7 @@ export default function AppointmentsPage() {
                                             ? 'bg-violet-50 border-violet-200 text-violet-700'
                                             : 'bg-blue-50 border-blue-200 text-blue-700'
                                     }`}>
-                                        Origem: {selectedBooking.origin === 'VISMED' ? 'VisMed' : 'Doctoralia'}
+                                        Origem: {selectedBooking.origin === 'VISMED' ? 'VissMed' : 'Doctoralia'}
                                     </span>
                                 </div>
                             </div>
@@ -754,7 +754,7 @@ export default function AppointmentsPage() {
                                 selectedBooking.syncedToVismed ? 'bg-violet-50 border-violet-200 text-violet-700' : 'bg-slate-50 border-slate-200 text-slate-400'
                             }`}>
                                 <Building2 className="h-3.5 w-3.5" />
-                                VisMed {selectedBooking.syncedToVismed ? '✓' : '✗'}
+                                VissMed {selectedBooking.syncedToVismed ? '✓' : '✗'}
                             </div>
                             <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-wider border ${
                                 selectedBooking.syncedToDoctoralia ? 'bg-blue-50 border-blue-200 text-blue-700' : 'bg-slate-50 border-slate-200 text-slate-400'
@@ -902,7 +902,7 @@ export default function AppointmentsPage() {
                             <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-3 flex items-center gap-3">
                                 <ArrowRightLeft className="h-4 w-4 text-emerald-600 shrink-0" />
                                 <p className="text-[9px] font-bold text-emerald-700 uppercase tracking-wider">
-                                    Agendamento será criado no VisMed e na Doctoralia simultaneamente.
+                                    Agendamento será criado no VissMed e na Doctoralia simultaneamente.
                                 </p>
                             </div>
 

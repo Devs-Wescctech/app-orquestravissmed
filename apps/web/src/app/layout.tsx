@@ -6,8 +6,8 @@ import { ClientProviders } from '@/components/client-providers'
 const inter = Inter({ subsets: ['latin'] })
 
 export const metadata: Metadata = {
-  title: 'VisMed - Integrated Management',
-  description: 'VisMed Multi-clinic management and integration system',
+  title: 'VissMed - Integrated Management',
+  description: 'VissMed Multi-clinic management and integration system',
 }
 
 export default function RootLayout({

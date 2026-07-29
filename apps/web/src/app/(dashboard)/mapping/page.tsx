@@ -235,7 +235,7 @@ export default function MappingHub() {
 
     const handleApproveDoctorReview = async (review: DoctorMatchReview, candidate: DoctorReviewCandidate) => {
         const ok = confirm(
-            `Vincular "${review.vismedDoctor?.name || 'médico VisMed'}" a "${candidate.name}" na Doctoralia?\n\n` +
+            `Vincular "${review.vismedDoctor?.name || 'médico VissMed'}" a "${candidate.name}" na Doctoralia?\n\n` +
             'O vínculo será criado e passará a ser usado pela sincronização.'
         );
         if (!ok) return;
@@ -253,7 +253,7 @@ export default function MappingHub() {
     };
 
     const handleDismissDoctorReview = async (review: DoctorMatchReview) => {
-        if (!confirm(`Descartar a revisão de "${review.vismedDoctor?.name || 'médico VisMed'}"?\n\nO médico permanecerá sem vínculo e este caso sairá da fila (volta se surgirem candidatos novos).`)) return;
+        if (!confirm(`Descartar a revisão de "${review.vismedDoctor?.name || 'médico VissMed'}"?\n\nO médico permanecerá sem vínculo e este caso sairá da fila (volta se surgirem candidatos novos).`)) return;
         setReviewActionIds(prev => new Set(prev).add(review.id));
         try {
             await api.post(`/mappings/doctors/reviews/${review.id}/dismiss`, { clinicId: activeClinic?.id });
@@ -380,7 +380,7 @@ export default function MappingHub() {
                                 <ShieldCheck className="h-3 w-3" /> Bidirecional
                             </span>
                         </div>
-                        <p className="text-sm text-slate-500 font-bold uppercase tracking-wide">Sincronização inteligente e integridade de dados na infraestrutura VisMed</p>
+                        <p className="text-sm text-slate-500 font-bold uppercase tracking-wide">Sincronização inteligente e integridade de dados na infraestrutura VissMed</p>
                     </div>
                 </div>
                 <div className="flex items-center gap-3">
@@ -397,7 +397,7 @@ export default function MappingHub() {
             {/* Metrics Glass Cards */}
             <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
                 {[
-                    { label: 'Total VisMed', value: profMetrics.total, icon: <User className="h-6 w-6" />, color: 'from-slate-500 to-slate-700' },
+                    { label: 'Total VissMed', value: profMetrics.total, icon: <User className="h-6 w-6" />, color: 'from-slate-500 to-slate-700' },
                     { label: 'Vinculados', value: profMetrics.linked, icon: <CheckCircle2 className="h-6 w-6" />, color: 'from-primary to-emerald-600' },
                     { label: 'Especialidades', value: profMetrics.withSpecialties, icon: <Stethoscope className="h-6 w-6" />, color: 'from-emerald-400 to-primary' },
                     { label: 'Pendente Review', value: profMetrics.pendingReview, icon: <AlertTriangle className="h-6 w-6" />, color: 'from-orange-400 to-rose-500' },
@@ -460,7 +460,7 @@ export default function MappingHub() {
                                                     {(r.vismedDoctor?.name || '?').charAt(0).toUpperCase()}
                                                 </div>
                                                 <div className="min-w-0">
-                                                    <div className="font-black text-sm text-slate-900 leading-tight truncate">{r.vismedDoctor?.name || 'Médico VisMed'}</div>
+                                                    <div className="font-black text-sm text-slate-900 leading-tight truncate">{r.vismedDoctor?.name || 'Médico VissMed'}</div>
                                                     <div className="flex flex-wrap items-center gap-2 mt-1">
                                                         {r.vismedDoctor?.documentNumber && (
                                                             <span className="text-[9px] font-black text-slate-400 bg-white px-1.5 py-0.5 rounded uppercase tracking-wider border border-slate-100">
@@ -746,7 +746,7 @@ export default function MappingHub() {
                 <div className="space-y-8 animate-in fade-in slide-in-from-top-4 duration-500">
                     <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-6">
                         {[
-                            { label: 'Espec. VisMed', value: specStats?.totalVismedSpecialties ?? '—', icon: <FileText className="h-6 w-6" />, color: 'from-indigo-500 to-indigo-700' },
+                            { label: 'Espec. VissMed', value: specStats?.totalVismedSpecialties ?? '—', icon: <FileText className="h-6 w-6" />, color: 'from-indigo-500 to-indigo-700' },
                             { label: 'Serviços Doctoralia', value: specStats?.totalDoctoraliaServices ?? '—', icon: <Activity className="h-6 w-6" />, color: 'from-blue-500 to-blue-700' },
                             { label: 'Aprovados', value: specStats?.totalAutoApproved ?? '—', icon: <CheckCircle2 className="h-6 w-6" />, color: 'from-primary to-emerald-600' },
                             { label: 'Pendentes Revisão', value: specStats?.totalPendingReview ?? '—', icon: <AlertTriangle className="h-6 w-6" />, color: 'from-amber-400 to-amber-600' },
@@ -794,7 +794,7 @@ export default function MappingHub() {
                             <table className="w-full text-sm text-left border-separate border-spacing-0">
                                 <thead className="bg-slate-50/50 text-[10px] text-slate-400 uppercase font-black tracking-[3px] border-b border-slate-100">
                                     <tr>
-                                        <th className="px-10 py-6">Especialidade (VisMed)</th>
+                                        <th className="px-10 py-6">Especialidade (VissMed)</th>
                                         <th className="px-10 py-6 text-center">Status de Busca</th>
                                         <th className="px-10 py-6">Serviços Doctoralia</th>
                                     </tr>
@@ -938,7 +938,7 @@ export default function MappingHub() {
                             <table className="w-full text-sm text-left border-separate border-spacing-0">
                                 <thead className="bg-slate-50/50 text-[10px] text-slate-400 uppercase font-black tracking-[3px] border-b border-slate-100">
                                     <tr>
-                                        <th className="px-10 py-6 font-black">Convênio (VisMed)</th>
+                                        <th className="px-10 py-6 font-black">Convênio (VissMed)</th>
                                         <th className="px-10 py-6 text-center">Status</th>
                                         <th className="px-10 py-6 text-right">Referência Externa</th>
                                     </tr>
@@ -954,10 +954,10 @@ export default function MappingHub() {
                                             onClick={() => { if (m.status === 'CONFLICT') { setSelectedMapping(m); setShowResolveModal(true); } }}>
                                             <td className="px-10 py-6">
                                                 <div className="flex flex-col gap-1 items-start">
-                                                    <div className="font-black text-base text-slate-900 group-hover:text-primary transition-colors tracking-tight">{m.vismedEntity?.name ?? m.conflictData?.name ?? 'Convênio VisMed'}</div>
+                                                    <div className="font-black text-base text-slate-900 group-hover:text-primary transition-colors tracking-tight">{m.vismedEntity?.name ?? m.conflictData?.name ?? 'Convênio VissMed'}</div>
                                                     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-1">
                                                         <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 bg-slate-50 px-1.5 py-0.5 rounded-md border border-slate-100 flex items-center gap-1">
-                                                            VisMed ID: #{m.vismedEntity?.vismed_id || m.vismedId || m.externalId || '---'}
+                                                            VissMed ID: #{m.vismedEntity?.vismed_id || m.vismedId || m.externalId || '---'}
                                                         </span>
                                                         {m.conflictData?.idconveniotipo && (
                                                             <span className="text-[10px] font-bold uppercase tracking-wider text-indigo-500 bg-indigo-50 px-1.5 py-0.5 rounded-md border border-indigo-100">
@@ -1087,7 +1087,7 @@ export default function MappingHub() {
                                         <div className="h-12 w-12 rounded-2xl bg-white/10 flex items-center justify-center group-hover:bg-white/20 transition-colors">
                                             {isResolving ? <Loader2 className="h-6 w-6 animate-spin text-primary" /> : <Building2 className="h-6 w-6 text-primary" />}
                                         </div>
-                                        Integridade VisMed
+                                        Integridade VissMed
                                     </button>
                                 </div>
 
@@ -1111,20 +1111,20 @@ export default function MappingHub() {
                     ) : units.length === 0 ? (
                         <div className="bg-white/70 backdrop-blur-xl rounded-[32px] shadow-sm border border-slate-100/80 p-32 text-center">
                             <Building2 className="h-16 w-16 text-slate-200 mx-auto mb-6" />
-                            <p className="text-[10px] font-black text-slate-400 uppercase tracking-[3px]">Nenhuma unidade VisMed configurada ainda.</p>
+                            <p className="text-[10px] font-black text-slate-400 uppercase tracking-[3px]">Nenhuma unidade VissMed configurada ainda.</p>
                         </div>
                     ) : units.map(u => {
                         const isLinked = !!u.doctoraliaCounterpart;
                         return (
                             <div key={u.id} className="bg-white/70 backdrop-blur-xl rounded-[32px] shadow-sm border border-slate-100/80 overflow-hidden hover:shadow-xl transition-all duration-500 group">
                                 <div className="grid grid-cols-1 md:grid-cols-[1fr_auto_1fr] items-stretch min-h-[180px]">
-                                    {/* LEFT — VisMed */}
+                                    {/* LEFT — VissMed */}
                                     <div className="p-8 flex flex-col justify-center border-r border-slate-100/60">
                                         <div className="flex items-center gap-2 mb-4">
                                             <div className="h-6 w-6 rounded-lg bg-slate-900 flex items-center justify-center">
                                                 <Building2 className="h-3.5 w-3.5 text-white" />
                                             </div>
-                                            <span className="text-[9px] font-black text-slate-400 uppercase tracking-[3px]">VisMed</span>
+                                            <span className="text-[9px] font-black text-slate-400 uppercase tracking-[3px]">VissMed</span>
                                         </div>
                                         <div className="font-black text-lg text-slate-900 tracking-tight leading-tight mb-3">{u.name}</div>
                                         <div className="space-y-2">
@@ -1266,7 +1266,7 @@ export default function MappingHub() {
 
             <div className="text-center pt-8 border-t border-slate-100/40">
                 <p className="text-[10px] font-black text-slate-400 uppercase tracking-[5px] leading-relaxed opacity-40 hover:opacity-100 transition-opacity">
-                    Data Governance Architecture • VisMed 2026 • Security Tier 1
+                    Data Governance Architecture • VissMed 2026 • Security Tier 1
                 </p>
             </div>
         </div>
