@@ -22,6 +22,30 @@ export class SyncSchedulerService implements OnModuleInit {
         } else {
             this.logger.log('[SCHEDULER] Sync cron ATIVO — global sync VisMed↔Doctoralia executa a cada 30 minutos (cron: */30 * * * *).');
         }
+        // Limpeza na subida: um restart/redeploy no meio de uma execução deixa o registro
+        // órfão em 'running' para sempre (o processo que o finalizaria morreu). Marca como
+        // failed logo no boot, sem esperar o próximo ciclo do cron.
+        this.cleanupStaleRuns('boot').catch(err =>
+            this.logger.warn(`[SCHEDULER] Falha na limpeza de runs órfãos no boot: ${err?.message}`));
+    }
+
+    /**
+     * Marca como 'failed' execuções presas em 'running' há mais de 90min, em TODAS as
+     * clínicas (independente de estarem ativas/pausadas — antes a limpeza só rodava
+     * dentro do loop de clínicas ativas, e clínicas puladas ficavam com runs órfãos
+     * congelados em "processando" indefinidamente).
+     */
+    private async cleanupStaleRuns(context: string): Promise<number> {
+        const STALE_THRESHOLD_MS = 90 * 60 * 1000;
+        const staleCutoff = new Date(Date.now() - STALE_THRESHOLD_MS);
+        const stale = await this.prisma.syncRun.updateMany({
+            where: { status: 'running', startedAt: { lt: staleCutoff } },
+            data: { status: 'failed', endedAt: new Date(), metrics: { error: `abandoned — running >90min (cleanup: ${context})` } },
+        });
+        if (stale.count > 0) {
+            this.logger.warn(`[SCHEDULER] ${stale.count} sync(s) órfão(s) (>90min em running) marcado(s) como failed (${context}).`);
+        }
+        return stale.count;
     }
 
     @Cron('*/30 * * * *', { name: 'global-sync-every-30min', timeZone: 'America/Sao_Paulo' })
@@ -39,6 +63,10 @@ export class SyncSchedulerService implements OnModuleInit {
         this.logger.log(`[SCHEDULER] >>> Iniciando ciclo automático de sync global (${startedAt.toISOString()})`);
 
         await this.cleanupSkippedBookingAlerts();
+        // Limpeza global de runs órfãos ANTES do loop de clínicas — cobre também clínicas
+        // que serão puladas (pausadas/em erro) e não passariam pela limpeza por-clínica.
+        await this.cleanupStaleRuns('cycle').catch(err =>
+            this.logger.warn(`[SCHEDULER] Falha na limpeza de runs órfãos: ${err?.message}`));
 
         try {
             const clinics = await this.prisma.clinic.findMany({
@@ -60,19 +88,7 @@ export class SyncSchedulerService implements OnModuleInit {
             for (const clinic of clinics) {
                 try {
                     // Anti-overlap: pula se já existe sync rodando para essa clínica.
-                    // Stale-lock recovery: runs travados em 'running' há mais de 90min são considerados
-                    // abandonados (provável crash/timeout sem cleanup) e marcados como 'failed' antes
-                    // de avaliar o anti-overlap, para que a clínica não fique bloqueada eternamente.
-                    const STALE_THRESHOLD_MS = 90 * 60 * 1000;
-                    const staleCutoff = new Date(Date.now() - STALE_THRESHOLD_MS);
-                    const stale = await this.prisma.syncRun.updateMany({
-                        where: { clinicId: clinic.id, status: 'running', startedAt: { lt: staleCutoff } },
-                        data: { status: 'failed', endedAt: new Date(), metrics: { error: 'abandoned by scheduler — running >90min' } },
-                    });
-                    if (stale.count > 0) {
-                        this.logger.warn(`[SCHEDULER] Clínica "${clinic.name}": ${stale.count} sync(s) órfão(s) (>90min em running) marcado(s) como failed.`);
-                    }
-
+                    // (Runs órfãos >90min já foram marcados como failed pela limpeza global acima.)
                     const inFlight = await this.prisma.syncRun.count({
                         where: { clinicId: clinic.id, status: 'running' },
                     });
