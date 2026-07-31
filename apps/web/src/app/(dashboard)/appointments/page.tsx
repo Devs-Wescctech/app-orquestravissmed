@@ -3,7 +3,7 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import {
     CalendarDays, Loader2, Clock, RefreshCw, User, ChevronLeft, ChevronRight,
     Stethoscope, X, Phone, Mail, FileText, Globe, Building2, ArrowRightLeft, Ban,
-    Plus, ChevronDown,
+    Plus, ChevronDown, ShieldCheck,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { useClinic } from '@/lib/clinic-store';
@@ -133,6 +133,7 @@ export default function AppointmentsPage() {
     const [bookingSlot, setBookingSlot] = useState<{ date: string; time: string } | null>(null);
     const [patientForm, setPatientForm] = useState({ name: '', surname: '', phone: '', email: '', cpf: '' });
     const [isSaving, setIsSaving] = useState(false);
+    const [isSweeping, setIsSweeping] = useState(false);
 
     const navigate = (direction: number) => {
         const d = new Date(currentDate);
@@ -265,6 +266,31 @@ export default function AppointmentsPage() {
         return map;
     }, [allBookings, displayDays]);
 
+    const handleManualSweep = async () => {
+        if (!clinicId || isSweeping) return;
+        setIsSweeping(true);
+        const toastId = toast.loading('Verificando agendamentos na Doctoralia...');
+        try {
+            const res = await api.post('/booking-sync/safety-sweep', { clinicId });
+            if (res.data?.ok === false) {
+                toast.error(res.data?.reason || 'Não foi possível verificar agora', { id: toastId });
+            } else {
+                const n = res.data?.enqueued ?? 0;
+                toast.success(
+                    n > 0
+                        ? `${n} agendamento(s) encontrado(s) e enviado(s) para criação na VissMed`
+                        : 'Verificação concluída: nenhum agendamento pendente encontrado',
+                    { id: toastId, duration: 8000 },
+                );
+                fetchBookings();
+            }
+        } catch (e: any) {
+            toast.error(`Erro na verificação: ${e.response?.data?.message || e.message}`, { id: toastId });
+        } finally {
+            setIsSweeping(false);
+        }
+    };
+
     const handleOpenBooking = (date: string) => {
         setBookingSlot({ date, time: '08:00' });
         setPatientForm({ name: '', surname: '', phone: '', email: '', cpf: '' });
@@ -368,6 +394,14 @@ export default function AppointmentsPage() {
                 </div>
 
                 <div className="flex items-center gap-3">
+                    <button
+                        onClick={handleManualSweep}
+                        disabled={isSweeping || !clinicId}
+                        title="Varre a agenda na Doctoralia agora e importa agendamentos que não chegaram ao orquestrador"
+                        className="flex items-center gap-2 px-5 py-3 bg-indigo-600 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-indigo-700 hover:shadow-md transition-all disabled:opacity-50"
+                    >
+                        <ShieldCheck className={`h-3.5 w-3.5 ${isSweeping ? 'animate-pulse' : ''}`} /> {isSweeping ? 'Verificando...' : 'Verificar agora'}
+                    </button>
                     <button
                         onClick={() => { fetchDoctors(); fetchBookings(); }}
                         disabled={isFetching}

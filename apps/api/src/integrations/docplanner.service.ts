@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { AsyncLocalStorage } from 'async_hooks';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 
@@ -33,34 +34,80 @@ export class DocplannerClient {
     private static readonly RATE_WINDOW_MS = 5 * 60 * 1000;
     /** Timestamps (epoch ms) das requisições feitas dentro da janela corrente. */
     private static rateTimestamps: number[] = [];
-    /** Fila FIFO: garante ordem de chegada e evita estouro por corrida entre chamadas concorrentes. */
-    private static rateQueue: Promise<void> = Promise.resolve();
     private static lastThrottleLogAt = 0;
+
+    /**
+     * Duas filas de espera pela vazão: a prioritária (varredura de segurança e outras
+     * operações pequenas/urgentes) passa na frente da normal (sync global em massa).
+     * IMPORTANTE: isso apenas REORDENA quem usa cada slot — o teto continua sendo
+     * exatamente RATE_LIMIT (400) requisições por janela de 5 minutos.
+     */
+    private static waitingHigh: Array<() => void> = [];
+    private static waitingLow: Array<() => void> = [];
+    private static pumping = false;
+    /** Grants prioritários consecutivos (para a cota anti-inanição da fila normal). */
+    private static consecutiveHighGrants = 0;
+
+    /** Contexto assíncrono: marca chamadas feitas dentro de runWithPriority(). */
+    private static priorityAls = new AsyncLocalStorage<boolean>();
+
+    /**
+     * Executa fn com prioridade na fila de vazão da Doctoralia. Não aumenta o
+     * limite de requisições — só garante que estas poucas chamadas não fiquem
+     * horas atrás das milhares do sync global.
+     */
+    static runWithPriority<T>(fn: () => Promise<T>): Promise<T> {
+        return DocplannerClient.priorityAls.run(true, fn);
+    }
+
+    private static async pumpRateQueue(logger: Logger): Promise<void> {
+        if (DocplannerClient.pumping) return;
+        DocplannerClient.pumping = true;
+        try {
+            while (DocplannerClient.waitingHigh.length || DocplannerClient.waitingLow.length) {
+                for (;;) {
+                    const now = Date.now();
+                    const cutoff = now - DocplannerClient.RATE_WINDOW_MS;
+                    const ts = DocplannerClient.rateTimestamps;
+                    while (ts.length && ts[0] <= cutoff) ts.shift();
+                    if (ts.length < DocplannerClient.RATE_LIMIT) {
+                        ts.push(now);
+                        break;
+                    }
+                    const waitMs = Math.max(ts[0] + DocplannerClient.RATE_WINDOW_MS - now, 250);
+                    if (now - DocplannerClient.lastThrottleLogAt > 30_000) {
+                        DocplannerClient.lastThrottleLogAt = now;
+                        logger.warn(`[RATE-LIMIT] Janela de ${DocplannerClient.RATE_LIMIT} req/5min cheia — segurando requisições por ~${Math.ceil(waitMs / 1000)}s para não disparar o WAF da Doctoralia (fila: ${DocplannerClient.waitingHigh.length} prioritária(s), ${DocplannerClient.waitingLow.length} normal(is)).`);
+                    }
+                    await new Promise(r => setTimeout(r, waitMs));
+                }
+                // Anti-inanição: a cada 4 slots prioritários seguidos, cede 1 à fila normal.
+                let next: (() => void) | undefined;
+                if (
+                    DocplannerClient.waitingLow.length &&
+                    (DocplannerClient.consecutiveHighGrants >= 4 || !DocplannerClient.waitingHigh.length)
+                ) {
+                    next = DocplannerClient.waitingLow.shift();
+                    DocplannerClient.consecutiveHighGrants = 0;
+                } else {
+                    next = DocplannerClient.waitingHigh.shift();
+                    DocplannerClient.consecutiveHighGrants++;
+                }
+                if (next) next();
+                else DocplannerClient.rateTimestamps.pop(); // slot reservado sem ninguém na fila (corrida rara): devolve
+            }
+        } finally {
+            DocplannerClient.pumping = false;
+        }
+    }
 
     /** Aguarda (se necessário) até haver espaço na janela de vazão e registra a requisição. */
     private static acquireRateSlot(logger: Logger): Promise<void> {
-        const run = async (): Promise<void> => {
-            for (;;) {
-                const now = Date.now();
-                const cutoff = now - DocplannerClient.RATE_WINDOW_MS;
-                const ts = DocplannerClient.rateTimestamps;
-                while (ts.length && ts[0] <= cutoff) ts.shift();
-                if (ts.length < DocplannerClient.RATE_LIMIT) {
-                    ts.push(now);
-                    return;
-                }
-                const waitMs = Math.max(ts[0] + DocplannerClient.RATE_WINDOW_MS - now, 250);
-                if (now - DocplannerClient.lastThrottleLogAt > 30_000) {
-                    DocplannerClient.lastThrottleLogAt = now;
-                    logger.warn(`[RATE-LIMIT] Janela de ${DocplannerClient.RATE_LIMIT} req/5min cheia — segurando requisições por ~${Math.ceil(waitMs / 1000)}s para não disparar o WAF da Doctoralia.`);
-                }
-                await new Promise(r => setTimeout(r, waitMs));
-            }
-        };
-        // Encadeia na fila para preservar ordem de chegada; a fila nunca rejeita.
-        const slot = DocplannerClient.rateQueue.then(run);
-        DocplannerClient.rateQueue = slot.catch(() => undefined);
-        return slot;
+        const priority = DocplannerClient.priorityAls.getStore() === true;
+        return new Promise<void>(resolve => {
+            (priority ? DocplannerClient.waitingHigh : DocplannerClient.waitingLow).push(resolve);
+            void DocplannerClient.pumpRateQueue(logger);
+        });
     }
 
     private accessToken: string;

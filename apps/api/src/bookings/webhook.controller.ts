@@ -6,6 +6,7 @@ import { QueueService } from './queue.service';
 import { RateLimiterService } from './rate-limiter.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { PrismaService } from '../prisma/prisma.service';
+import { DocplannerClient } from '../integrations/docplanner.service';
 
 @Controller('webhooks')
 export class WebhookController {
@@ -259,7 +260,7 @@ export class BookingSyncController {
             });
             if (!conn) return { ok: false, reason: 'Sem integração Doctoralia conectada' };
             this.logger.log(`[MANUAL] Varredura de segurança para clínica ${body.clinicId}`);
-            const enqueued = await this.safetySweepService.sweepClinic(conn);
+            const enqueued = await DocplannerClient.runWithPriority(() => this.safetySweepService.sweepClinic(conn));
             return { ok: true, enqueued };
         }
         this.logger.log('[MANUAL] Varredura de segurança para todas as clínicas');

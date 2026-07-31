@@ -1,6 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { DocplannerService } from '../integrations/docplanner.service';
+import { DocplannerClient, DocplannerService } from '../integrations/docplanner.service';
 import { QueueService } from './queue.service';
 import { RateLimiterService } from './rate-limiter.service';
 
@@ -96,7 +96,9 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
                 // Staggering entre clínicas para diluir a carga (30 clínicas × médicos vinculados).
                 if (i > 0) await this.sleep(SWEEP_STAGGER_PER_CLINIC_MS);
                 try {
-                    const enqueued = await this.sweepClinic(connections[i]);
+                    // Prioridade na fila de vazão: as ~dezenas de chamadas da varredura passam
+                    // na frente das milhares do sync global (o teto de 400/5min é o mesmo).
+                    const enqueued = await DocplannerClient.runWithPriority(() => this.sweepClinic(connections[i]));
                     totalEnqueued += enqueued;
                     clinicsSwept++;
                 } catch (err: any) {
