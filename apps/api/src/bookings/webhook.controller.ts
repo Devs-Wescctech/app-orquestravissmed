@@ -81,7 +81,7 @@ export class BookingSyncController {
     async pollVismed(@Req() req: any, @Query('clinicId') clinicId: string) {
         this.validateClinicAccess(req.user, clinicId);
         const conn = await this.prisma.integrationConnection.findFirst({
-            where: { clinicId, provider: 'vismed', status: 'connected' },
+            where: { clinicId, provider: 'vismed', status: { not: 'disconnected' }, clientId: { not: null } },
         });
         if (!conn) return { ok: false, reason: 'Sem integração VisMed conectada' };
         await this.bookingSyncService.pollVismedClinic(conn);
@@ -121,13 +121,20 @@ export class BookingSyncController {
         ]);
 
         const connectedClinics = await this.prisma.integrationConnection.count({
-            where: { provider: 'doctoralia', status: 'connected' },
+            where: { provider: 'doctoralia', status: { not: 'disconnected' }, clientId: { not: null } },
+        });
+
+        // Clínicas com credenciais mas fora do polling/varredura — visível no health, não silêncio.
+        const excludedFromPolling = await this.prisma.integrationConnection.findMany({
+            where: { provider: 'doctoralia', clientId: { not: null }, status: 'disconnected' },
+            select: { clinicId: true, status: true },
         });
 
         return {
             status: 'ok',
             timestamp: new Date().toISOString(),
             connectedClinics,
+            excludedFromPolling,
             queue: queueMetrics,
             rateLimiter: rateLimiterStats,
         };
@@ -144,7 +151,7 @@ export class BookingSyncController {
         }
 
         const connections = await this.prisma.integrationConnection.findMany({
-            where: { provider: 'doctoralia', status: 'connected' },
+            where: { provider: 'doctoralia', status: { not: 'disconnected' }, clientId: { not: null } },
             select: { clinicId: true },
         });
 
@@ -256,7 +263,7 @@ export class BookingSyncController {
         if (body?.clinicId) {
             this.validateClinicAccess(req.user, body.clinicId);
             const conn = await this.prisma.integrationConnection.findFirst({
-                where: { clinicId: body.clinicId, provider: 'doctoralia', status: 'connected' },
+                where: { clinicId: body.clinicId, provider: 'doctoralia', status: { not: 'disconnected' }, clientId: { not: null } },
             });
             if (!conn) return { ok: false, reason: 'Sem integração Doctoralia conectada' };
             this.logger.log(`[MANUAL] Varredura de segurança para clínica ${body.clinicId}`);

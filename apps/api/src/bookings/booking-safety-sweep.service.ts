@@ -88,7 +88,7 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
         let clinicsSwept = 0;
         try {
             const connections = await this.prisma.integrationConnection.findMany({
-                where: { provider: 'doctoralia', status: 'connected' },
+                where: { provider: 'doctoralia', status: { not: 'disconnected' }, clientId: { not: null } },
             });
 
             for (let i = 0; i < connections.length; i++) {

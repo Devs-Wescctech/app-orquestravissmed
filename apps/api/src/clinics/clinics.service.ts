@@ -148,11 +148,17 @@ export class ClinicsService {
                 facilities: items.map((f: any) => ({ id: f.id, name: f.name })),
             };
         } catch (e: any) {
+            // Não rebaixa uma conexão 'connected' em uso: uma falha momentânea no teste
+            // (ex.: WAF da Doctoralia) não pode tirar a clínica do polling/varredura.
+            const demote = conn.status !== 'connected';
             await this.prisma.integrationConnection.update({
                 where: { id: conn.id },
-                data: { status: 'error', lastTestAt: new Date() },
+                data: { ...(demote ? { status: 'error' } : {}), lastTestAt: new Date() },
             });
-            return { success: false, message: `Erro: ${e.message}` };
+            return {
+                success: false,
+                message: `Erro: ${e.message}${demote ? '' : ' — status mantido como "connected"; a importação de agendamentos continua ativa'}`,
+            };
         }
     }
 
@@ -182,11 +188,16 @@ export class ClinicsService {
                 message: `Conexão OK — ${unidades.length} unidade(s) visível(is) para Empresa ${conn.clientId}`,
             };
         } catch (e: any) {
+            // Mesma regra da Doctoralia: teste falho não rebaixa conexão 'connected' em uso.
+            const demote = conn.status !== 'connected';
             await this.prisma.integrationConnection.update({
                 where: { id: conn.id },
-                data: { status: 'error', lastTestAt: new Date() },
+                data: { ...(demote ? { status: 'error' } : {}), lastTestAt: new Date() },
             });
-            return { success: false, message: `Falha na conexão: ${e.message}` };
+            return {
+                success: false,
+                message: `Falha na conexão: ${e.message}${demote ? '' : ' — status mantido como "connected"; a importação continua ativa'}`,
+            };
         }
     }
 }

@@ -114,10 +114,22 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
     private async refreshPollingSchedule() {
         try {
             const connections = await this.prisma.integrationConnection.findMany({
-                where: { provider: 'doctoralia', status: 'connected' },
+                where: { provider: 'doctoralia', status: { not: 'disconnected' }, clientId: { not: null } },
             });
 
             const currentIds = new Set(connections.map(c => c.clinicId));
+
+            // Alerta visível (não silêncio): qualquer conexão Doctoralia com credenciais que
+            // ficou FORA do polling (ex.: status 'disconnected') é logada como ERRO a cada refresh.
+            const excluded = await this.prisma.integrationConnection.findMany({
+                where: { provider: 'doctoralia', clientId: { not: null }, status: 'disconnected' },
+                select: { clinicId: true, status: true },
+            });
+            for (const ex of excluded) {
+                this.logger.error(
+                    `[POLL-EXCLUSAO] Clinica ${ex.clinicId} tem credenciais Doctoralia mas status '${ex.status}' — EXCLUÍDA do polling de notificações e da varredura de segurança. Reative a conexão se isso não for intencional.`,
+                );
+            }
 
             for (const conn of connections) {
                 if (this.polledClinicIds.has(conn.clinicId)) continue;
@@ -146,7 +158,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
 
             // VisMed appointments polling (independent from Doctoralia)
             const vismedConns = await this.prisma.integrationConnection.findMany({
-                where: { provider: 'vismed', status: 'connected' },
+                where: { provider: 'vismed', status: { not: 'disconnected' }, clientId: { not: null } },
             });
 
             for (const vConn of vismedConns) {
@@ -181,8 +193,9 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
 
     private polledVismedClinicIds = new Set<string>();
 
-    async pollVismedClinic(conn: any) {
-        if (!conn.clientId) return;
+    async pollVismedClinic(staleConn: any) {
+        const conn = await this.getEligibleConnection(staleConn.clinicId, 'vismed');
+        if (!conn || !conn.clientId) return;
 
         try {
             const idEmpresaGestora = Number(conn.clientId);
@@ -705,7 +718,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         if (unlinked.length === 0) return;
 
         const docConn = await this.prisma.integrationConnection.findFirst({
-            where: { clinicId, provider: 'doctoralia', status: 'connected' },
+            where: { clinicId, provider: 'doctoralia', status: { not: 'disconnected' }, clientId: { not: null } },
         });
         if (!docConn?.clientId) return;
 
@@ -810,7 +823,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         if (linked.length === 0) return;
 
         const docConn = await this.prisma.integrationConnection.findFirst({
-            where: { clinicId, provider: 'doctoralia', status: 'connected' },
+            where: { clinicId, provider: 'doctoralia', status: { not: 'disconnected' }, clientId: { not: null } },
         });
         if (!docConn?.clientId) return;
 
@@ -1390,7 +1403,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         }
 
         const conn = await this.prisma.integrationConnection.findFirst({
-            where: { clinicId: rec.clinicId, provider: 'doctoralia', status: 'connected' },
+            where: { clinicId: rec.clinicId, provider: 'doctoralia', status: { not: 'disconnected' }, clientId: { not: null } },
         });
         if (!conn || !conn.clientId) {
             this.logger.warn(`[CANCEL-SYNC] sem conexão Doctoralia para clínica ${rec.clinicId}`);
@@ -1479,7 +1492,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         }
 
         const conn = await this.prisma.integrationConnection.findFirst({
-            where: { clinicId: rec.clinicId, provider: 'vismed', status: 'connected' },
+            where: { clinicId: rec.clinicId, provider: 'vismed', status: { not: 'disconnected' }, clientId: { not: null } },
         });
         const baseUrl = conn?.domain || undefined;
 
@@ -1576,7 +1589,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         }
 
         const conn = await this.prisma.integrationConnection.findFirst({
-            where: { clinicId: rec.clinicId, provider: 'doctoralia', status: 'connected' },
+            where: { clinicId: rec.clinicId, provider: 'doctoralia', status: { not: 'disconnected' }, clientId: { not: null } },
         });
         if (!conn || !conn.clientId) {
             this.logger.warn(`[RESCHEDULE-SYNC] sem conexão Doctoralia para clínica ${rec.clinicId}`);
@@ -1684,7 +1697,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         }
 
         const conn = await this.prisma.integrationConnection.findFirst({
-            where: { clinicId: rec.clinicId, provider: 'vismed', status: 'connected' },
+            where: { clinicId: rec.clinicId, provider: 'vismed', status: { not: 'disconnected' }, clientId: { not: null } },
         });
         if (!conn || !conn.clientId) {
             this.logger.warn(`[RESCHEDULE-SYNC] sem conexão VisMed para clínica ${rec.clinicId}`);
@@ -2156,15 +2169,29 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
 
     async pollAllVismedClinics() {
         const conns = await this.prisma.integrationConnection.findMany({
-            where: { provider: 'vismed', status: 'connected' },
+            where: { provider: 'vismed', status: { not: 'disconnected' }, clientId: { not: null } },
         });
         for (const c of conns) {
             await this.pollVismedClinic(c);
         }
     }
 
-    private async pollClinic(conn: any) {
-        if (!conn.clientId || !conn.clientSecret) return;
+    // Revalida a elegibilidade da conexão a cada tick do timer. Os timers fecham sobre a
+    // conexão antiga: sem isso, uma clínica desconectada DEPOIS de agendada continuaria
+    // sendo polled (e o /health reportaria o oposto). Retorna a conexão FRESCA ou null.
+    private async getEligibleConnection(clinicId: string, provider: string) {
+        const fresh = await this.prisma.integrationConnection.findFirst({
+            where: { clinicId, provider, status: { not: 'disconnected' }, clientId: { not: null } },
+        });
+        if (!fresh) {
+            this.logger.warn(`[POLL] Clinic ${clinicId} (${provider}) não é mais elegível (desconectada ou sem credenciais) — pulando este ciclo.`);
+        }
+        return fresh;
+    }
+
+    private async pollClinic(staleConn: any) {
+        const conn = await this.getEligibleConnection(staleConn.clinicId, 'doctoralia');
+        if (!conn || !conn.clientId || !conn.clientSecret) return;
 
         try {
             await this.rateLimiter.acquire('doctoralia');
@@ -2218,7 +2245,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
     private async pollAllClinics() {
         try {
             const connections = await this.prisma.integrationConnection.findMany({
-                where: { provider: 'doctoralia', status: 'connected' },
+                where: { provider: 'doctoralia', status: { not: 'disconnected' }, clientId: { not: null } },
             });
             for (const conn of connections) {
                 await this.pollClinic(conn);
@@ -2246,7 +2273,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         const facilityIdStr = String(facilityData.id);
 
         const conn = await this.prisma.integrationConnection.findFirst({
-            where: { provider: 'doctoralia', status: 'connected', facilityId: facilityIdStr },
+            where: { provider: 'doctoralia', status: { not: 'disconnected' }, clientId: { not: null }, facilityId: facilityIdStr },
         });
 
         if (!conn) {
@@ -3259,7 +3286,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
 
         if (syncRecord.vismedAppointmentId) {
             const vismedConn = await this.prisma.integrationConnection.findFirst({
-                where: { clinicId, provider: 'vismed', status: 'connected' },
+                where: { clinicId, provider: 'vismed', status: { not: 'disconnected' }, clientId: { not: null } },
             });
 
             if (vismedConn) {
