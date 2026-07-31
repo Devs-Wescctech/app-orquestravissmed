@@ -1,6 +1,6 @@
 import { Injectable, Logger, HttpException, BadRequestException, NotFoundException, InternalServerErrorException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { DocplannerService } from '../integrations/docplanner.service';
+import { DocplannerService, DocplannerClient } from '../integrations/docplanner.service';
 
 @Injectable()
 export class AppointmentsService {
@@ -257,7 +257,8 @@ export class AppointmentsService {
         }
 
         try {
-            const bookingsRes = await client.getBookings(cd.facilityId, doctorExternalId, cd.address.id, start, end);
+            // Chamada disparada pela UI: fila prioritária (nunca espera atrás do sync em massa).
+            const bookingsRes = await DocplannerClient.runWithPriority(() => client.getBookings(cd.facilityId, doctorExternalId, cd.address.id, start, end));
 
             await this.logRequest({ clinicId, action: 'FETCH_BOOKINGS', doctorId: doctorExternalId, start, end, durationMs: Date.now() - startTime, status: 'success' });
             const list = Array.isArray(bookingsRes) ? bookingsRes : (bookingsRes?._items || []);
@@ -325,7 +326,8 @@ export class AppointmentsService {
         }
 
         try {
-            const slotsRes = await client.getSlots(cd.facilityId, doctorExternalId, cd.address.id, start, end);
+            // Chamada disparada pela UI: fila prioritária (nunca espera atrás do sync em massa).
+            const slotsRes = await DocplannerClient.runWithPriority(() => client.getSlots(cd.facilityId, doctorExternalId, cd.address.id, start, end));
 
             await this.logRequest({ clinicId, action: 'FETCH_SLOTS', doctorId: doctorExternalId, start, end, durationMs: Date.now() - startTime, status: 'success' });
             const list = Array.isArray(slotsRes) ? slotsRes : (slotsRes?._items || []);
@@ -493,7 +495,7 @@ export class AppointmentsService {
             if (cd.calendarStatus === 'enabled' && cd.facilityId && cd.address?.id) {
                 calendarEnabled = true;
                 try {
-                    const res = await client.getBookings(cd.facilityId, m.externalId || '', cd.address.id, start, end);
+                    const res = await DocplannerClient.runWithPriority(() => client.getBookings(cd.facilityId, m.externalId || '', cd.address.id, start, end));
                     const items = (res._items || []).map((b: any) => ({
                         ...b,
                         doctorName: `${cd.name || ''} ${cd.surname || ''}`.trim(),
