@@ -98,6 +98,11 @@ export class VismedSyncProcessor extends WorkerHost {
             const especialidades = await this.vismedClient.getEspecialidades(idEmpresaGestora);
             await this.logEvent(currentSyncRunId, 'SPECIALTY', 'fetch_success', `Encontradas ${especialidades.length} especialidades.`);
 
+            // vismedIds retornados pela API nesta execução + índice por nome normalizado,
+            // para detectar/migrar registros cujo código mudou na VisMed (ex.: 180 → 3472).
+            const returnedVismedIds = new Set<number>();
+            const currentSpecIdsByNorm = new Map<string, string>(); // normalizedName -> VismedSpecialty.id (registro atual)
+
             for (const e of especialidades) {
                 if (!e.idcategoriaservico || !e.nomecategoriaservico) continue;
 
@@ -116,10 +121,26 @@ export class VismedSyncProcessor extends WorkerHost {
                     }
                 });
 
+                returnedVismedIds.add(Number(e.idcategoriaservico));
+                if (!currentSpecIdsByNorm.has(normName)) {
+                    currentSpecIdsByNorm.set(normName, spec.id);
+                }
+
                 // Dispatch matching run
                 await this.matchingEngine.runMatchingForSpecialty(spec.id);
                 insertedOrUpdated++;
             }
+
+            // ----------------------------------------------------
+            // PASSO B2: Migrar/alertar especialidades obsoletas
+            // (código sumiu do retorno da API — VisMed trocou o idcategoriaservico)
+            // ----------------------------------------------------
+            if (returnedVismedIds.size > 0) {
+                await this.migrateObsoleteSpecialties(currentSyncRunId, returnedVismedIds, currentSpecIdsByNorm);
+            } else {
+                this.logger.warn('API de especialidades retornou vazia — pulando detecção de códigos obsoletos (fail-safe).');
+            }
+
             await this.prisma.syncRun.update({ where: { id: currentSyncRunId }, data: { totalRecords: insertedOrUpdated } });
 
             // ----------------------------------------------------
@@ -312,6 +333,104 @@ export class VismedSyncProcessor extends WorkerHost {
                 await this.logEvent(syncRunId, 'SYSTEM', 'sync_error', e ? e.message : 'Unknown error');
             }
             throw e;
+        }
+    }
+
+    /**
+     * Detecta registros VismedSpecialty cujo vismedId (idcategoriaservico) NÃO veio mais no
+     * retorno da API — sinal de que a VisMed trocou o código (ex.: Oftalmologia 180 → 3472).
+     *
+     * Para cada registro obsoleto:
+     * - Se existe registro atual com o MESMO nome normalizado: migra os vínculos
+     *   médico↔especialidade (VismedProfessionalSpecialty) e os mapeamentos
+     *   serviço↔especialidade (SpecialtyServiceMapping) para o registro atual e apaga o obsoleto.
+     * - Se não existe correspondente por nome: mantém o registro (pode ser especialidade
+     *   "fantasma" criada a partir da string de especialidades do profissional), mas registra
+     *   alerta no log do sync em vez de silenciar.
+     */
+    private async migrateObsoleteSpecialties(
+        syncRunId: string,
+        returnedVismedIds: Set<number>,
+        currentSpecIdsByNorm: Map<string, string>,
+    ): Promise<void> {
+        const staleSpecs = await this.prisma.vismedSpecialty.findMany({
+            where: { vismedId: { notIn: Array.from(returnedVismedIds) } },
+            include: {
+                doctors: true,
+                mappings: true,
+            },
+        });
+
+        for (const stale of staleSpecs) {
+            const norm = stale.normalizedName
+                || stale.name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+            const targetId = currentSpecIdsByNorm.get(norm);
+
+            if (!targetId || targetId === stale.id) {
+                // Sem correspondente no catálogo atual — não apagar (pode ser especialidade
+                // "fantasma" legítima), mas alertar em vez de manter silenciosamente.
+                if (stale.doctors.length > 0 || stale.mappings.length > 0) {
+                    const msg = `Especialidade "${stale.name}" (idcategoriaservico=${stale.vismedId}) não consta mais no retorno da VisMed e não há registro atual com o mesmo nome. Vínculos mantidos: ${stale.doctors.length} médico(s), ${stale.mappings.length} mapeamento(s). Verifique o catálogo na VisMed.`;
+                    this.logger.warn(`[SPECIALTY-OBSOLETE] ${msg}`);
+                    await this.logEvent(syncRunId, 'SPECIALTY', 'specialty_obsolete', msg);
+                }
+                continue;
+            }
+
+            const target = await this.prisma.vismedSpecialty.findUnique({ where: { id: targetId } });
+            if (!target) continue;
+
+            this.logger.log(
+                `[SPECIALTY-MIGRATE] "${stale.name}" mudou de código na VisMed: ${stale.vismedId} → ${target.vismedId}. Migrando ${stale.doctors.length} vínculo(s) de médico e ${stale.mappings.length} mapeamento(s) de serviço.`,
+            );
+
+            await this.prisma.$transaction(async (tx) => {
+                // 1) Vínculos médico↔especialidade: mover, respeitando o unique (doctorId, specialtyId)
+                for (const link of stale.doctors) {
+                    const exists = await tx.vismedProfessionalSpecialty.findUnique({
+                        where: {
+                            vismedDoctorId_vismedSpecialtyId: {
+                                vismedDoctorId: link.vismedDoctorId,
+                                vismedSpecialtyId: target.id,
+                            },
+                        },
+                    });
+                    if (exists) {
+                        await tx.vismedProfessionalSpecialty.delete({ where: { id: link.id } });
+                    } else {
+                        await tx.vismedProfessionalSpecialty.update({
+                            where: { id: link.id },
+                            data: { vismedSpecialtyId: target.id },
+                        });
+                    }
+                }
+
+                // 2) Mapeamentos serviço↔especialidade: mover, respeitando o unique (specialtyId, serviceId)
+                for (const m of stale.mappings) {
+                    const exists = await tx.specialtyServiceMapping.findUnique({
+                        where: {
+                            vismedSpecialtyId_doctoraliaServiceId: {
+                                vismedSpecialtyId: target.id,
+                                doctoraliaServiceId: m.doctoraliaServiceId,
+                            },
+                        },
+                    });
+                    if (exists) {
+                        await tx.specialtyServiceMapping.delete({ where: { id: m.id } });
+                    } else {
+                        await tx.specialtyServiceMapping.update({
+                            where: { id: m.id },
+                            data: { vismedSpecialtyId: target.id },
+                        });
+                    }
+                }
+
+                // 3) Apagar o registro obsoleto (cascade limpa qualquer resto)
+                await tx.vismedSpecialty.delete({ where: { id: stale.id } });
+            });
+
+            const msg = `Especialidade "${stale.name}": código VisMed mudou de ${stale.vismedId} para ${target.vismedId}. Migrados ${stale.doctors.length} vínculo(s) de médico e ${stale.mappings.length} mapeamento(s) de serviço; registro antigo removido.`;
+            await this.logEvent(syncRunId, 'SPECIALTY', 'specialty_migrated', msg);
         }
     }
 
