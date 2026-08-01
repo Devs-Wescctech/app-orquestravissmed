@@ -216,6 +216,20 @@ export class AppointmentsService {
     // ────────────────────── Bookings ──────────────────────
 
     async getBookings(clinicId: string, doctorExternalId: string, start: string, end: string) {
+        // Blindagem total: NENHUMA exceção nesta rota pode virar 500 — a UI espera
+        // sempre 200 com { bookings: [], error } em caso de falha. O stack completo
+        // é logado para diagnóstico imediato.
+        try {
+            return await this.getBookingsInner(clinicId, doctorExternalId, start, end);
+        } catch (e: any) {
+            this.logger.error(`getBookings falhou (clinic=${clinicId}, doctor=${doctorExternalId}, ${start}..${end}): ${e?.message}`, e?.stack);
+            await this.logRequest({ clinicId, action: 'FETCH_BOOKINGS', doctorId: doctorExternalId, start, end, durationMs: 0, status: 'error', error: e?.message, extraDetails: { stack: e?.stack } });
+            // Mensagem genérica para o cliente; o detalhe fica só no log/auditoria.
+            return { bookings: [], error: 'Erro inesperado ao buscar os agendamentos. Tente novamente em instantes.' };
+        }
+    }
+
+    private async getBookingsInner(clinicId: string, doctorExternalId: string, start: string, end: string) {
         const startTime = Date.now();
 
         const conn = await this.prisma.integrationConnection.findFirst({
@@ -265,8 +279,10 @@ export class AppointmentsService {
             return { bookings: list, calendarStatus: cd.calendarStatus };
         } catch (e: any) {
             const isHttp = e instanceof HttpException;
-            const details = isHttp ? (e.getResponse() as any).details : null;
+            const resp = isHttp ? e.getResponse() : null;
+            const details = resp && typeof resp === 'object' ? (resp as any).details : null;
             const isTimeout = e.status === 504 || e.message?.includes('timeout') || e.message?.includes('não respondeu');
+            this.logger.error(`Falha ao buscar bookings na Doctoralia (doctor=${doctorExternalId}, ${start}..${end}): ${e?.message}`, e?.stack);
             await this.logRequest({ 
                 clinicId, 
                 action: 'FETCH_BOOKINGS', 
@@ -466,6 +482,18 @@ export class AppointmentsService {
     // ────────────────────── All Bookings ──────────────────────
 
     async getAllBookings(clinicId: string, start: string, end: string) {
+        // Blindagem total: mesma garantia de getBookings — nunca devolver 500.
+        try {
+            return await this.getAllBookingsInner(clinicId, start, end);
+        } catch (e: any) {
+            this.logger.error(`getAllBookings falhou (clinic=${clinicId}, ${start}..${end}): ${e?.message}`, e?.stack);
+            await this.logRequest({ clinicId, action: 'FETCH_ALL_BOOKINGS', start, end, durationMs: 0, status: 'error', error: e?.message, extraDetails: { stack: e?.stack } });
+            // Mensagem genérica para o cliente; o detalhe fica só no log/auditoria.
+            return { bookings: [], calendarEnabled: false, error: 'Erro inesperado ao buscar os agendamentos. Tente novamente em instantes.' };
+        }
+    }
+
+    private async getAllBookingsInner(clinicId: string, start: string, end: string) {
         const startTime = Date.now();
 
         const conn = await this.prisma.integrationConnection.findFirst({
@@ -496,14 +524,15 @@ export class AppointmentsService {
                 calendarEnabled = true;
                 try {
                     const res = await DocplannerClient.runWithPriority(() => client.getBookings(cd.facilityId, m.externalId || '', cd.address.id, start, end));
-                    const items = (res._items || []).map((b: any) => ({
+                    const rawItems = Array.isArray(res) ? res : (res?._items || []);
+                    const items = rawItems.map((b: any) => ({
                         ...b,
                         doctorName: `${cd.name || ''} ${cd.surname || ''}`.trim(),
                         doctorExternalId: m.externalId,
                     }));
                     allBookings.push(...items);
                 } catch (e: any) {
-                    this.logger.warn(`Bookings for doctor ${m.externalId}: ${e.message}`);
+                    this.logger.error(`Falha ao buscar bookings do médico ${m.externalId} (clinic=${clinicId}, ${start}..${end}): ${e?.message}`, e?.stack);
                     errors.push(`${cd.name}: ${e.message}`);
                 }
             }
