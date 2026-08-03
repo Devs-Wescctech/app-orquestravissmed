@@ -101,7 +101,7 @@ export class VismedSyncProcessor extends WorkerHost {
             // vismedIds retornados pela API nesta execução + índice por nome normalizado,
             // para detectar/migrar registros cujo código mudou na VisMed (ex.: 180 → 3472).
             const returnedVismedIds = new Set<number>();
-            const currentSpecIdsByNorm = new Map<string, string>(); // normalizedName -> VismedSpecialty.id (registro atual)
+            const currentSpecTargetByNorm = new Map<string, { id: string; vismedId: number }>(); // normalizedName -> registro atual de menor vismedId
 
             for (const e of especialidades) {
                 if (!e.idcategoriaservico || !e.nomecategoriaservico) continue;
@@ -122,8 +122,11 @@ export class VismedSyncProcessor extends WorkerHost {
                 });
 
                 returnedVismedIds.add(Number(e.idcategoriaservico));
-                if (!currentSpecIdsByNorm.has(normName)) {
-                    currentSpecIdsByNorm.set(normName, spec.id);
+                // Determinístico: entre homônimas, o alvo de migração é sempre a de MENOR vismedId,
+                // independente da ordem em que a API retorna as categorias.
+                const prevTarget = currentSpecTargetByNorm.get(normName);
+                if (!prevTarget || Number(e.idcategoriaservico) < prevTarget.vismedId) {
+                    currentSpecTargetByNorm.set(normName, { id: spec.id, vismedId: Number(e.idcategoriaservico) });
                 }
 
                 // Dispatch matching run
@@ -136,6 +139,8 @@ export class VismedSyncProcessor extends WorkerHost {
             // (código sumiu do retorno da API — VisMed trocou o idcategoriaservico)
             // ----------------------------------------------------
             if (returnedVismedIds.size > 0) {
+                const currentSpecIdsByNorm = new Map<string, string>();
+                for (const [norm, t] of currentSpecTargetByNorm) currentSpecIdsByNorm.set(norm, t.id);
                 await this.migrateObsoleteSpecialties(currentSyncRunId, returnedVismedIds, currentSpecIdsByNorm);
             } else {
                 this.logger.warn('API de especialidades retornou vazia — pulando detecção de códigos obsoletos (fail-safe).');
@@ -218,39 +223,69 @@ export class VismedSyncProcessor extends WorkerHost {
                 if (p.especialidades && typeof p.especialidades === 'string') {
                     const docSpecs = p.especialidades.split(',').map((s: string) => s.trim()).filter((s: string) => s.length > 0);
 
+                    // IDs (VismedSpecialty.id) que a string de especialidades atual justifica.
+                    const expectedSpecIds = new Set<string>();
+
                     for (const specName of docSpecs) {
                         const normSpecName = specName.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
 
-                        // Buscar ID nativo ou registrar especialidade fantasma
-                        let matchedSpec = await this.prisma.vismedSpecialty.findFirst({
-                            where: { normalizedName: normSpecName }
+                        // Buscar TODAS as categorias homônimas (determinístico: ordenado por vismedId).
+                        // A VisMed pode ter duas categorias com o mesmo nome (ex.: Oftalmologia 180 e 3472)
+                        // e o médico deve ficar vinculado a TODAS, não a uma escolhida ao acaso.
+                        let matchedSpecs = await this.prisma.vismedSpecialty.findMany({
+                            where: { normalizedName: normSpecName },
+                            orderBy: { vismedId: 'asc' },
                         });
 
-                        if (!matchedSpec) {
+                        // Categoria "fantasma" SOMENTE quando nenhuma homônima existe.
+                        if (matchedSpecs.length === 0) {
                             const randomId = Math.floor(Math.random() * 10000000) + 1000000;
-                            matchedSpec = await this.prisma.vismedSpecialty.create({
+                            const ghost = await this.prisma.vismedSpecialty.create({
                                 data: {
                                     vismedId: randomId,
                                     name: specName,
                                     normalizedName: normSpecName
                                 }
                             });
-                            await this.matchingEngine.runMatchingForSpecialty(matchedSpec.id);
+                            await this.matchingEngine.runMatchingForSpecialty(ghost.id);
+                            matchedSpecs = [ghost];
                         }
 
-                        await this.prisma.vismedProfessionalSpecialty.upsert({
-                            where: {
-                                vismedDoctorId_vismedSpecialtyId: {
+                        for (const matchedSpec of matchedSpecs) {
+                            expectedSpecIds.add(matchedSpec.id);
+                            await this.prisma.vismedProfessionalSpecialty.upsert({
+                                where: {
+                                    vismedDoctorId_vismedSpecialtyId: {
+                                        vismedDoctorId: doctor.id,
+                                        vismedSpecialtyId: matchedSpec.id
+                                    }
+                                },
+                                update: {},
+                                create: {
                                     vismedDoctorId: doctor.id,
-                                    vismedSpecialtyId: matchedSpec.id
+                                    vismedSpecialtyId: matchedSpec.id,
+                                    source: 'SYNC'
                                 }
-                            },
-                            update: {},
-                            create: {
-                                vismedDoctorId: doctor.id,
-                                vismedSpecialtyId: matchedSpec.id
-                            }
-                        });
+                            });
+                        }
+                    }
+
+                    // Limpeza de vínculos obsoletos: remove vínculos criados pela SYNC cujas
+                    // categorias não constam mais nas especialidades atuais do profissional.
+                    // Vínculos MANUAL são preservados. Só roda quando a string veio preenchida.
+                    const staleLinks = await this.prisma.vismedProfessionalSpecialty.findMany({
+                        where: {
+                            vismedDoctorId: doctor.id,
+                            source: 'SYNC',
+                            vismedSpecialtyId: { notIn: Array.from(expectedSpecIds) },
+                        },
+                        include: { specialty: true },
+                    });
+                    for (const link of staleLinks) {
+                        await this.prisma.vismedProfessionalSpecialty.delete({ where: { id: link.id } });
+                        const msg = `Vínculo obsoleto removido: ${doctor.name} × "${link.specialty?.name}" (idcategoriaservico=${link.specialty?.vismedId}) — categoria não consta mais nas especialidades do profissional.`;
+                        this.logger.log(`[SPECIALTY-LINK-CLEANUP] ${msg}`);
+                        await this.logEvent(currentSyncRunId, 'DOCTOR', 'specialty_link_removed', msg);
                     }
                 }
 
@@ -359,6 +394,7 @@ export class VismedSyncProcessor extends WorkerHost {
                 doctors: true,
                 mappings: true,
             },
+            orderBy: { vismedId: 'asc' },
         });
 
         for (const stale of staleSpecs) {

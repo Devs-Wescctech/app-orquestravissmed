@@ -291,6 +291,10 @@ model VismedProfessionalSpecialty {
   id                String          @id @default(uuid())
   vismedDoctorId    String
   vismedSpecialtyId String
+  // Origem do vínculo: 'SYNC' (criado pela sincronização a partir da string de
+  // especialidades) ou 'MANUAL' (criado/confirmado por operador — nunca removido
+  // pela limpeza automática de vínculos obsoletos).
+  source            String          @default("SYNC")
   createdAt         DateTime        @default(now())
 
   doctor            VismedDoctor    @relation(fields: [vismedDoctorId], references: [id], onDelete: Cascade)

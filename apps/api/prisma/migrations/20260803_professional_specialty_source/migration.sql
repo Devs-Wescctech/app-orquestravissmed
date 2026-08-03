@@ -1,0 +1,1 @@
+ALTER TABLE "VismedProfessionalSpecialty" ADD COLUMN IF NOT EXISTS "source" TEXT NOT NULL DEFAULT 'SYNC';

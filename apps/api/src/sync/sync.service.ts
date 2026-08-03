@@ -233,27 +233,50 @@ export class SyncService {
 
                 if (p.especialidades && typeof p.especialidades === 'string') {
                     const docSpecs = p.especialidades.split(',').map((s: string) => s.trim()).filter((s: string) => s.length > 0);
+                    const expectedSpecIds = new Set<string>();
                     for (const specName of docSpecs) {
                         const normSpecName = specName.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
-                        let matchedSpec = await this.prisma.vismedSpecialty.findFirst({
-                            where: { normalizedName: normSpecName }
+                        // TODAS as homônimas, ordenadas (determinístico) — não findFirst ao acaso.
+                        let matchedSpecs = await this.prisma.vismedSpecialty.findMany({
+                            where: { normalizedName: normSpecName },
+                            orderBy: { vismedId: 'asc' },
                         });
-                        if (!matchedSpec) {
+                        if (matchedSpecs.length === 0) {
                             const randomId = Math.floor(Math.random() * 10000000) + 1000000;
-                            matchedSpec = await this.prisma.vismedSpecialty.create({
+                            const ghost = await this.prisma.vismedSpecialty.create({
                                 data: { vismedId: randomId, name: specName, normalizedName: normSpecName }
                             });
-                            await this.matchingEngine.runMatchingForSpecialty(matchedSpec.id);
+                            await this.matchingEngine.runMatchingForSpecialty(ghost.id);
+                            matchedSpecs = [ghost];
                         }
-                        await this.prisma.vismedProfessionalSpecialty.upsert({
-                            where: {
-                                vismedDoctorId_vismedSpecialtyId: {
-                                    vismedDoctorId: doctor.id, vismedSpecialtyId: matchedSpec.id
-                                }
-                            },
-                            update: {},
-                            create: { vismedDoctorId: doctor.id, vismedSpecialtyId: matchedSpec.id }
-                        });
+                        for (const matchedSpec of matchedSpecs) {
+                            expectedSpecIds.add(matchedSpec.id);
+                            await this.prisma.vismedProfessionalSpecialty.upsert({
+                                where: {
+                                    vismedDoctorId_vismedSpecialtyId: {
+                                        vismedDoctorId: doctor.id, vismedSpecialtyId: matchedSpec.id
+                                    }
+                                },
+                                update: {},
+                                create: { vismedDoctorId: doctor.id, vismedSpecialtyId: matchedSpec.id, source: 'SYNC' }
+                            });
+                        }
+                    }
+                    // Remove vínculos SYNC obsoletos (categoria não consta mais nas especialidades);
+                    // vínculos MANUAL são preservados.
+                    const staleLinks = await this.prisma.vismedProfessionalSpecialty.findMany({
+                        where: {
+                            vismedDoctorId: doctor.id,
+                            source: 'SYNC',
+                            vismedSpecialtyId: { notIn: Array.from(expectedSpecIds) },
+                        },
+                        include: { specialty: true },
+                    });
+                    for (const link of staleLinks) {
+                        await this.prisma.vismedProfessionalSpecialty.delete({ where: { id: link.id } });
+                        const msg = `Vínculo obsoleto removido: ${doctor.name} × "${link.specialty?.name}" (idcategoriaservico=${link.specialty?.vismedId}) — categoria não consta mais nas especialidades do profissional.`;
+                        this.logger.log(`[SPECIALTY-LINK-CLEANUP] ${msg}`);
+                        await this.logEvent(syncRunId, 'DOCTOR', 'specialty_link_removed', msg);
                     }
                 }
                 insertedOrUpdated++;
