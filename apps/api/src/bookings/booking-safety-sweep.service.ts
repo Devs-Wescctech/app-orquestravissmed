@@ -40,6 +40,11 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
     private readonly intervalMin = envInt('BOOKING_SWEEP_INTERVAL_MIN', 20, 5, 24 * 60);
     private readonly horizonDays = envInt('BOOKING_SWEEP_HORIZON_DAYS', 60, 1, 365);
     private timer: NodeJS.Timeout | null = null;
+    /** Estado das varreduras manuais por clínica (gatilho da UI, roda em background). */
+    private readonly manualSweeps = new Map<
+        string,
+        { running: boolean; startedAt: string; finishedAt?: string; enqueued?: number; error?: string }
+    >();
     private startupTimer: NodeJS.Timeout | null = null;
     private isRunning = false;
     private isShuttingDown = false;
@@ -120,6 +125,53 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
             this.isRunning = false;
         }
         return { clinics: clinicsSwept, enqueued: totalEnqueued };
+    }
+
+    /**
+     * Gatilho MANUAL (botão "Verificar Agora" da UI): responde imediatamente e roda a
+     * varredura da clínica em background. A UI nunca espera a fila/vazão da Doctoralia.
+     * Retorna false se já houver uma varredura manual em andamento para a clínica.
+     */
+    startManualSweep(conn: any): { started: boolean; reason?: string } {
+        const clinicId = String(conn?.clinicId || '');
+        if (!clinicId) return { started: false, reason: 'Conexão sem clínica associada' };
+        const current = this.manualSweeps.get(clinicId);
+        if (current?.running) {
+            return { started: false, reason: 'Já existe uma verificação em andamento para esta clínica' };
+        }
+        this.manualSweeps.set(clinicId, { running: true, startedAt: new Date().toISOString() });
+        this.logger.log(`[SAFETY-SWEEP] [MANUAL] Varredura em background iniciada para clínica ${clinicId}`);
+
+        // Fire-and-forget com try/catch abrangente: NENHUMA falha aqui pode virar 500 na requisição.
+        (async () => {
+            try {
+                const enqueued = await DocplannerClient.runWithPriority(() => this.sweepClinic(conn));
+                this.manualSweeps.set(clinicId, {
+                    running: false,
+                    startedAt: this.manualSweeps.get(clinicId)?.startedAt || new Date().toISOString(),
+                    finishedAt: new Date().toISOString(),
+                    enqueued,
+                });
+                this.logger.log(`[SAFETY-SWEEP] [MANUAL] Varredura da clínica ${clinicId} concluída: ${enqueued} booking(s) enfileirado(s).`);
+            } catch (err: any) {
+                this.logger.error(`[SAFETY-SWEEP] [MANUAL] Varredura da clínica ${clinicId} falhou: ${err?.message}`, err?.stack);
+                this.manualSweeps.set(clinicId, {
+                    running: false,
+                    startedAt: this.manualSweeps.get(clinicId)?.startedAt || new Date().toISOString(),
+                    finishedAt: new Date().toISOString(),
+                    error: err?.message || 'Erro inesperado na verificação',
+                });
+            }
+        })();
+
+        return { started: true };
+    }
+
+    /** Estado da última varredura manual da clínica (para a UI acompanhar via polling). */
+    getManualSweepStatus(clinicId: string) {
+        const s = this.manualSweeps.get(clinicId);
+        if (!s) return { running: false };
+        return s;
     }
 
     /**

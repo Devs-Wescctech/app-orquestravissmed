@@ -274,19 +274,47 @@ export default function AppointmentsPage() {
             const res = await api.post('/booking-sync/safety-sweep', { clinicId });
             if (res.data?.ok === false) {
                 toast.error(res.data?.reason || 'Não foi possível verificar agora', { id: toastId });
-            } else {
-                const n = res.data?.enqueued ?? 0;
-                toast.success(
-                    n > 0
-                        ? `${n} agendamento(s) encontrado(s) e enviado(s) para criação na VissMed`
-                        : 'Verificação concluída: nenhum agendamento pendente encontrado',
-                    { id: toastId, duration: 8000 },
-                );
-                fetchBookings();
+                setIsSweeping(false);
+                return;
             }
+            // Verificação iniciada em background — acompanha o resultado via polling do status.
+            toast.loading('Verificação iniciada — buscando agendamentos na Doctoralia...', { id: toastId });
+            const deadline = Date.now() + 3 * 60 * 1000;
+            const poll = async () => {
+                try {
+                    const st = await api.get('/booking-sync/safety-sweep/status', { params: { clinicId } });
+                    if (st.data?.running === false && st.data?.finishedAt) {
+                        if (st.data?.error) {
+                            toast.error(`Erro na verificação: ${st.data.error}`, { id: toastId, duration: 8000 });
+                        } else {
+                            const n = st.data?.enqueued ?? 0;
+                            toast.success(
+                                n > 0
+                                    ? `${n} agendamento(s) encontrado(s) e enviado(s) para criação na VissMed`
+                                    : 'Verificação concluída: nenhum agendamento pendente encontrado',
+                                { id: toastId, duration: 8000 },
+                            );
+                            fetchBookings();
+                        }
+                        setIsSweeping(false);
+                        return;
+                    }
+                } catch {
+                    // erro transitório de rede no polling: tenta de novo até o prazo
+                }
+                if (Date.now() < deadline) {
+                    setTimeout(poll, 3000);
+                } else {
+                    toast.success('Verificação segue em andamento — atualize a agenda em instantes para ver o resultado', {
+                        id: toastId,
+                        duration: 8000,
+                    });
+                    setIsSweeping(false);
+                }
+            };
+            setTimeout(poll, 2500);
         } catch (e: any) {
             toast.error(`Erro na verificação: ${e.response?.data?.message || e.message}`, { id: toastId });
-        } finally {
             setIsSweeping(false);
         }
     };

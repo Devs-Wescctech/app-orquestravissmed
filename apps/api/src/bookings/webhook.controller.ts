@@ -262,16 +262,30 @@ export class BookingSyncController {
     async triggerSafetySweep(@Req() req: any, @Body() body?: { clinicId?: string }) {
         if (body?.clinicId) {
             this.validateClinicAccess(req.user, body.clinicId);
-            const conn = await this.prisma.integrationConnection.findFirst({
-                where: { clinicId: body.clinicId, provider: 'doctoralia', status: { not: 'disconnected' }, clientId: { not: null } },
-            });
+            let conn: any = null;
+            try {
+                conn = await this.prisma.integrationConnection.findFirst({
+                    where: { clinicId: body.clinicId, provider: 'doctoralia', status: { not: 'disconnected' }, clientId: { not: null } },
+                });
+            } catch (err: any) {
+                this.logger.error(`[MANUAL] Falha ao consultar integração da clínica ${body.clinicId}: ${err?.message}`, err?.stack);
+                return { ok: false, reason: 'Falha ao consultar a integração no banco de dados' };
+            }
             if (!conn) return { ok: false, reason: 'Sem integração Doctoralia conectada' };
             this.logger.log(`[MANUAL] Varredura de segurança para clínica ${body.clinicId}`);
-            const enqueued = await DocplannerClient.runWithPriority(() => this.safetySweepService.sweepClinic(conn));
-            return { ok: true, enqueued };
+            // Responde imediatamente; a varredura roda em background (UI nunca espera a fila Doctoralia).
+            const { started, reason } = this.safetySweepService.startManualSweep(conn);
+            if (!started) return { ok: false, reason: reason || 'Não foi possível iniciar a verificação' };
+            return { ok: true, started: true };
         }
         this.logger.log('[MANUAL] Varredura de segurança para todas as clínicas');
         const result = await this.safetySweepService.runSweepAllClinics();
         return { ok: true, ...result };
+    }
+
+    @Get('safety-sweep/status')
+    async getSafetySweepStatus(@Req() req: any, @Query('clinicId') clinicId: string) {
+        this.validateClinicAccess(req.user, clinicId);
+        return this.safetySweepService.getManualSweepStatus(clinicId);
     }
 }
