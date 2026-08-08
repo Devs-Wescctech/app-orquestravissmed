@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { DocplannerClient } from '../integrations/docplanner.service';
 import { SlotSyncService } from './slot-sync.service';
 import { VismedAvailabilityService, ClinicAvailability } from './vismed-availability.service';
+import { SyncCycleContext } from './sync-cycle-context';
 
 @Injectable()
 export class PushSyncService {
@@ -93,6 +94,10 @@ export class PushSyncService {
                 continue;
             }
 
+            // Contexto de ciclo: reutiliza respostas de GET /addresses e GET /services
+            // dentro da mesma execução (PushSync → SlotSync), sem cache entre ciclos.
+            const cycleCtx = new SyncCycleContext();
+
             // We need the doctoralia address IDs to sync. 
             // Vismed currently doesn't map VisMedUnit to DoctoraliaAddress 1:1, 
             // but Doctoralia doctors belong to a Facility which has Addresses.
@@ -101,6 +106,8 @@ export class PushSyncService {
             try {
                 const addrsRes = await client.getAddresses(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId);
                 doctoraliaAddresses = addrsRes._items || [];
+                // Armazena no contexto para reuso pelo SlotSync no mesmo ciclo.
+                cycleCtx.setAddresses(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, doctoraliaAddresses);
             } catch (error: any) {
                 this.logger.error(`Error fetching addresses for doctor ${dDoc.name}: ${error.message}`);
                 continue;
@@ -148,7 +155,7 @@ export class PushSyncService {
                 }
 
                 // 3. SERVICES DELTA
-                await this.syncServicesDelta(syncRunId, client, dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, vDoc.specialties, dDoc.name, facilityCatalogIds);
+                await this.syncServicesDelta(syncRunId, client, dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, vDoc.specialties, dDoc.name, facilityCatalogIds, cycleCtx);
 
                 // 4. INSURANCE PROVIDERS SYNC
                 await this.syncInsuranceProviders(syncRunId, client, clinicId, dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, dDoc.name);
@@ -159,7 +166,7 @@ export class PushSyncService {
             // No modo template (legado), só roda se houver turno_m/t/n configurado.
             try {
                 if (!slotSourceTemplate || vDoc.turnoM || vDoc.turnoT || vDoc.turnoN) {
-                    const slotResult = await this.slotSync.syncSlotsForDoctor(vDoc.id, client, syncRunId, 30, clinicId, availability);
+                    const slotResult = await this.slotSync.syncSlotsForDoctor(vDoc.id, client, syncRunId, 30, clinicId, availability, cycleCtx);
                     this.logger.log(`Doctor ${dDoc.name}: [SLOTS] ${slotResult.message}`);
                     if (slotResult.success) {
                         const doctorMapping = await this.prisma.mapping.findFirst({
@@ -181,6 +188,10 @@ export class PushSyncService {
                 this.logger.warn(`Doctor ${dDoc.name}: [SLOTS FAILED] ${error.message}`);
                 await this.logEvent(syncRunId, 'SLOT_SYNC', 'error', `Doctor ${dDoc.name}: Falha no sync de slots - ${error.message}`);
             }
+
+            // Exibe as estatísticas de reuso do contexto de ciclo (hits/misses) para
+            // validação operacional do ganho de chamadas à API Doctoralia.
+            cycleCtx.logStats(dDoc.name);
         }
 
         this.logger.log(`REVERSE SYNC completed.`);
@@ -195,16 +206,28 @@ export class PushSyncService {
         vismedSpecialties: any[],
         doctorName: string,
         facilityCatalogIds: Set<string> | null,
+        cycleCtx?: SyncCycleContext,
     ) {
-        // Fetch current address services from Doctoralia
+        // Fetch current address services from Doctoralia (reusa do contexto se disponível).
         let currentServices = [];
         try {
-            const res = await client.getServices(facilityId, doctorId, addressId);
-            currentServices = res._items || [];
+            const cached = cycleCtx?.getServices(facilityId, doctorId, addressId);
+            if (cached !== undefined) {
+                currentServices = cached;
+            } else {
+                const res = await client.getServices(facilityId, doctorId, addressId);
+                currentServices = res._items || [];
+                cycleCtx?.setServices(facilityId, doctorId, addressId, currentServices);
+            }
         } catch (error: any) {
             this.logger.error(`Doctor ${doctorName}: Failed to fetch current services for address ${addressId}: ${error.message}`);
             return;
         }
+
+        // Rastrea se alguma mutação (add/delete) ocorreu neste endereço.
+        // Usado para invalidar o cache de serviços no contexto de ciclo ao final,
+        // garantindo que o SlotSync subsequente busque a lista atualizada da Doctoralia.
+        let servicesMutated = false;
 
         // Map current services by their dictionary service_id (not address_service id)
         // Each address_service has: id (address_service_id), service_id (dictionary_id)
@@ -313,6 +336,7 @@ export class PushSyncService {
                     };
                     await client.addAddressService(facilityId, doctorId, addressId, payload);
                     addedDictIds.add(dictId);
+                    servicesMutated = true;
                     this.logger.log(`Doctor ${doctorName}: [ADD] Service dict:${dictId} (${specName}) to Address ${addressId}`);
                     await this.logEvent(syncRunId, 'SERVICE_PUSH', 'created', `Doctor ${doctorName}: Adicionado serviço "${specName}" (dict:${dictId}) ao endereço ${addressId}`);
                 } catch (error: any) {
@@ -350,6 +374,7 @@ export class PushSyncService {
                     try {
                         const addrSvcId = String(addrSvc.id);
                         await client.deleteAddressService(facilityId, doctorId, addressId, addrSvcId);
+                        servicesMutated = true;
                         this.logger.log(`Doctor ${doctorName}: [DELETE] Service addr_svc:${addrSvcId} (dict:${dictId}) from Address ${addressId}`);
                         await this.logEvent(syncRunId, 'SERVICE_PUSH', 'deleted', `Doctor ${doctorName}: Removido serviço excessivo (dict:${dictId}) do endereço ${addressId}`);
                     } catch (error: any) {
@@ -358,6 +383,14 @@ export class PushSyncService {
                     }
                 }
             }
+        }
+
+        // Se qualquer mutação ocorreu (add ou delete bem-sucedido), invalida o cache de
+        // serviços no contexto de ciclo. O SlotSync subsequente fará um GET real para obter
+        // a lista atualizada, evitando usar address_service IDs stale ou ausentes.
+        if (servicesMutated) {
+            cycleCtx?.invalidateServices(facilityId, doctorId, addressId);
+            this.logger.debug(`Doctor ${doctorName}: [CTX] services invalidated for addr ${addressId} após mutação`);
         }
     }
 

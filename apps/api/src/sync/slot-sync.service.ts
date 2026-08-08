@@ -5,6 +5,7 @@ import { DocplannerClient } from '../integrations/docplanner.service';
 import { VismedAvailabilityService, ClinicAvailability, AvailRange } from './vismed-availability.service';
 import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 import { getDoctoraliaMetricsService } from '../metrics/doctoralia-metrics.service';
+import { SyncCycleContext } from './sync-cycle-context';
 
 interface TurnoSlot {
     start: string;
@@ -146,10 +147,11 @@ export class SlotSyncService {
         daysAhead: number = 30,
         clinicId?: string,
         availability?: ClinicAvailability | null,
+        cycleCtx?: SyncCycleContext,
     ): Promise<{ success: boolean; message: string; slotsCreated: number }> {
         // WP-01: propagate SLOT_SYNC context for all Doctoralia calls within this sync
         return runWithDoctoraliaContext({ origin: 'SLOT_SYNC', clinicId }, () =>
-            this._syncSlotsForDoctorInner(vismedDoctorId, client, syncRunId, daysAhead, clinicId, availability),
+            this._syncSlotsForDoctorInner(vismedDoctorId, client, syncRunId, daysAhead, clinicId, availability, cycleCtx),
         );
     }
 
@@ -160,6 +162,7 @@ export class SlotSyncService {
         daysAhead: number = 30,
         clinicId?: string,
         availability?: ClinicAvailability | null,
+        cycleCtx?: SyncCycleContext,
     ): Promise<{ success: boolean; message: string; slotsCreated: number }> {
         const slotSyncStartAt = Date.now();
         const source = this.slotSource();
@@ -238,8 +241,14 @@ export class SlotSyncService {
 
         let doctoraliaAddresses: any[];
         try {
-            const res = await client.getAddresses(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId);
-            doctoraliaAddresses = res._items || [];
+            const cachedAddrs = cycleCtx?.getAddresses(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId);
+            if (cachedAddrs !== undefined) {
+                doctoraliaAddresses = cachedAddrs;
+            } else {
+                const res = await client.getAddresses(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId);
+                doctoraliaAddresses = res._items || [];
+                cycleCtx?.setAddresses(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, doctoraliaAddresses);
+            }
         } catch (error: any) {
             const msg = `Falha ao buscar endereços Doctoralia para ${doctor.name}: ${error.message}`;
             this.logger.error(msg);
@@ -307,8 +316,14 @@ export class SlotSyncService {
 
             let addressServices: any[];
             try {
-                const svcRes = await client.getServices(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId);
-                addressServices = svcRes._items || [];
+                const cachedSvcs = cycleCtx?.getServices(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId);
+                if (cachedSvcs !== undefined) {
+                    addressServices = cachedSvcs;
+                } else {
+                    const svcRes = await client.getServices(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId);
+                    addressServices = svcRes._items || [];
+                    cycleCtx?.setServices(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, addressServices);
+                }
             } catch (error: any) {
                 this.logger.warn(`Failed to get services for addr ${addrId}: ${error.message}`);
                 addressesFailed++;
