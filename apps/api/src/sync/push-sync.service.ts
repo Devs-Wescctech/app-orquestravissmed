@@ -4,6 +4,7 @@ import { DocplannerClient } from '../integrations/docplanner.service';
 import { SlotSyncService } from './slot-sync.service';
 import { VismedAvailabilityService, ClinicAvailability } from './vismed-availability.service';
 import { SyncCycleContext } from './sync-cycle-context';
+import { canSkipAddressPatch } from './address-patch-compare';
 
 @Injectable()
 export class PushSyncService {
@@ -146,9 +147,19 @@ export class PushSyncService {
                     if (clinic.addressCity) addressPayload.city_name = clinic.addressCity;
                     if (clinic.addressZipCode) addressPayload.post_code = clinic.addressZipCode;
 
-                    await client.updateAddress(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, addressPayload);
-                    this.logger.log(`Doctor ${dDoc.name}: [ADDR] Updated address ${addrId} with clinic config (insurance_support=${desiredInsuranceSupport})`);
-                    await this.logEvent(syncRunId, 'ADDRESS_PUSH', 'updated', `Doctor ${dDoc.name}: Endereço ${addrId} atualizado (insurance_support=${desiredInsuranceSupport})`);
+                    // Comparação condicional: omite o PATCH quando o estado remoto já
+                    // corresponde ao payload desejado (para campos com equivalência comprovada).
+                    // Ver address-patch-compare.ts para a lista de campos comparáveis e
+                    // as regras de normalização (trim, remoção de não-numéricos para CEP, etc.).
+                    const { skip, reason } = canSkipAddressPatch(addressPayload, addr);
+                    if (skip) {
+                        this.logger.log(`Doctor ${dDoc.name}: [ADDR SKIP] address_patch_skipped clinic=${clinicId} addr=${addrId} — ${reason}`);
+                        await this.logEvent(syncRunId, 'ADDRESS_PUSH', 'address_patch_skipped', `Doctor ${dDoc.name}: PATCH endereço ${addrId} omitido — estado remoto já está correto (${reason})`);
+                    } else {
+                        await client.updateAddress(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, addressPayload);
+                        this.logger.log(`Doctor ${dDoc.name}: [ADDR] address_patch_sent clinic=${clinicId} addr=${addrId} — ${reason} (insurance_support=${desiredInsuranceSupport})`);
+                        await this.logEvent(syncRunId, 'ADDRESS_PUSH', 'address_patch_sent', `Doctor ${dDoc.name}: Endereço ${addrId} atualizado (insurance_support=${desiredInsuranceSupport})`);
+                    }
                 } catch (error: any) {
                     this.logger.warn(`Doctor ${dDoc.name}: [ADDR FAILED] Address ${addrId}: ${error.message}`);
                     await this.logEvent(syncRunId, 'ADDRESS_PUSH', 'error', `Doctor ${dDoc.name}: Falha ao atualizar endereço ${addrId} - ${error.message}`);
