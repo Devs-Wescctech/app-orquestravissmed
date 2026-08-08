@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { DocplannerService } from '../integrations/docplanner.service';
+import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 
 @Injectable()
 export class DoctorsService {
@@ -59,6 +60,11 @@ export class DoctorsService {
      * Fetches all doctors live from Doctoralia API with enriched data (addresses, services, calendar status)
      */
     async fetchLive(clinicId: string) {
+        // WP-01: propagate USER_INTERACTIVE context for all Doctoralia calls in this flow
+        return runWithDoctoraliaContext({ origin: 'USER_INTERACTIVE', clinicId }, () => this._fetchLiveInner(clinicId));
+    }
+
+    private async _fetchLiveInner(clinicId: string) {
         const conn = await this.prisma.integrationConnection.findFirst({
             where: { clinicId, provider: 'doctoralia' },
         });

@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
 import { SyncService } from './sync.service';
+import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 
 @Injectable()
 export class SyncSchedulerService implements OnModuleInit {
@@ -58,6 +59,11 @@ export class SyncSchedulerService implements OnModuleInit {
             return;
         }
 
+        // WP-01: propagate SCHEDULER context for all Doctoralia calls within this cron cycle
+        return runWithDoctoraliaContext({ origin: 'SCHEDULER' }, () => this._runGlobalSyncForAllClinicsInner());
+    }
+
+    private async _runGlobalSyncForAllClinicsInner() {
         this.isRunning = true;
         const startedAt = new Date();
         this.logger.log(`[SCHEDULER] >>> Iniciando ciclo automático de sync global (${startedAt.toISOString()})`);

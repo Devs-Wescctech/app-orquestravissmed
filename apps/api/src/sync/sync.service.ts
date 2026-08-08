@@ -6,6 +6,7 @@ import { VismedService } from '../integrations/vismed/vismed.service';
 import { DocplannerService } from '../integrations/docplanner.service';
 import { MatchingEngineService } from '../mappings/matching-engine.service';
 import { PushSyncService } from './push-sync.service';
+import { getDoctoraliaContext, runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 
 @Injectable()
 export class SyncService {
@@ -75,16 +76,21 @@ export class SyncService {
             }
         } else {
             try {
+                // WP-01: serialize the current ALS context origin into the job payload so the
+                // BullMQ processor (new async context) can reconstruct it for observability.
+                const _observabilityOrigin = getDoctoraliaContext()?.origin ?? 'SCHEDULER';
                 await this.doctoraliaQueue.add('process-sync', {
                     syncRunId: syncRun.id,
                     clinicId,
-                    type
+                    type,
+                    _observabilityOrigin,
                 }, { attempts: 3, backoff: { type: 'exponential', delay: 2000 } });
                 this.logger.log(`Dispatched DOCTORALIA sync job for clinic ${clinicId}`);
             } catch (e) {
                 if (this.isRedisUnavailable(e)) {
                     this.logger.warn(`Redis unavailable, running DOCTORALIA sync directly for clinic ${clinicId}`);
-                    this.runDoctoraliaSyncDirect(syncRun.id, clinicId).catch(err =>
+                    const _directOrigin = getDoctoraliaContext()?.origin ?? 'SCHEDULER';
+                    this.runDoctoraliaSyncDirect(syncRun.id, clinicId, _directOrigin).catch(err =>
                         this.logger.error(`Direct DOCTORALIA sync failed: ${err.message}`)
                     );
                 } else {
@@ -341,8 +347,13 @@ export class SyncService {
         }
     }
 
-    private async runDoctoraliaSyncDirect(syncRunId: string, clinicId: string) {
+    private async runDoctoraliaSyncDirect(syncRunId: string, clinicId: string, observabilityOrigin: string = 'SCHEDULER') {
         this.logger.log(`[DIRECT] Starting Doctoralia sync for clinic ${clinicId}`);
+        // WP-01: reconstruct Doctoralia context (ALS doesn't propagate across async fire-and-forget)
+        return runWithDoctoraliaContext({ origin: observabilityOrigin as any, clinicId }, () => this._runDoctoraliaSyncDirectBody(syncRunId, clinicId));
+    }
+
+    private async _runDoctoraliaSyncDirectBody(syncRunId: string, clinicId: string) {
         try {
             const conn = await this.prisma.integrationConnection.findFirst({
                 where: { clinicId, provider: 'doctoralia' }

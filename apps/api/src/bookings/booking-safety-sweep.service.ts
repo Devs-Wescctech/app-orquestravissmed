@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { DocplannerClient, DocplannerService } from '../integrations/docplanner.service';
 import { QueueService } from './queue.service';
 import { RateLimiterService } from './rate-limiter.service';
+import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 
 /**
  * Rede de segurança para agendamentos Doctoralia perdidos.
@@ -181,7 +182,11 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
      */
     async sweepClinic(conn: any): Promise<number> {
         if (!conn?.clientId || !conn?.clientSecret) return 0;
+        // WP-01: propagate SAFETY_SWEEP context for all Doctoralia calls within this sweep
+        return runWithDoctoraliaContext({ origin: 'SAFETY_SWEEP', clinicId: conn.clinicId }, () => this._sweepClinicInner(conn));
+    }
 
+    private async _sweepClinicInner(conn: any): Promise<number> {
         const pairs = await this.collectDoctorAddressPairs(conn.clinicId);
         if (pairs.length === 0) {
             this.logger.debug(`[SAFETY-SWEEP] Clínica ${conn.clinicId}: nenhum médico vinculado com endereço conhecido.`);

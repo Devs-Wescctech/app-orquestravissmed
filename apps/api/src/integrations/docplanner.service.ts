@@ -2,6 +2,9 @@ import { Injectable, Logger } from '@nestjs/common';
 import { AsyncLocalStorage } from 'async_hooks';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
+import { getDoctoraliaMetricsService } from '../metrics/doctoralia-metrics.service';
+import { getDoctoraliaContext } from '../metrics/doctoralia-call-context';
+import { randomUUID } from 'crypto';
 
 interface CachedToken {
     token: string;
@@ -104,8 +107,27 @@ export class DocplannerClient {
     /** Aguarda (se necessário) até haver espaço na janela de vazão e registra a requisição. */
     private static acquireRateSlot(logger: Logger): Promise<void> {
         const priority = DocplannerClient.priorityAls.getStore() === true;
+        const enqueuedAt = Date.now();
         return new Promise<void>(resolve => {
-            (priority ? DocplannerClient.waitingHigh : DocplannerClient.waitingLow).push(resolve);
+            (priority ? DocplannerClient.waitingHigh : DocplannerClient.waitingLow).push(() => {
+                // Emite snapshot de fila sem alterar o algoritmo
+                try {
+                    const metrics = getDoctoraliaMetricsService();
+                    if (metrics) {
+                        const now = Date.now();
+                        const cutoff = now - DocplannerClient.RATE_WINDOW_MS;
+                        const ts = DocplannerClient.rateTimestamps;
+                        const used = ts.filter(t => t > cutoff).length;
+                        logger.debug(
+                            `[METRICS] DOCTORALIA_RATE_LIMIT_USAGE=${used} DOCTORALIA_RATE_LIMIT_REMAINING=${DocplannerClient.RATE_LIMIT - used} ` +
+                            `DOCTORALIA_QUEUE_SIZE_HIGH=${DocplannerClient.waitingHigh.length} ` +
+                            `DOCTORALIA_QUEUE_SIZE_LOW=${DocplannerClient.waitingLow.length} ` +
+                            `DOCTORALIA_QUEUE_WAIT_MS=${now - enqueuedAt}`,
+                        );
+                    }
+                } catch (_e) { /* fail-safe */ }
+                resolve();
+            });
             void DocplannerClient.pumpRateQueue(logger);
         });
     }
@@ -227,20 +249,57 @@ export class DocplannerClient {
         const url = `https://${domain}/oauth/v2/token`;
         const basicAuth = Buffer.from(`${this.clientId}:${this.clientSecret}`).toString('base64');
 
+        const _oauthEnqueuedAt = Date.now();
         await DocplannerClient.acquireRateSlot(this.logger);
-        const response = await fetch(url, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Authorization': `Basic ${basicAuth}`,
-                // O fetch do Node não envia User-Agent; o WAF da Doctoralia pontua
-                // requisições sem identificação como robô suspeito.
-                'User-Agent': 'Orquestrador/1.0 (VisMed integration)',
-            },
-            body: 'grant_type=client_credentials&scope=integration',
-        });
+        const _oauthReleasedAt = Date.now();
+        const _oauthSentAt = Date.now();
+        // WP-01: httpStatus default para NETWORK; será sobrescrito se fetch retornar
+        let _oauthHttpStatus: number | 'TIMEOUT' | 'NETWORK' | 'OTHER' = 'NETWORK';
+        let response: Awaited<ReturnType<typeof fetch>> | undefined;
+        try {
+            response = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Authorization': `Basic ${basicAuth}`,
+                    // O fetch do Node não envia User-Agent; o WAF da Doctoralia pontua
+                    // requisições sem identificação como robô suspeito.
+                    'User-Agent': 'Orquestrador/1.0 (VisMed integration)',
+                },
+                body: 'grant_type=client_credentials&scope=integration',
+            });
+            _oauthHttpStatus = response.status;
+        } catch (fetchErr: any) {
+            _oauthHttpStatus = fetchErr?.name === 'AbortError' ? 'TIMEOUT' : 'NETWORK';
+            throw fetchErr;
+        } finally {
+            // WP-01: registra chamada OAuth em finally — cobre sucesso, HTTP error E network failure
+            const _oauthRespondedAt = Date.now();
+            try {
+                const metrics = getDoctoraliaMetricsService();
+                if (metrics) {
+                    metrics.record({
+                        doctoraliaRequestId: randomUUID(),
+                        origin: 'AUTHENTICATION',
+                        operation: 'OAUTH_TOKEN',
+                        endpoint: '/oauth/v2/token',
+                        method: 'POST',
+                        httpStatus: _oauthHttpStatus,
+                        isRetry: false,
+                        retryNumber: 0,
+                        isOAuth: true,
+                        enqueuedAt: _oauthEnqueuedAt,
+                        releasedAt: _oauthReleasedAt,
+                        sentAt: _oauthSentAt,
+                        respondedAt: _oauthRespondedAt,
+                        waitMs: _oauthReleasedAt - _oauthEnqueuedAt,
+                        execMs: _oauthRespondedAt - _oauthSentAt,
+                    });
+                }
+            } catch (_e) { /* fail-safe: metrics never propagate */ }
+        }
 
-        if (!response.ok) {
+        if (!response!.ok) {
             const errorText = await response.text();
             // Diagnóstico forense do bloqueio WAF: registra cabeçalhos da resposta,
             // content-type e o IP público de saída NO INSTANTE da falha, para
@@ -290,11 +349,20 @@ export class DocplannerClient {
         }
         const domain = this.getBaseUrl().replace(/^https?:\/\//, '');
         const url = `https://${domain}${path}`;
+
+        // WP-01: captura contexto e prepara instrumentação
+        const ctx = getDoctoraliaContext();
+        const doctoraliaRequestId = randomUUID();
+        const enqueuedAt = Date.now();
+
         // Adquire o slot ANTES de armar o timeout de 30s — a espera na fila de vazão
         // não pode consumir o tempo da requisição em si.
         await DocplannerClient.acquireRateSlot(this.logger);
+        const releasedAt = Date.now();
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 30000);
+        let httpStatus: number | 'TIMEOUT' | 'NETWORK' | 'OTHER' | undefined;
+        const sentAt = Date.now();
 
         try {
             const headers: any = {
@@ -315,6 +383,7 @@ export class DocplannerClient {
 
             this.logger.verbose(`Calling Docplanner API: ${method} ${url}`);
             const response = await fetch(url, options);
+            httpStatus = response.status;
 
             if (method === 'PUT' || method === 'PATCH') {
                 this.logger.log(`API Response: ${method} ${path} → status=${response.status}, content-type=${response.headers.get('content-type')}`);
@@ -353,9 +422,79 @@ export class DocplannerClient {
             const text = await response.text();
             if (!text || !text.trim()) return null;
             try { return JSON.parse(text); } catch { return null; }
+        } catch (err: any) {
+            // Classifica o tipo de erro para métricas
+            if (!httpStatus) {
+                const isAbort = err?.name === 'AbortError';
+                httpStatus = isAbort ? 'TIMEOUT' : 'NETWORK';
+            }
+            throw err;
         } finally {
             clearTimeout(timeout);
+            // WP-01: registra evento de forma fail-safe
+            const respondedAt = Date.now();
+            try {
+                const metrics = getDoctoraliaMetricsService();
+                if (metrics) {
+                    // WP-01: extrair IDs reais DO PATH antes de sanitizar (para resourceKey de assinatura)
+                    const rawIdMatches = path.split('?')[0].match(/\/(\d+)/g);
+                    const resourceKey = rawIdMatches ? rawIdMatches.map(s => s.slice(1)).join('|') : '';
+                    // Sanitizar IDs no path mas PRESERVAR query params para assinatura de duplicatas
+                    const [pathPart, queryPart] = path.split('?', 2);
+                    const sanitized = pathPart.replace(/\/\d+/g, '/:id') + (queryPart ? '?' + queryPart : '');
+                    const operation = this.inferOperation(method, path);
+                    metrics.record({
+                        doctoraliaRequestId,
+                        origin: ctx?.origin ?? 'OTHER',
+                        clinicId: ctx?.clinicId,
+                        operation,
+                        endpoint: sanitized,
+                        resourceKey,
+                        method,
+                        httpStatus: httpStatus ?? 'OTHER',
+                        isRetry,
+                        retryNumber: isRetry ? 1 : 0,
+                        isOAuth: false,
+                        enqueuedAt,
+                        releasedAt,
+                        sentAt,
+                        respondedAt,
+                        waitMs: releasedAt - enqueuedAt,
+                        execMs: respondedAt - sentAt,
+                        requestId: ctx?.requestId,
+                        pollExecutionId: ctx?.pollExecutionId,
+                    });
+                }
+            } catch (_e) { /* fail-safe: metrics never propagate */ }
         }
+    }
+
+    /** Infere nome de operação legível a partir do método HTTP e caminho. */
+    private inferOperation(method: string, path: string): string {
+        const p = path.toLowerCase();
+        if (p.includes('/bookings') && method === 'GET') return 'GET_BOOKINGS';
+        if (p.includes('/bookings') && method === 'DELETE') return 'CANCEL_BOOKING';
+        if (p.includes('/bookings') && method === 'POST' && p.includes('/move')) return 'MOVE_BOOKING';
+        if (p.includes('/bookings')) return `${method}_BOOKING`;
+        if (p.includes('/slots') && p.includes('/book')) return 'BOOK_SLOT';
+        if (p.includes('/slots') && method === 'PUT') return 'REPLACE_SLOTS';
+        if (p.includes('/slots') && method === 'DELETE') return 'DELETE_SLOTS';
+        if (p.includes('/slots') && method === 'GET') return 'GET_SLOTS';
+        if (p.includes('/breaks') && method === 'GET') return 'GET_BREAKS';
+        if (p.includes('/breaks') && method === 'POST') return 'ADD_BREAK';
+        if (p.includes('/breaks') && method === 'DELETE') return 'DELETE_BREAK';
+        if (p.includes('/breaks') && method === 'PATCH') return 'MOVE_BREAK';
+        if (p.includes('/calendar/enable')) return 'ENABLE_CALENDAR';
+        if (p.includes('/calendar/disable')) return 'DISABLE_CALENDAR';
+        if (p.includes('/calendar')) return 'GET_CALENDAR';
+        if (p.includes('/notifications/release')) return 'RELEASE_NOTIFICATIONS';
+        if (p.includes('/notifications')) return 'GET_NOTIFICATIONS';
+        if (p.includes('/addresses')) return `${method}_ADDRESSES`;
+        if (p.includes('/doctors')) return `${method}_DOCTORS`;
+        if (p.includes('/facilities')) return `${method}_FACILITIES`;
+        if (p.includes('/services')) return `${method}_SERVICES`;
+        if (p.includes('/insurance')) return `${method}_INSURANCE`;
+        return `${method}_OTHER`;
     }
 
     async getFacilities(): Promise<any> {

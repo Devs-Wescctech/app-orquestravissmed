@@ -2,6 +2,7 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { DocplannerService } from '../integrations/docplanner.service';
 import { VismedService } from '../integrations/vismed/vismed.service';
+import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 
 @Injectable()
 export class ClinicsService {
@@ -128,6 +129,8 @@ export class ClinicsService {
             return { success: false, message: 'Integração Doctoralia não configurada' };
         }
 
+        // WP-01: propagate USER_INTERACTIVE context for the test connection call
+        return runWithDoctoraliaContext({ origin: 'USER_INTERACTIVE', clinicId }, async () => {
         try {
             const client = this.docplanner.createClient(
                 conn.domain || 'doctoralia.com.br',
@@ -160,6 +163,7 @@ export class ClinicsService {
                 message: `Erro: ${e.message}${demote ? '' : ' — status mantido como "connected"; a importação de agendamentos continua ativa'}`,
             };
         }
+        }); // end runWithDoctoraliaContext(USER_INTERACTIVE)
     }
 
     async testVismedIntegration(clinicId: string) {

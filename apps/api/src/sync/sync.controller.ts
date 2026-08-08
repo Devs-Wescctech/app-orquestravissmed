@@ -7,6 +7,8 @@ import { DocplannerService } from '../integrations/docplanner.service';
 import { SlotSyncService } from './slot-sync.service';
 import { PushSyncService } from './push-sync.service';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
+import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
+import { randomUUID } from 'crypto';
 
 @ApiTags('sync')
 @ApiBearerAuth()
@@ -297,9 +299,12 @@ export class SyncController {
     ) {
         this.validateUserClinicAccess(req?.user, clinicId);
         await this.validateDoctorBelongsToClinic(vismedDoctorId, clinicId);
-        const client = await this.getDoctoraliaClient(clinicId);
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        return this.slotSync.syncSlotsForDoctor(vismedDoctorId, client, undefined, daysAhead || 30, clinicId);
+        // WP-01: USER_INTERACTIVE — slotSync.syncSlotsForDoctor will re-wrap as SLOT_SYNC
+        return runWithDoctoraliaContext({ origin: 'USER_INTERACTIVE', clinicId, requestId: randomUUID() }, async () => {
+            const client = await this.getDoctoraliaClient(clinicId);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            return this.slotSync.syncSlotsForDoctor(vismedDoctorId, client, undefined, daysAhead || 30, clinicId);
+        });
     }
 
     @ApiOperation({ summary: 'Sync slots for all mapped doctors' })
@@ -310,9 +315,11 @@ export class SyncController {
         @Request() req?: any,
     ) {
         this.validateUserClinicAccess(req?.user, clinicId);
-        const client = await this.getDoctoraliaClient(clinicId);
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        return this.slotSync.syncAllSlots(client, undefined, daysAhead || 30, clinicId);
+        return runWithDoctoraliaContext({ origin: 'USER_INTERACTIVE', clinicId, requestId: randomUUID() }, async () => {
+            const client = await this.getDoctoraliaClient(clinicId);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            return this.slotSync.syncAllSlots(client, undefined, daysAhead || 30, clinicId);
+        });
     }
 
     @ApiOperation({ summary: 'Get shifts (turnos) for a VisMed doctor' })
@@ -341,6 +348,8 @@ export class SyncController {
     ) {
         this.validateUserClinicAccess(req?.user, clinicId);
         const dDoc = await this.validateDoctoraliaDoctorBelongsToClinic(doctoraliaDoctorId, clinicId);
+        // WP-01: USER_INTERACTIVE context for direct Doctoralia calls in this handler
+        return runWithDoctoraliaContext({ origin: 'USER_INTERACTIVE', clinicId, requestId: randomUUID() }, async () => {
         const client = await this.getDoctoraliaClient(clinicId);
         await new Promise(resolve => setTimeout(resolve, 1000));
 
@@ -369,6 +378,7 @@ export class SyncController {
         }
 
         return { doctoraliaDoctorId, results };
+        }); // end runWithDoctoraliaContext(USER_INTERACTIVE) for enableCalendar
     }
 
     @ApiOperation({ summary: 'Disable calendar for a doctor on Doctoralia' })
@@ -380,6 +390,7 @@ export class SyncController {
     ) {
         this.validateUserClinicAccess(req?.user, clinicId);
         const dDoc = await this.validateDoctoraliaDoctorBelongsToClinic(doctoraliaDoctorId, clinicId);
+        return runWithDoctoraliaContext({ origin: 'USER_INTERACTIVE', clinicId, requestId: randomUUID() }, async () => {
         const client = await this.getDoctoraliaClient(clinicId);
         await new Promise(resolve => setTimeout(resolve, 1000));
 
@@ -408,6 +419,7 @@ export class SyncController {
         }
 
         return { doctoraliaDoctorId, results };
+        }); // end runWithDoctoraliaContext(USER_INTERACTIVE) for disableCalendar
     }
 
     @ApiOperation({ summary: 'Debug: check real Doctoralia calendar state for a doctor' })
@@ -419,6 +431,7 @@ export class SyncController {
     ) {
         this.validateUserClinicAccess(req?.user, clinicId);
         const dDoc = await this.validateDoctoraliaDoctorBelongsToClinic(doctoraliaDoctorId, clinicId);
+        return runWithDoctoraliaContext({ origin: 'USER_INTERACTIVE', clinicId, requestId: randomUUID() }, async () => {
         const client = await this.getDoctoraliaClient(clinicId);
 
         const addrsRes = await client.getAddresses(dDoc.doctoraliaFacilityId, doctoraliaDoctorId);
@@ -462,6 +475,7 @@ export class SyncController {
         }
 
         return { doctoraliaDoctorId, facilityId: dDoc.doctoraliaFacilityId, addresses: results };
+        }); // end runWithDoctoraliaContext(USER_INTERACTIVE) for debugCalendar
     }
 
     @Post(':clinicId/insurance')
@@ -471,6 +485,8 @@ export class SyncController {
         @Param('clinicId') clinicId: string,
     ) {
         this.validateUserClinicAccess(req.user, clinicId);
+        // WP-01: USER_INTERACTIVE for direct Doctoralia calls
+        return runWithDoctoraliaContext({ origin: 'USER_INTERACTIVE', clinicId, requestId: randomUUID() }, async () => {
         const client = await this.getDoctoraliaClient(clinicId);
 
         // Cria um SyncRun para que warnings de regressão sejam rastreados e apareçam no dashboard
@@ -544,6 +560,7 @@ export class SyncController {
             regressionWarnings: totalRegressionWarnings,
             results,
         };
+        }); // end runWithDoctoraliaContext(USER_INTERACTIVE) for syncInsuranceProviders
     }
 
     @Post(':clinicId/services/:doctoraliaDoctorId/attach-insurance')
@@ -556,6 +573,7 @@ export class SyncController {
     ) {
         this.validateUserClinicAccess(req.user, clinicId);
         const dDoc = await this.validateDoctoraliaDoctorBelongsToClinic(doctoraliaDoctorId, clinicId);
+        return runWithDoctoraliaContext({ origin: 'USER_INTERACTIVE', clinicId, requestId: randomUUID() }, async () => {
         const client = await this.getDoctoraliaClient(clinicId);
         await new Promise(r => setTimeout(r, 1000));
 
@@ -649,6 +667,7 @@ export class SyncController {
             }).catch(() => {});
             throw err;
         }
+        }); // end runWithDoctoraliaContext(USER_INTERACTIVE) for attachInsuranceToServices
     }
 
     @Get(':clinicId/insurance/:doctoraliaDoctorId')
@@ -659,28 +678,30 @@ export class SyncController {
         @Param('doctoraliaDoctorId') doctoraliaDoctorId: string,
     ) {
         this.validateUserClinicAccess(req.user, clinicId);
-        const client = await this.getDoctoraliaClient(clinicId);
+        return runWithDoctoraliaContext({ origin: 'USER_INTERACTIVE', clinicId, requestId: randomUUID() }, async () => {
+            const client = await this.getDoctoraliaClient(clinicId);
 
-        const dDoc = await this.prisma.doctoraliaDoctor.findFirst({
-            where: { doctoraliaDoctorId },
-        });
-        if (!dDoc) throw new NotFoundException('Médico Doctoralia não encontrado.');
-
-        const addrsRes = await client.getAddresses(dDoc.doctoraliaFacilityId, doctoraliaDoctorId);
-        const addresses = addrsRes._items || [];
-        const results: any[] = [];
-
-        for (const addr of addresses) {
-            const addrId = String(addr.id);
-            const insRes = await client.getAddressInsuranceProviders(dDoc.doctoraliaFacilityId, doctoraliaDoctorId, addrId);
-            results.push({
-                addressId: addrId,
-                addressName: addr.name,
-                insuranceProviders: insRes._items || [],
+            const dDoc = await this.prisma.doctoraliaDoctor.findFirst({
+                where: { doctoraliaDoctorId },
             });
-        }
+            if (!dDoc) throw new NotFoundException('Médico Doctoralia não encontrado.');
 
-        return { doctoraliaDoctorId, addresses: results };
+            const addrsRes = await client.getAddresses(dDoc.doctoraliaFacilityId, doctoraliaDoctorId);
+            const addresses = addrsRes._items || [];
+            const results: any[] = [];
+
+            for (const addr of addresses) {
+                const addrId = String(addr.id);
+                const insRes = await client.getAddressInsuranceProviders(dDoc.doctoraliaFacilityId, doctoraliaDoctorId, addrId);
+                results.push({
+                    addressId: addrId,
+                    addressName: addr.name,
+                    insuranceProviders: insRes._items || [],
+                });
+            }
+
+            return { doctoraliaDoctorId, addresses: results };
+        }); // end runWithDoctoraliaContext(USER_INTERACTIVE) for getInsuranceProviders
     }
 
     private async updateCalendarStatusInMapping(clinicId: string, doctoraliaDoctorInternalId: string, status: string) {

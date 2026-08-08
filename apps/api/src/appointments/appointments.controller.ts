@@ -1,6 +1,8 @@
 import { Controller, Get, Query, UseGuards, Req, ForbiddenException, Patch, Post, Body, Put, Delete } from '@nestjs/common';
 import { AppointmentsService } from './appointments.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
+import { randomUUID } from 'crypto';
 
 @Controller('appointments')
 @UseGuards(JwtAuthGuard)
@@ -49,10 +51,14 @@ export class AppointmentsController {
     ) {
         this.validateClinicAccess(req.user, clinicId);
         const dates = this.defaultDates(start, end);
-        if (doctorId) {
-            return this.appointmentsService.getBookings(clinicId, doctorId, dates.start, dates.end);
-        }
-        return this.appointmentsService.getAllBookings(clinicId, dates.start, dates.end);
+        // WP-01: propagate USER_INTERACTIVE context with per-request ID
+        const requestId = randomUUID();
+        return runWithDoctoraliaContext({ origin: 'USER_INTERACTIVE', clinicId, requestId }, async () => {
+            if (doctorId) {
+                return this.appointmentsService.getBookings(clinicId, doctorId, dates.start, dates.end);
+            }
+            return this.appointmentsService.getAllBookings(clinicId, dates.start, dates.end);
+        });
     }
 
     /**
@@ -71,7 +77,11 @@ export class AppointmentsController {
         if (!doctorId) {
             return { slots: [], error: 'doctorId é obrigatório para buscar slots' };
         }
-        return this.appointmentsService.getSlots(clinicId, doctorId, dates.start, dates.end);
+        // WP-01: propagate USER_INTERACTIVE context
+        const requestId = randomUUID();
+        return runWithDoctoraliaContext({ origin: 'USER_INTERACTIVE', clinicId, requestId }, () =>
+            this.appointmentsService.getSlots(clinicId, doctorId, dates.start, dates.end),
+        );
     }
 
     /**
@@ -83,7 +93,11 @@ export class AppointmentsController {
         @Body() body: { clinicId: string; doctorId: string; slots: any[] }
     ) {
         this.validateClinicAccess(req.user, body.clinicId);
-        return this.appointmentsService.replaceSlots(body.clinicId, body.doctorId, body.slots);
+        // WP-01: propagate USER_INTERACTIVE context
+        const requestId = randomUUID();
+        return runWithDoctoraliaContext({ origin: 'USER_INTERACTIVE', clinicId: body.clinicId, requestId }, () =>
+            this.appointmentsService.replaceSlots(body.clinicId, body.doctorId, body.slots),
+        );
     }
 
     /**
@@ -96,7 +110,11 @@ export class AppointmentsController {
     ) {
         const { clinicId, doctorId, ...payload } = body;
         this.validateClinicAccess(req.user, clinicId);
-        return this.appointmentsService.bookSlot(clinicId, doctorId, payload);
+        // WP-01: propagate USER_INTERACTIVE context
+        const requestId = randomUUID();
+        return runWithDoctoraliaContext({ origin: 'USER_INTERACTIVE', clinicId, requestId }, () =>
+            this.appointmentsService.bookSlot(clinicId, doctorId, payload),
+        );
     }
 
     /**
@@ -114,7 +132,11 @@ export class AppointmentsController {
         if (!doctorId || !start || !end) {
             throw new ForbiddenException('doctorId, start e end são obrigatórios');
         }
-        return this.appointmentsService.deleteSlots(clinicId, doctorId, start, end);
+        // WP-01: propagate USER_INTERACTIVE context
+        const requestId = randomUUID();
+        return runWithDoctoraliaContext({ origin: 'USER_INTERACTIVE', clinicId, requestId }, () =>
+            this.appointmentsService.deleteSlots(clinicId, doctorId, start, end),
+        );
     }
 
     /**
@@ -136,6 +158,10 @@ export class AppointmentsController {
     ) {
         const finalClinicId = body.clinicId || req.user.roles?.[0]?.clinicId;
         this.validateClinicAccess(req.user, finalClinicId);
-        return this.appointmentsService.updateCalendarStatus(finalClinicId, body.doctoraliaDoctorId, body.status, req.user.id);
+        // WP-01: propagate USER_INTERACTIVE context
+        const requestId = randomUUID();
+        return runWithDoctoraliaContext({ origin: 'USER_INTERACTIVE', clinicId: finalClinicId, requestId }, () =>
+            this.appointmentsService.updateCalendarStatus(finalClinicId, body.doctoraliaDoctorId, body.status, req.user.id),
+        );
     }
 }

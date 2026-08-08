@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { getDoctoraliaMetricsService } from '../metrics/doctoralia-metrics.service';
 
 interface TokenBucket {
     tokens: number;
@@ -40,18 +41,51 @@ export class RateLimiterService {
 
     async acquire(provider: string, cost: number = 1): Promise<void> {
         const bucket = this.getBucket(provider);
+        const acquireStartAt = Date.now();
 
         while (true) {
             this.refill(bucket);
 
             if (bucket.tokens >= cost) {
+                const tokensBefore = bucket.tokens;
                 bucket.tokens -= cost;
+                // WP-01: registra aquisição imediata (sem espera)
+                try {
+                    const metrics = getDoctoraliaMetricsService();
+                    if (metrics) {
+                        metrics.recordRateLimiter({
+                            provider,
+                            tokensAvailableBefore: tokensBefore,
+                            tokensAvailableAfter: bucket.tokens,
+                            waitMsExpected: 0,
+                            waitMsActual: Date.now() - acquireStartAt,
+                            blocked: false,
+                            recordedAt: Date.now(),
+                        });
+                    }
+                } catch (_e) { /* fail-safe */ }
                 return;
             }
 
             const waitTime = ((cost - bucket.tokens) / bucket.refillRate) * 1000;
+            const tokensBefore = bucket.tokens;
             this.logger.debug(`[RATE-LIMIT] ${provider}: waiting ${Math.round(waitTime)}ms (tokens: ${bucket.tokens.toFixed(1)}/${bucket.maxTokens})`);
             await new Promise(r => setTimeout(r, Math.min(waitTime + 50, 5000)));
+            // WP-01: registra espera no token bucket
+            try {
+                const metrics = getDoctoraliaMetricsService();
+                if (metrics) {
+                    metrics.recordRateLimiter({
+                        provider,
+                        tokensAvailableBefore: tokensBefore,
+                        tokensAvailableAfter: Math.min(bucket.maxTokens, tokensBefore + (waitTime / 1000) * bucket.refillRate),
+                        waitMsExpected: waitTime,
+                        waitMsActual: Date.now() - acquireStartAt,
+                        blocked: true,
+                        recordedAt: Date.now(),
+                    });
+                }
+            } catch (_e) { /* fail-safe */ }
         }
     }
 

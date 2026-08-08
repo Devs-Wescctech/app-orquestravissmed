@@ -3,6 +3,8 @@ import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { DocplannerClient } from '../integrations/docplanner.service';
 import { VismedAvailabilityService, ClinicAvailability, AvailRange } from './vismed-availability.service';
+import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
+import { getDoctoraliaMetricsService } from '../metrics/doctoralia-metrics.service';
 
 interface TurnoSlot {
     start: string;
@@ -145,6 +147,21 @@ export class SlotSyncService {
         clinicId?: string,
         availability?: ClinicAvailability | null,
     ): Promise<{ success: boolean; message: string; slotsCreated: number }> {
+        // WP-01: propagate SLOT_SYNC context for all Doctoralia calls within this sync
+        return runWithDoctoraliaContext({ origin: 'SLOT_SYNC', clinicId }, () =>
+            this._syncSlotsForDoctorInner(vismedDoctorId, client, syncRunId, daysAhead, clinicId, availability),
+        );
+    }
+
+    private async _syncSlotsForDoctorInner(
+        vismedDoctorId: string,
+        client: DocplannerClient,
+        syncRunId?: string,
+        daysAhead: number = 30,
+        clinicId?: string,
+        availability?: ClinicAvailability | null,
+    ): Promise<{ success: boolean; message: string; slotsCreated: number }> {
+        const slotSyncStartAt = Date.now();
         const source = this.slotSource();
         const whereClause: any = { id: vismedDoctorId };
 
@@ -473,6 +490,15 @@ export class SlotSyncService {
                 addressesUnchanged++;
                 this.logger.log(`Doctor ${doctor.name} address ${addrId}: disponibilidade inalterada (hash igual), skip replaceSlots.`);
                 if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'unchanged', `Doctor ${doctor.name} addr ${addrId}: disponibilidade inalterada, push pulado.`);
+                // WP-01: emit slot sync skipped event
+                try {
+                    getDoctoraliaMetricsService()?.recordSlotSync({
+                        doctorId: vismedDoctorId, addressId: addrId, clinicId,
+                        event: 'SLOT_SYNC_SKIPPED_UNCHANGED',
+                        durationMs: Date.now() - slotSyncStartAt, retries: 0, errors: 0,
+                        recordedAt: Date.now(),
+                    });
+                } catch (_e) {}
                 continue;
             }
 
@@ -504,6 +530,15 @@ export class SlotSyncService {
 
                 totalSlots += allSlots.length;
                 await this.upsertSlotPushState(String(dDoc.doctoraliaDoctorId), addrId, availabilityHash);
+                // WP-01: emit slot sync pushed event
+                try {
+                    getDoctoraliaMetricsService()?.recordSlotSync({
+                        doctorId: vismedDoctorId, addressId: addrId, clinicId,
+                        event: 'SLOT_SYNC_PUSHED_CHANGED',
+                        durationMs: Date.now() - slotSyncStartAt, retries: 0, errors: 0,
+                        recordedAt: Date.now(),
+                    });
+                } catch (_e) {}
                 this.logger.log(`Doctor ${doctor.name}: synced ${allSlots.length} work periods to address ${addrId} for ${dates.length} days`);
                 if (syncRunId) {
                     await this.logEvent(syncRunId, 'SLOT_SYNC', 'created', `Doctor ${doctor.name}: ${allSlots.length} slots sincronizados para endereço ${addrId}`);

@@ -5,6 +5,9 @@ import { VismedService } from '../integrations/vismed/vismed.service';
 import { QueueService } from './queue.service';
 import { RateLimiterService } from './rate-limiter.service';
 import { MatchingEngineService } from '../mappings/matching-engine.service';
+import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
+import { getDoctoraliaMetricsService } from '../metrics/doctoralia-metrics.service';
+import { randomUUID } from 'crypto';
 
 const POLL_BASE_INTERVAL_MS = 30 * 1000;
 const STAGGER_PER_CLINIC_MS = 2000;
@@ -197,6 +200,11 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         const conn = await this.getEligibleConnection(staleConn.clinicId, 'vismed');
         if (!conn || !conn.clientId) return;
 
+        // WP-01: poll execution tracking + context propagation
+        const pollExecutionId = randomUUID();
+        try { getDoctoraliaMetricsService()?.trackPollStart(conn.clinicId, pollExecutionId); } catch (_e) {}
+
+        await runWithDoctoraliaContext({ origin: 'POLLING', clinicId: conn.clinicId, pollExecutionId }, async () => {
         try {
             const idEmpresaGestora = Number(conn.clientId);
             if (!idEmpresaGestora) {
@@ -265,25 +273,37 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             // basta que TODOS os fetches tenham tido sucesso (fetchSuccess). A re-confirmação
             // dentro do reconcile protege contra glitch de API que retorne lista vazia/parcial.
             if (fetchSuccess) {
-                await this.reconcileDisappearedFromVismed(conn.clinicId, seenVismedIds, start, end, units, baseUrl, dataini, datafim).catch(err =>
-                    this.logger.warn(`[RECONCILE-DISAPPEARED] Error: ${err.message}`),
+                await runWithDoctoraliaContext({ origin: 'RECONCILIATION', clinicId: conn.clinicId, reconciliationSubtype: 'reconcileDisappearedFromVismed', pollExecutionId }, () =>
+                    this.reconcileDisappearedFromVismed(conn.clinicId, seenVismedIds, start, end, units, baseUrl, dataini, datafim).catch(err =>
+                        this.logger.warn(`[RECONCILE-DISAPPEARED] Error: ${err.message}`),
+                    ),
                 );
             }
 
-            await this.reconcileUnlinkedWithDoctoralia(conn.clinicId).catch(err =>
-                this.logger.warn(`[RECONCILE] Error: ${err.message}`),
+            await runWithDoctoraliaContext({ origin: 'RECONCILIATION', clinicId: conn.clinicId, reconciliationSubtype: 'reconcileUnlinkedWithDoctoralia', pollExecutionId }, () =>
+                this.reconcileUnlinkedWithDoctoralia(conn.clinicId).catch(err =>
+                    this.logger.warn(`[RECONCILE] Error: ${err.message}`),
+                ),
             );
 
-            await this.reconcileCancelledOnDoctoralia(conn.clinicId).catch(err =>
-                this.logger.warn(`[RECONCILE-CANCEL] Error: ${err.message}`),
+            await runWithDoctoraliaContext({ origin: 'RECONCILIATION', clinicId: conn.clinicId, reconciliationSubtype: 'reconcileCancelledOnDoctoralia', pollExecutionId }, () =>
+                this.reconcileCancelledOnDoctoralia(conn.clinicId).catch(err =>
+                    this.logger.warn(`[RECONCILE-CANCEL] Error: ${err.message}`),
+                ),
             );
 
-            await this.reconcileBookedWithoutVismedId(conn.clinicId).catch(err =>
-                this.logger.warn(`[RECONCILE-NO-VISMED-ID] Error: ${err.message}`),
+            await runWithDoctoraliaContext({ origin: 'RECONCILIATION', clinicId: conn.clinicId, reconciliationSubtype: 'reconcileBookedWithoutVismedId', pollExecutionId }, () =>
+                this.reconcileBookedWithoutVismedId(conn.clinicId).catch(err =>
+                    this.logger.warn(`[RECONCILE-NO-VISMED-ID] Error: ${err.message}`),
+                ),
             );
         } catch (err: any) {
             this.logger.warn(`[VISMED-POLL] Error polling clinic ${conn.clinicId}: ${err.message}`);
+        } finally {
+            // WP-01: poll tracking end
+            try { getDoctoraliaMetricsService()?.trackPollEnd(conn.clinicId, pollExecutionId); } catch (_e) {}
         }
+        }); // end runWithDoctoraliaContext(POLLING)
     }
 
     /**
@@ -2193,6 +2213,8 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         const conn = await this.getEligibleConnection(staleConn.clinicId, 'doctoralia');
         if (!conn || !conn.clientId || !conn.clientSecret) return;
 
+        // WP-01: propagate POLLING context with clinicId for notification polling calls
+        await runWithDoctoraliaContext({ origin: 'POLLING', clinicId: conn.clinicId }, async () => {
         try {
             await this.rateLimiter.acquire('doctoralia');
 
@@ -2240,6 +2262,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         } catch (err: any) {
             this.logger.warn(`[POLL] Error polling clinic ${conn.clinicId}: ${err.message}`);
         }
+        }); // end runWithDoctoraliaContext(POLLING)
     }
 
     private async pollAllClinics() {
@@ -2262,6 +2285,12 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
     async processWebhookNotification(body: any) {
         const notifName = body?.name;
         this.logger.log(`[WEBHOOK] Received notification: ${notifName}`);
+        // WP-01: propagate WEBHOOK context for all Doctoralia calls within this notification
+        return runWithDoctoraliaContext({ origin: 'WEBHOOK' }, () => this._processWebhookNotificationInner(body));
+    }
+
+    private async _processWebhookNotificationInner(body: any) {
+        const notifName = body?.name;
 
         const facilityData = body?.data?.facility;
 
@@ -2282,6 +2311,9 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         }
 
         this.logger.log(`[WEBHOOK] Matched facilityId=${facilityIdStr} to clinic ${conn.clinicId}`);
+
+        // WP-01: re-wrap with clinicId now that the connection has been resolved
+        return runWithDoctoraliaContext({ origin: 'WEBHOOK', clinicId: conn.clinicId }, async () => {
 
         if (['slot-booked', 'booking-canceled', 'booking-moved'].includes(notifName)) {
             try {
@@ -2322,6 +2354,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         }
 
         return { processed: false, reason: `unsupported_type:${notifName}` };
+        }); // end runWithDoctoraliaContext(WEBHOOK, clinicId)
     }
 
     private async handleSlotBooked(clinicId: string, data: any, rawNotification: any) {

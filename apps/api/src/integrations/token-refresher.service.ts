@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
 import { DocplannerService } from './docplanner.service';
+import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 
 /**
  * Renovador de token OAuth Doctoralia em segundo plano.
@@ -59,13 +60,16 @@ export class TokenRefresherService implements OnModuleInit {
                         conn.clientId,
                         conn.clientSecret || '',
                     );
-                    if (expiresAt > Date.now()) {
-                        // Token ainda válido mas dentro da margem: força um token NOVO
-                        // (getToken(false) devolveria o atual e nunca renovaria).
-                        await client.forceTokenRefresh(conn.clientId, conn.clientSecret || '');
-                    } else {
-                        await client.authenticate(conn.clientId, conn.clientSecret || '');
-                    }
+                    // WP-01: propagate AUTHENTICATION context for proactive token renewal
+                    await runWithDoctoraliaContext({ origin: 'AUTHENTICATION' }, async () => {
+                        if (expiresAt > Date.now()) {
+                            // Token ainda válido mas dentro da margem: força um token NOVO
+                            // (getToken(false) devolveria o atual e nunca renovaria).
+                            await client.forceTokenRefresh(conn.clientId!, conn.clientSecret || '');
+                        } else {
+                            await client.authenticate(conn.clientId!, conn.clientSecret || '');
+                        }
+                    });
                     this.logger.log(`[TOKEN-REFRESHER] Token garantido para clientId ${conn.clientId.split('_')[0]}_***.`);
                 } catch (err: any) {
                     // Esperado enquanto o WAF desafia; tenta de novo no próximo ciclo.

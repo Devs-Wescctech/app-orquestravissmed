@@ -15,6 +15,7 @@ import { DoctorsModule } from './doctors/doctors.module';
 import { AppointmentsModule } from './appointments/appointments.module';
 import { BookingsModule } from './bookings/bookings.module';
 import { SettingsModule } from './settings/settings.module';
+import { MetricsModule } from './metrics/metrics.module';
 
 @Module({
   imports: [
@@ -44,6 +45,7 @@ import { SettingsModule } from './settings/settings.module';
     SyncModule,
     MappingsModule,
     SettingsModule,
+    MetricsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

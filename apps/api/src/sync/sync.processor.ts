@@ -6,6 +6,7 @@ import { DocplannerService, DocplannerClient } from '../integrations/docplanner.
 import { MappingEntityType, MappingStatus } from '@prisma/client';
 import { MatchingEngineService } from '../mappings/matching-engine.service';
 import { PushSyncService } from './push-sync.service';
+import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 
 @Processor('sync-queue')
 export class SyncProcessor extends WorkerHost {
@@ -21,9 +22,16 @@ export class SyncProcessor extends WorkerHost {
     }
 
     async process(job: Job<any, any, string>): Promise<any> {
-        const { syncRunId, clinicId } = job.data;
+        const { syncRunId, clinicId, _observabilityOrigin } = job.data;
+        const origin = (_observabilityOrigin as any) ?? 'SCHEDULER';
         this.logger.log(`Processing sync job for clinic ${clinicId}, run ID ${syncRunId}`);
 
+        // WP-01: BullMQ runs jobs in a new async context; ALS does not propagate.
+        // Reconstruct the Doctoralia observability context from the serialized job payload.
+        return runWithDoctoraliaContext({ origin, clinicId }, () => this._processInner(job, syncRunId, clinicId));
+    }
+
+    private async _processInner(job: Job<any, any, string>, syncRunId: string, clinicId: string): Promise<any> {
         try {
             const conn = await this.prisma.integrationConnection.findFirst({
                 where: { clinicId, provider: 'doctoralia' }
