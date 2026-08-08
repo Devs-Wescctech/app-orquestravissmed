@@ -514,4 +514,126 @@ describe('DoctoraliaMetricsService — 10 testes WP-01', () => {
             expect(eventsStr).not.toContain(sensitive);
         }
     });
+
+    // ─── Teste WP-01-A-1: BlockWatcher gera origem SLOT_SYNC ────────────────
+    it('WP-01-A-1. BlockWatcher — chamada dentro de runWithDoctoraliaContext(SLOT_SYNC) gera origin=SLOT_SYNC (não OTHER)', async () => {
+        const clinicId = 'clinic-block-watcher';
+
+        // Simula o que BlockWatcherService.watchClinic() faz após WP-01-A:
+        // envolve a chamada ao SlotSyncService com runWithDoctoraliaContext SLOT_SYNC
+        await runWithDoctoraliaContext({ origin: 'SLOT_SYNC', clinicId }, async () => {
+            const ctx = getDoctoraliaContext();
+
+            // Simula chamada Doctoralia feita dentro do syncSlotsForDoctor
+            service.record(makeEvent({
+                doctoraliaRequestId: 'block-watcher-call-1',
+                origin: ctx?.origin ?? 'OTHER',
+                clinicId: ctx?.clinicId,
+                operation: 'REPLACE_SLOTS',
+                endpoint: '/api/v3/integration/facilities/:id/doctors/:id/addresses/:id/slots',
+                method: 'PUT',
+                httpStatus: 200,
+                isOAuth: false,
+            }));
+        });
+
+        const events = service.getEvents();
+        const bwEvent = events.find(e => e.doctoraliaRequestId === 'block-watcher-call-1');
+        expect(bwEvent).toBeDefined();
+        // Antes do fix WP-01-A, estas chamadas apareciam como OTHER por falta do contexto ALS
+        expect(bwEvent!.origin).toBe('SLOT_SYNC');
+        expect(bwEvent!.clinicId).toBe(clinicId);
+
+        // Confirma que aparece no baseline como SLOT_SYNC, não OTHER
+        const baseline = service.getBaseline();
+        expect(baseline.volume.byOrigin['SLOT_SYNC']).toBeGreaterThanOrEqual(1);
+        expect(baseline.volume.byOrigin['OTHER']).toBeUndefined();
+    });
+
+    // ─── Teste WP-01-A-2: Snapshot do DocplannerClient popula campos de usage ─
+    it('WP-01-A-2. recordRateSnapshot() — baseline reporta campos de usage/remaining/queue com valores reais (não null)', () => {
+        // Antes do fix, esses campos eram sempre null no baseline
+        const snapshot = {
+            usedInWindow: 42,
+            remainingInWindow: 358,
+            queueSizeHigh: 3,
+            queueSizeLow: 15,
+        };
+        service.recordRateSnapshot(snapshot);
+
+        const baseline = service.getBaseline();
+        expect(baseline.queue.DOCTORALIA_RATE_LIMIT_USAGE).toBe(42);
+        expect(baseline.queue.DOCTORALIA_RATE_LIMIT_REMAINING).toBe(358);
+        expect(baseline.queue.DOCTORALIA_QUEUE_SIZE_HIGH).toBe(3);
+        expect(baseline.queue.DOCTORALIA_QUEUE_SIZE_LOW).toBe(15);
+        expect(baseline.queue.rateSnapshotRecordedAt).not.toBeNull();
+    });
+
+    it('WP-01-A-2b. Antes de qualquer snapshot — campos ainda retornam null (comportamento padrão)', () => {
+        // Sem chamar recordRateSnapshot, os campos devem ser null
+        const baseline = service.getBaseline();
+        expect(baseline.queue.DOCTORALIA_RATE_LIMIT_USAGE).toBeNull();
+        expect(baseline.queue.DOCTORALIA_RATE_LIMIT_REMAINING).toBeNull();
+        expect(baseline.queue.DOCTORALIA_QUEUE_SIZE_HIGH).toBeNull();
+        expect(baseline.queue.DOCTORALIA_QUEUE_SIZE_LOW).toBeNull();
+        expect(baseline.queue.rateSnapshotRecordedAt).toBeNull();
+    });
+
+    // ─── Teste WP-01-A-3: reset() zera contadores ───────────────────────────
+    it('WP-01-A-3. reset() — zera todos os contadores em memória e atualiza startedAt', () => {
+        // Popula o serviço com dados
+        service.record(makeEvent({ doctoraliaRequestId: 'before-reset-1', origin: 'POLLING' }));
+        service.record(makeEvent({ doctoraliaRequestId: 'before-reset-2', origin: 'SLOT_SYNC' }));
+        service.trackPollStart('clinic-r', 'poll-r1');
+        service.recordRateSnapshot({ usedInWindow: 10, remainingInWindow: 390, queueSizeHigh: 1, queueSizeLow: 5 });
+
+        // Confirma que há dados antes do reset
+        expect(service.getEvents()).toHaveLength(2);
+        const baselineBefore = service.getBaseline();
+        expect(baselineBefore.queue.DOCTORALIA_RATE_LIMIT_USAGE).toBe(10);
+
+        const beforeResetAt = Date.now();
+
+        // Executa o reset
+        service.reset();
+
+        // Após o reset: todos os eventos devem ter sumido
+        expect(service.getEvents()).toHaveLength(0);
+        expect(service.getRateLimiterEvents()).toHaveLength(0);
+        expect(service.getDuplicateEvents()).toHaveLength(0);
+        expect(service.getOverlapEvents()).toHaveLength(0);
+        expect(service.getTotalOverlapCount()).toBe(0);
+        expect(service.getMaxConcurrentPolls()).toBe(0);
+
+        // Snapshot de rate limiter deve ser null após reset
+        const baselineAfter = service.getBaseline();
+        expect(baselineAfter.queue.DOCTORALIA_RATE_LIMIT_USAGE).toBeNull();
+        expect(baselineAfter.volume.DOCTORALIA_API_REQUEST_COUNT).toBe(0);
+        expect(baselineAfter.volume.totalDoctoraliaRequests).toBe(0);
+
+        // measurementPeriodMs deve ser pequeno (novo startedAt após reset)
+        expect(baselineAfter.measurementPeriodMs).toBeLessThan(Date.now() - beforeResetAt + 100);
+    });
+
+    it('WP-01-A-3b. reset() — dados gravados APÓS o reset são registrados normalmente', () => {
+        // Popula e reseta
+        service.record(makeEvent({ doctoraliaRequestId: 'pre-reset', origin: 'POLLING' }));
+        service.reset();
+
+        // Grava dados novos após o reset
+        service.record(makeEvent({ doctoraliaRequestId: 'post-reset-1', origin: 'SLOT_SYNC', clinicId: 'clinic-new' }));
+        service.record(makeEvent({ doctoraliaRequestId: 'post-reset-2', origin: 'POLLING', clinicId: 'clinic-new' }));
+
+        const events = service.getEvents();
+        expect(events).toHaveLength(2);
+        expect(events.find(e => e.doctoraliaRequestId === 'pre-reset')).toBeUndefined();
+        expect(events.find(e => e.doctoraliaRequestId === 'post-reset-1')).toBeDefined();
+        expect(events.find(e => e.doctoraliaRequestId === 'post-reset-2')).toBeDefined();
+    });
+
+    // ─── Teste WP-01-A-4: dataSource no baseline ────────────────────────────
+    it('WP-01-A-4. getBaseline() — inclui campo dataSource: "live"', () => {
+        const baseline = service.getBaseline();
+        expect(baseline.dataSource).toBe('live');
+    });
 });

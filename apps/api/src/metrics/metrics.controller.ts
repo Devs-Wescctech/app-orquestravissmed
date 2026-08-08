@@ -1,11 +1,12 @@
 /**
  * WP-01 — Endpoint de relatório de observabilidade Doctoralia.
- * GET /metrics/doctoralia-baseline — restrito a usuários com role SUPER_ADMIN.
+ * GET  /metrics/doctoralia-baseline — restrito a usuários com role SUPER_ADMIN.
+ * POST /metrics/doctoralia-baseline/reset — reinicia contadores em memória (SUPER_ADMIN).
  *
  * O relatório contém dados operacionais globais (clinicIds, volumes, fila), por isso
  * não pode ser exposto para usuários com escopo de clínica. Somente SUPER_ADMIN.
  */
-import { Controller, ForbiddenException, Get, Req, UseGuards } from '@nestjs/common';
+import { Controller, ForbiddenException, Get, Post, Req, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { DoctoraliaMetricsService } from './doctoralia-metrics.service';
 
@@ -32,5 +33,23 @@ export class MetricsController {
             throw new ForbiddenException('Acesso restrito a administradores globais (SUPER_ADMIN).');
         }
         return this.metricsService.getBaseline();
+    }
+
+    /**
+     * POST /metrics/doctoralia-baseline/reset
+     *
+     * Reinicia todos os contadores em memória para iniciar uma nova janela de coleta.
+     * Útil para testes e para coletar um baseline limpo em produção sem reiniciar o container.
+     *
+     * **Restrito a SUPER_ADMIN**.
+     */
+    @Post('doctoralia-baseline/reset')
+    resetDoctoraliaBaseline(@Req() req: any) {
+        const isSuperAdmin = req.user?.roles?.some((r: any) => r.role === 'SUPER_ADMIN');
+        if (!isSuperAdmin) {
+            throw new ForbiddenException('Acesso restrito a administradores globais (SUPER_ADMIN).');
+        }
+        this.metricsService.reset();
+        return { ok: true, resetAt: new Date().toISOString() };
     }
 }

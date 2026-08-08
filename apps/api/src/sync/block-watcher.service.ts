@@ -5,6 +5,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { VismedService } from '../integrations/vismed/vismed.service';
 import { DocplannerService } from '../integrations/docplanner.service';
 import { SlotSyncService } from './slot-sync.service';
+import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 
 /**
  * Vigia leve de bloqueios de agenda (fast-lane, a cada 10min).
@@ -163,6 +164,8 @@ export class BlockWatcherService implements OnModuleInit {
         // re-tentadas pelo SlotPushState no sync global (o estado de push só avança em sucesso).
         const committed = new Map(currentHashes);
 
+        // WP-01-A: envolve chamadas Doctoralia do re-sync com contexto ALS SLOT_SYNC
+        // para que apareçam como origem correta no baseline (não como OTHER).
         for (const idprofissional of affected) {
             try {
                 const doctor = await this.prisma.vismedDoctor.findUnique({
@@ -173,7 +176,10 @@ export class BlockWatcherService implements OnModuleInit {
                     this.logger.warn(`[BLOCK-WATCHER] idprofissional ${idprofissional} sem VismedDoctor correspondente — pulando.`);
                     continue;
                 }
-                const res = await this.slotSync.syncSlotsForDoctor(doctor.id, client, undefined, 30, clinicId);
+                const res = await runWithDoctoraliaContext(
+                    { origin: 'SLOT_SYNC', clinicId },
+                    () => this.slotSync.syncSlotsForDoctor(doctor.id, client, undefined, 30, clinicId),
+                );
                 this.logger.log(`[BLOCK-WATCHER] ${doctor.name}: ${res.message}`);
             } catch (err: any) {
                 this.logger.error(`[BLOCK-WATCHER] Falha re-sync idprofissional ${idprofissional}: ${err?.message} — manterá detecção no próximo ciclo.`);

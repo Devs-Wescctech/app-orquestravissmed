@@ -118,12 +118,13 @@ export class DocplannerClient {
                         const cutoff = now - DocplannerClient.RATE_WINDOW_MS;
                         const ts = DocplannerClient.rateTimestamps;
                         const used = ts.filter(t => t > cutoff).length;
-                        logger.debug(
-                            `[METRICS] DOCTORALIA_RATE_LIMIT_USAGE=${used} DOCTORALIA_RATE_LIMIT_REMAINING=${DocplannerClient.RATE_LIMIT - used} ` +
-                            `DOCTORALIA_QUEUE_SIZE_HIGH=${DocplannerClient.waitingHigh.length} ` +
-                            `DOCTORALIA_QUEUE_SIZE_LOW=${DocplannerClient.waitingLow.length} ` +
-                            `DOCTORALIA_QUEUE_WAIT_MS=${now - enqueuedAt}`,
-                        );
+                        const remaining = DocplannerClient.RATE_LIMIT - used;
+                        metrics.recordRateSnapshot({
+                            usedInWindow: used,
+                            remainingInWindow: remaining,
+                            queueSizeHigh: DocplannerClient.waitingHigh.length,
+                            queueSizeLow: DocplannerClient.waitingLow.length,
+                        });
                     }
                 } catch (_e) { /* fail-safe */ }
                 resolve();

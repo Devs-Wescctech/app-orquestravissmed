@@ -150,7 +150,16 @@ export class DoctoraliaMetricsService {
     private readonly recentSignatures = new Map<string, number[]>();
 
     // Início da medição
-    private readonly startedAt = Date.now();
+    private startedAt = Date.now();
+
+    // Snapshot ponto-a-ponto do DocplannerClient (acquireRateSlot)
+    private lastRateSnapshot: {
+        usedInWindow: number;
+        remainingInWindow: number;
+        queueSizeHigh: number;
+        queueSizeLow: number;
+        recordedAt: number;
+    } | null = null;
 
     constructor() {
         // Registra instância global para uso por DocplannerClient (não-NestJS)
@@ -179,6 +188,47 @@ export class DoctoraliaMetricsService {
             this.rateLimiterEvents.push(event);
         } catch (err: any) {
             this.logger.debug(`[METRICS] recordRateLimiter() error (non-fatal): ${err?.message}`);
+        }
+    }
+
+    /**
+     * Armazena o snapshot mais recente do estado do rate limiter/fila do DocplannerClient.
+     * Chamado dentro de acquireRateSlot() ao liberar cada slot — ponto-a-ponto, não série histórica.
+     */
+    recordRateSnapshot(snapshot: {
+        usedInWindow: number;
+        remainingInWindow: number;
+        queueSizeHigh: number;
+        queueSizeLow: number;
+    }): void {
+        try {
+            this.lastRateSnapshot = { ...snapshot, recordedAt: Date.now() };
+        } catch (err: any) {
+            this.logger.debug(`[METRICS] recordRateSnapshot() error (non-fatal): ${err?.message}`);
+        }
+    }
+
+    /**
+     * Reinicia todas as coleções em memória para o estado inicial.
+     * Preserva o `startedAt` como o momento do reset (nova janela de medição).
+     */
+    reset(): void {
+        try {
+            this.events.length = 0;
+            this.rateLimiterEvents.length = 0;
+            this.activePolls.clear();
+            this.completedPolls.length = 0;
+            this.overlapEvents.length = 0;
+            this.totalOverlapCount = 0;
+            this.maxConcurrentPolls = 0;
+            this.slotSyncEvents.length = 0;
+            this.duplicateEvents.length = 0;
+            this.recentSignatures.clear();
+            this.lastRateSnapshot = null;
+            this.startedAt = Date.now();
+        } catch (err: any) {
+            this.logger.warn(`[METRICS] reset() error: ${err?.message}`);
+            throw err;
         }
     }
 
@@ -441,6 +491,7 @@ export class DoctoraliaMetricsService {
 
         return {
             generatedAt: new Date().toISOString(),
+            dataSource: 'live' as const,
             measurementPeriodMs: Date.now() - this.startedAt,
             measurementScope: {
                 instanceId,
@@ -464,10 +515,13 @@ export class DoctoraliaMetricsService {
                     max: waitMsAll[waitMsAll.length - 1] ?? 0,
                     buckets,
                 },
-                DOCTORALIA_RATE_LIMIT_USAGE: null, // snapshot point-in-time via DocplannerClient
-                DOCTORALIA_RATE_LIMIT_REMAINING: null,
-                DOCTORALIA_QUEUE_SIZE_HIGH: null,
-                DOCTORALIA_QUEUE_SIZE_LOW: null,
+                DOCTORALIA_RATE_LIMIT_USAGE: this.lastRateSnapshot?.usedInWindow ?? null,
+                DOCTORALIA_RATE_LIMIT_REMAINING: this.lastRateSnapshot?.remainingInWindow ?? null,
+                DOCTORALIA_QUEUE_SIZE_HIGH: this.lastRateSnapshot?.queueSizeHigh ?? null,
+                DOCTORALIA_QUEUE_SIZE_LOW: this.lastRateSnapshot?.queueSizeLow ?? null,
+                rateSnapshotRecordedAt: this.lastRateSnapshot
+                    ? new Date(this.lastRateSnapshot.recordedAt).toISOString()
+                    : null,
             },
             rateLimiterService: {
                 totalEvents: this.rateLimiterEvents.length,
