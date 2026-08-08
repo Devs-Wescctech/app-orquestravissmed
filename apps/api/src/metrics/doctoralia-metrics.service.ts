@@ -93,6 +93,7 @@ export interface DuplicateEvent {
 
 const MAX_EVENTS = 10_000;
 const DUPLICATE_WINDOW_MS = 30_000;   // 30s
+const MAX_RATE_SNAPSHOTS = 100;        // histórico circular de snapshots de rate limiter
 
 const WAIT_BUCKETS = [1000, 5000, 10000, 30000, 60000] as const;
 type BucketLabel = '<1s' | '1-5s' | '5-10s' | '10-30s' | '30-60s' | '>60s';
@@ -152,7 +153,7 @@ export class DoctoraliaMetricsService {
     // Início da medição
     private startedAt = Date.now();
 
-    // Snapshot ponto-a-ponto do DocplannerClient (acquireRateSlot)
+    // Snapshot ponto-a-ponto do DocplannerClient (acquireRateSlot) — último valor observado
     private lastRateSnapshot: {
         usedInWindow: number;
         remainingInWindow: number;
@@ -160,6 +161,15 @@ export class DoctoraliaMetricsService {
         queueSizeLow: number;
         recordedAt: number;
     } | null = null;
+
+    // Histórico circular de snapshots (máx. MAX_RATE_SNAPSHOTS entradas, FIFO)
+    private readonly rateSnapshots: Array<{
+        usedInWindow: number;
+        remainingInWindow: number;
+        queueSizeHigh: number;
+        queueSizeLow: number;
+        recordedAt: number;
+    }> = [];
 
     constructor() {
         // Registra instância global para uso por DocplannerClient (não-NestJS)
@@ -193,7 +203,8 @@ export class DoctoraliaMetricsService {
 
     /**
      * Armazena o snapshot mais recente do estado do rate limiter/fila do DocplannerClient.
-     * Chamado dentro de acquireRateSlot() ao liberar cada slot — ponto-a-ponto, não série histórica.
+     * Chamado dentro de acquireRateSlot() ao liberar cada slot.
+     * Mantém histórico circular (MAX_RATE_SNAPSHOTS entradas) para cálculo de picos na janela.
      */
     recordRateSnapshot(snapshot: {
         usedInWindow: number;
@@ -202,7 +213,12 @@ export class DoctoraliaMetricsService {
         queueSizeLow: number;
     }): void {
         try {
-            this.lastRateSnapshot = { ...snapshot, recordedAt: Date.now() };
+            const entry = { ...snapshot, recordedAt: Date.now() };
+            this.lastRateSnapshot = entry;
+            if (this.rateSnapshots.length >= MAX_RATE_SNAPSHOTS) {
+                this.rateSnapshots.shift();
+            }
+            this.rateSnapshots.push(entry);
         } catch (err: any) {
             this.logger.debug(`[METRICS] recordRateSnapshot() error (non-fatal): ${err?.message}`);
         }
@@ -225,6 +241,7 @@ export class DoctoraliaMetricsService {
             this.duplicateEvents.length = 0;
             this.recentSignatures.clear();
             this.lastRateSnapshot = null;
+            this.rateSnapshots.length = 0;
             this.startedAt = Date.now();
         } catch (err: any) {
             this.logger.warn(`[METRICS] reset() error: ${err?.message}`);
@@ -483,11 +500,50 @@ export class DoctoraliaMetricsService {
         const rlBlocked = this.rateLimiterEvents.filter(e => e.blocked).length;
         const rlWaitMs = this.rateLimiterEvents.map(e => e.waitMsActual).sort((a, b) => a - b);
 
-        // Escopo de instância
-        const instanceId = process.env.NODE_APP_INSTANCE ?? process.env.REPL_ID ?? process.pid.toString();
-        const instanceCountRaw = process.env.NODE_APP_INSTANCE ?? null;
-        const instanceCount = instanceCountRaw !== null ? 'DETERMINED' : 'UNKNOWN';
-        const scope = instanceCount === 'UNKNOWN' ? 'SINGLE_INSTANCE' : 'MULTI_INSTANCE_PARTIAL';
+        // ── Escopo de instância ──────────────────────────────────────────────────
+        // Regra crítica: SINGLE_INSTANCE_CONFIRMED exige evidência positiva verificável.
+        // Ausência de variável não é evidência de instância única — resultado = UNKNOWN.
+        // NODE_APP_INSTANCE presente → PM2 clustering → MULTI_INSTANCE.
+        const instanceEnv = process.env.NODE_APP_INSTANCE ?? null;
+        const instanceId = instanceEnv ?? process.env.REPL_ID ?? process.pid.toString();
+
+        let scope: 'SINGLE_INSTANCE_CONFIRMED' | 'MULTI_INSTANCE' | 'UNKNOWN';
+        let instanceCount: number | null;
+        let scopeNote: string | undefined;
+
+        if (instanceEnv !== null) {
+            // NODE_APP_INSTANCE presente indica PM2/cluster com múltiplas réplicas possíveis.
+            // O índice 0 não significa que não há instâncias 1, 2, …
+            scope = 'MULTI_INSTANCE';
+            instanceCount = null; // contagem total de réplicas não é determinável aqui
+            scopeNote = 'Métricas parciais: apenas esta instância/processo. NODE_APP_INSTANCE presente indica cluster.';
+        } else {
+            // Sem evidência positiva de instância única — não inventar confirmação.
+            scope = 'UNKNOWN';
+            instanceCount = null;
+            scopeNote = 'Escopo desconhecido: métricas representam apenas este processo. Sem evidência verificável de instância única.';
+        }
+
+        // ── Estatísticas agregadas do histórico de snapshots ─────────────────────
+        const snaps = this.rateSnapshots;
+        const snapCount = snaps.length;
+
+        function snapStat(field: keyof typeof snaps[0]): { current: number | null; max: number | null; min: number | null } {
+            if (snapCount === 0 || field === 'recordedAt') {
+                return { current: null, max: null, min: null };
+            }
+            const values = snaps.map(s => s[field] as number);
+            return {
+                current: values[values.length - 1] ?? null,
+                max: Math.max(...values),
+                min: Math.min(...values),
+            };
+        }
+
+        const rateLimitUsageStat = snapStat('usedInWindow');
+        const rateLimitRemainingStat = snapStat('remainingInWindow');
+        const queueHighStat = snapStat('queueSizeHigh');
+        const queueLowStat = snapStat('queueSizeLow');
 
         return {
             generatedAt: new Date().toISOString(),
@@ -497,9 +553,7 @@ export class DoctoraliaMetricsService {
                 instanceId,
                 instanceCount,
                 scope,
-                note: instanceCount === 'UNKNOWN'
-                    ? 'NODE_APP_INSTANCE não configurado — assume instância única'
-                    : 'Métricas desta instância apenas',
+                ...(scopeNote ? { note: scopeNote } : {}),
             },
             volume: {
                 DOCTORALIA_API_REQUEST_COUNT: apiEvents.length,
@@ -515,6 +569,7 @@ export class DoctoraliaMetricsService {
                     max: waitMsAll[waitMsAll.length - 1] ?? 0,
                     buckets,
                 },
+                // Retrocompatibilidade: último snapshot observado (ponto-a-ponto)
                 DOCTORALIA_RATE_LIMIT_USAGE: this.lastRateSnapshot?.usedInWindow ?? null,
                 DOCTORALIA_RATE_LIMIT_REMAINING: this.lastRateSnapshot?.remainingInWindow ?? null,
                 DOCTORALIA_QUEUE_SIZE_HIGH: this.lastRateSnapshot?.queueSizeHigh ?? null,
@@ -522,6 +577,12 @@ export class DoctoraliaMetricsService {
                 rateSnapshotRecordedAt: this.lastRateSnapshot
                     ? new Date(this.lastRateSnapshot.recordedAt).toISOString()
                     : null,
+                // Estatísticas agregadas da janela de medição (baseadas no histórico circular)
+                snapshotCount: snapCount,
+                rateLimitUsage: rateLimitUsageStat,
+                rateLimitRemaining: rateLimitRemainingStat,
+                queueHigh: queueHighStat,
+                queueLow: queueLowStat,
             },
             rateLimiterService: {
                 totalEvents: this.rateLimiterEvents.length,

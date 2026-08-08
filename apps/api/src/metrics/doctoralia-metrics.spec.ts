@@ -636,4 +636,138 @@ describe('DoctoraliaMetricsService — 10 testes WP-01', () => {
         const baseline = service.getBaseline();
         expect(baseline.dataSource).toBe('live');
     });
+
+    // ─── Testes WP-01-B ──────────────────────────────────────────────────────
+
+    // ─── Teste WP-01-B-1: sem NODE_APP_INSTANCE → scope=UNKNOWN ─────────────
+    it('WP-01-B-1. Sem NODE_APP_INSTANCE → scope=UNKNOWN, instanceCount=null', () => {
+        // Garante que NODE_APP_INSTANCE não está definido durante este teste
+        const prev = process.env.NODE_APP_INSTANCE;
+        delete process.env.NODE_APP_INSTANCE;
+        try {
+            const baseline = service.getBaseline();
+            expect(baseline.measurementScope.scope).toBe('UNKNOWN');
+            expect(baseline.measurementScope.instanceCount).toBeNull();
+            expect(typeof baseline.measurementScope.note).toBe('string');
+            expect(baseline.measurementScope.note.length).toBeGreaterThan(0);
+        } finally {
+            if (prev !== undefined) process.env.NODE_APP_INSTANCE = prev;
+        }
+    });
+
+    // ─── Teste WP-01-B-2: NODE_APP_INSTANCE presente → scope=MULTI_INSTANCE ─
+    it('WP-01-B-2. NODE_APP_INSTANCE presente → scope=MULTI_INSTANCE, note descritivo', () => {
+        const prev = process.env.NODE_APP_INSTANCE;
+        process.env.NODE_APP_INSTANCE = '0';
+        try {
+            const baseline = service.getBaseline();
+            expect(baseline.measurementScope.scope).toBe('MULTI_INSTANCE');
+            expect(baseline.measurementScope.instanceCount).toBeNull(); // contagem total não determinável
+            expect(typeof baseline.measurementScope.note).toBe('string');
+            expect(baseline.measurementScope.note.length).toBeGreaterThan(0);
+        } finally {
+            if (prev !== undefined) process.env.NODE_APP_INSTANCE = prev;
+            else delete process.env.NODE_APP_INSTANCE;
+        }
+    });
+
+    // ─── Teste WP-01-B-3: 3 snapshots → current/max/min corretos ────────────
+    it('WP-01-B-3. 3 snapshots → current=último, max=pico, min=mínimo corretos', () => {
+        service.recordRateSnapshot({ usedInWindow: 10, remainingInWindow: 390, queueSizeHigh: 2, queueSizeLow: 5 });
+        service.recordRateSnapshot({ usedInWindow: 50, remainingInWindow: 350, queueSizeHigh: 8, queueSizeLow: 20 });
+        service.recordRateSnapshot({ usedInWindow: 30, remainingInWindow: 370, queueSizeHigh: 4, queueSizeLow: 1 });
+
+        const baseline = service.getBaseline();
+        const { rateLimitUsage, rateLimitRemaining, queueHigh, queueLow } = baseline.queue;
+
+        // current = último snapshot registrado
+        expect(rateLimitUsage.current).toBe(30);
+        expect(rateLimitRemaining.current).toBe(370);
+        expect(queueHigh.current).toBe(4);
+        expect(queueLow.current).toBe(1);
+
+        // max = pico na janela
+        expect(rateLimitUsage.max).toBe(50);
+        expect(rateLimitRemaining.max).toBe(390);
+        expect(queueHigh.max).toBe(8);
+        expect(queueLow.max).toBe(20);
+
+        // min = mínimo na janela
+        expect(rateLimitUsage.min).toBe(10);
+        expect(rateLimitRemaining.min).toBe(350);
+        expect(queueHigh.min).toBe(2);
+        expect(queueLow.min).toBe(1);
+
+        // snapshotCount correto
+        expect(baseline.queue.snapshotCount).toBe(3);
+    });
+
+    // ─── Teste WP-01-B-4: reset → histórico limpo, stats=null ───────────────
+    it('WP-01-B-4. Após reset → histórico de snapshots limpo, stats=null, startedAt atualizado, dataSource="live"', () => {
+        service.recordRateSnapshot({ usedInWindow: 100, remainingInWindow: 300, queueSizeHigh: 5, queueSizeLow: 10 });
+        service.recordRateSnapshot({ usedInWindow: 200, remainingInWindow: 200, queueSizeHigh: 10, queueSizeLow: 20 });
+
+        // Confirma que há dados antes do reset
+        const before = service.getBaseline();
+        expect(before.queue.rateLimitUsage.current).not.toBeNull();
+        expect(before.queue.snapshotCount).toBe(2);
+
+        const beforeResetAt = Date.now();
+        service.reset();
+
+        const after = service.getBaseline();
+
+        // Histórico de snapshots limpo → stats = null
+        expect(after.queue.snapshotCount).toBe(0);
+        expect(after.queue.rateLimitUsage.current).toBeNull();
+        expect(after.queue.rateLimitUsage.max).toBeNull();
+        expect(after.queue.rateLimitUsage.min).toBeNull();
+        expect(after.queue.rateLimitRemaining.current).toBeNull();
+        expect(after.queue.queueHigh.current).toBeNull();
+        expect(after.queue.queueLow.current).toBeNull();
+
+        // Campos de retrocompatibilidade também null
+        expect(after.queue.DOCTORALIA_RATE_LIMIT_USAGE).toBeNull();
+        expect(after.queue.DOCTORALIA_RATE_LIMIT_REMAINING).toBeNull();
+
+        // startedAt atualizado (measurementPeriodMs deve ser muito pequeno)
+        expect(after.measurementPeriodMs).toBeLessThan(Date.now() - beforeResetAt + 200);
+
+        // dataSource preservado
+        expect(after.dataSource).toBe('live');
+    });
+
+    // ─── Teste WP-01-B-5: Regressão — BlockWatcher usa SLOT_SYNC; guards mantidos ─
+    it('WP-01-B-5. Regressão — BlockWatcher ainda usa SLOT_SYNC; endpoints ainda exigem SUPER_ADMIN; nenhum fluxo funcional alterado', async () => {
+        // (a) SLOT_SYNC origin ainda funciona corretamente
+        await runWithDoctoraliaContext({ origin: 'SLOT_SYNC', clinicId: 'clinic-bw' }, async () => {
+            const ctx = getDoctoraliaContext();
+            service.record(makeEvent({
+                doctoraliaRequestId: 'bw-regress-1',
+                origin: ctx?.origin ?? 'OTHER',
+                clinicId: ctx?.clinicId,
+                operation: 'REPLACE_SLOTS',
+                method: 'PUT',
+                httpStatus: 200,
+                isOAuth: false,
+            }));
+        });
+        const events = service.getEvents();
+        const bwEvent = events.find(e => e.doctoraliaRequestId === 'bw-regress-1');
+        expect(bwEvent?.origin).toBe('SLOT_SYNC');
+
+        // (b) getBaseline() ainda retorna dataSource='live'
+        const baseline = service.getBaseline();
+        expect(baseline.dataSource).toBe('live');
+
+        // (c) scope nunca é 'SINGLE_INSTANCE' (o valor antigo/bugado)
+        expect(baseline.measurementScope.scope).not.toBe('SINGLE_INSTANCE');
+
+        // (d) Nenhum snap antes de chamar recordRateSnapshot → campos null (não inventar dados)
+        service.reset();
+        const afterReset = service.getBaseline();
+        expect(afterReset.queue.rateLimitUsage.current).toBeNull();
+        expect(afterReset.queue.rateLimitUsage.max).toBeNull();
+        expect(afterReset.queue.rateLimitUsage.min).toBeNull();
+    });
 });
