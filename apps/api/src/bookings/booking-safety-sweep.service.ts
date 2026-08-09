@@ -4,6 +4,8 @@ import { DocplannerClient, DocplannerService } from '../integrations/docplanner.
 import { QueueService } from './queue.service';
 import { RateLimiterService } from './rate-limiter.service';
 import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
+import { getDoctoraliaMetricsService } from '../metrics/doctoralia-metrics.service';
+import { ClinicConcurrencyGuard } from './clinic-concurrency-guard';
 
 /**
  * Rede de segurança para agendamentos Doctoralia perdidos.
@@ -55,6 +57,7 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
         private readonly docplannerService: DocplannerService,
         private readonly queueService: QueueService,
         private readonly rateLimiter: RateLimiterService,
+        private readonly concurrencyGuard: ClinicConcurrencyGuard,
     ) {}
 
     onModuleInit() {
@@ -101,14 +104,30 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
                 if (this.isShuttingDown) break;
                 // Staggering entre clínicas para diluir a carga (30 clínicas × médicos vinculados).
                 if (i > 0) await this.sleep(SWEEP_STAGGER_PER_CLINIC_MS);
+                const clinicId = connections[i].clinicId;
                 try {
-                    // Prioridade na fila de vazão: as ~dezenas de chamadas da varredura passam
-                    // na frente das milhares do sync global (o teto de 400/5min é o mesmo).
-                    const enqueued = await DocplannerClient.runWithPriority(() => this.sweepClinic(connections[i]));
-                    totalEnqueued += enqueued;
-                    clinicsSwept++;
+                    // WP-02 P2c: Guard de concorrência — SKIP se Polling ativo para esta clínica
+                    if (this.concurrencyGuard.isActive(clinicId, 'POLLING')) {
+                        this.logger.warn(`[SAFETY-SWEEP] SWEEP_SKIPPED_POLL_ACTIVE clinicId=${clinicId} — Polling em andamento, varredura descartada`);
+                        try { getDoctoraliaMetricsService()?.recordConcurrencySkip('SWEEP_SKIPPED_POLL_ACTIVE', clinicId); } catch (_e) {}
+                        continue;
+                    }
+                    if (!this.concurrencyGuard.tryAcquire(clinicId, 'SAFETY_SWEEP')) {
+                        this.logger.warn(`[SAFETY-SWEEP] SWEEP_SKIPPED_SWEEP_ACTIVE clinicId=${clinicId} — Safety Sweep já em andamento, varredura descartada`);
+                        continue;
+                    }
+                    try {
+                        // Prioridade na fila de vazão: as ~dezenas de chamadas da varredura passam
+                        // na frente das milhares do sync global (o teto de 400/5min é o mesmo).
+                        const enqueued = await DocplannerClient.runWithPriority(() => this.sweepClinic(connections[i]));
+                        totalEnqueued += enqueued;
+                        clinicsSwept++;
+                    } finally {
+                        // WP-02 P2c: liberar guard em qualquer cenário
+                        this.concurrencyGuard.release(clinicId, 'SAFETY_SWEEP');
+                    }
                 } catch (err: any) {
-                    this.logger.warn(`[SAFETY-SWEEP] Falha na clínica ${connections[i].clinicId}: ${err?.message}`);
+                    this.logger.warn(`[SAFETY-SWEEP] Falha na clínica ${clinicId}: ${err?.message}`);
                 }
             }
 
@@ -145,6 +164,30 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
 
         // Fire-and-forget com try/catch abrangente: NENHUMA falha aqui pode virar 500 na requisição.
         (async () => {
+            // WP-02 P2c: Guard de concorrência — SKIP se Polling ativo para esta clínica
+            if (this.concurrencyGuard.isActive(clinicId, 'POLLING')) {
+                this.logger.warn(`[SAFETY-SWEEP] [MANUAL] SWEEP_SKIPPED_POLL_ACTIVE clinicId=${clinicId} — Polling em andamento, varredura manual descartada`);
+                try { getDoctoraliaMetricsService()?.recordConcurrencySkip('SWEEP_SKIPPED_POLL_ACTIVE', clinicId); } catch (_e) {}
+                this.manualSweeps.set(clinicId, {
+                    running: false,
+                    startedAt: this.manualSweeps.get(clinicId)?.startedAt || new Date().toISOString(),
+                    finishedAt: new Date().toISOString(),
+                    error: 'Polling em andamento para esta clínica — varredura manual descartada (tente novamente em instantes)',
+                });
+                return;
+            }
+            if (!this.concurrencyGuard.tryAcquire(clinicId, 'SAFETY_SWEEP')) {
+                // Pode ocorrer quando o sweep automático adquiriu o guard entre o início do
+                // fire-and-forget e esta linha. Resetar o estado para que a UI não fique travada.
+                this.logger.warn(`[SAFETY-SWEEP] [MANUAL] SWEEP_SKIPPED_SWEEP_ACTIVE clinicId=${clinicId} — sweep automático em andamento, varredura manual descartada`);
+                this.manualSweeps.set(clinicId, {
+                    running: false,
+                    startedAt: this.manualSweeps.get(clinicId)?.startedAt || new Date().toISOString(),
+                    finishedAt: new Date().toISOString(),
+                    error: 'Varredura automática em andamento para esta clínica — tente novamente em instantes',
+                });
+                return;
+            }
             try {
                 const enqueued = await DocplannerClient.runWithPriority(() => this.sweepClinic(conn));
                 this.manualSweeps.set(clinicId, {
@@ -162,6 +205,9 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
                     finishedAt: new Date().toISOString(),
                     error: err?.message || 'Erro inesperado na verificação',
                 });
+            } finally {
+                // WP-02 P2c: liberar guard em qualquer cenário
+                this.concurrencyGuard.release(clinicId, 'SAFETY_SWEEP');
             }
         })();
 

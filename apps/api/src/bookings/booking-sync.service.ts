@@ -7,6 +7,7 @@ import { RateLimiterService } from './rate-limiter.service';
 import { MatchingEngineService } from '../mappings/matching-engine.service';
 import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 import { getDoctoraliaMetricsService } from '../metrics/doctoralia-metrics.service';
+import { ClinicConcurrencyGuard } from './clinic-concurrency-guard';
 import { randomUUID } from 'crypto';
 
 const POLL_BASE_INTERVAL_MS = 30 * 1000;
@@ -27,6 +28,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         private queueService: QueueService,
         private rateLimiter: RateLimiterService,
         private matchingEngine: MatchingEngineService,
+        private concurrencyGuard: ClinicConcurrencyGuard,
     ) {}
 
     // Normaliza qualquer status vindo da Doctoralia para detectar cancelamento de forma robusta
@@ -200,10 +202,24 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         const conn = await this.getEligibleConnection(staleConn.clinicId, 'vismed');
         if (!conn || !conn.clientId) return;
 
-        // WP-01: poll execution tracking + context propagation
+        // WP-02 P2c: Guard de concorrência — SKIP imediato se o Safety Sweep estiver ativo
+        if (this.concurrencyGuard.isActive(conn.clinicId, 'SAFETY_SWEEP')) {
+            this.logger.warn(`[VISMED-POLL] POLL_SKIPPED_SWEEP_ACTIVE clinicId=${conn.clinicId} — Safety Sweep em andamento, poll descartado`);
+            try { getDoctoraliaMetricsService()?.recordConcurrencySkip('POLL_SKIPPED_SWEEP_ACTIVE', conn.clinicId); } catch (_e) {}
+            return;
+        }
+        // SKIP imediato se outro Polling já estiver ativo para a mesma clínica
+        if (!this.concurrencyGuard.tryAcquire(conn.clinicId, 'POLLING')) {
+            this.logger.warn(`[VISMED-POLL] POLL_SKIPPED_POLL_ACTIVE clinicId=${conn.clinicId} — Polling já em andamento, poll descartado`);
+            try { getDoctoraliaMetricsService()?.recordConcurrencySkip('POLL_SKIPPED_POLL_ACTIVE', conn.clinicId); } catch (_e) {}
+            return;
+        }
+
+        // WP-01: poll execution tracking + context propagation (apenas quando o poll efetivamente executa)
         const pollExecutionId = randomUUID();
         try { getDoctoraliaMetricsService()?.trackPollStart(conn.clinicId, pollExecutionId); } catch (_e) {}
 
+        try {
         await runWithDoctoraliaContext({ origin: 'POLLING', clinicId: conn.clinicId, pollExecutionId }, async () => {
         try {
             const idEmpresaGestora = Number(conn.clientId);
@@ -304,6 +320,10 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             try { getDoctoraliaMetricsService()?.trackPollEnd(conn.clinicId, pollExecutionId); } catch (_e) {}
         }
         }); // end runWithDoctoraliaContext(POLLING)
+        } finally {
+            // WP-02 P2c: liberar guard em qualquer cenário (exception, timeout, erro de negócio)
+            this.concurrencyGuard.release(conn.clinicId, 'POLLING');
+        }
     }
 
     /**

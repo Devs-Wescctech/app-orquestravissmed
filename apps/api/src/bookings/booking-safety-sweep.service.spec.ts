@@ -1,4 +1,5 @@
 import { BookingSafetySweepService } from './booking-safety-sweep.service';
+import { ClinicConcurrencyGuard } from './clinic-concurrency-guard';
 
 describe('BookingSafetySweepService', () => {
     let service: BookingSafetySweepService;
@@ -7,6 +8,7 @@ describe('BookingSafetySweepService', () => {
     let queue: any;
     let rateLimiter: any;
     let client: any;
+    let concurrencyGuard: ClinicConcurrencyGuard;
 
     const conn = {
         clinicId: 'clinic-1',
@@ -41,7 +43,8 @@ describe('BookingSafetySweepService', () => {
         docplanner = { createClient: jest.fn().mockReturnValue(client) };
         queue = { enqueueBatch: jest.fn().mockResolvedValue(undefined) };
         rateLimiter = { acquire: jest.fn().mockResolvedValue(undefined) };
-        service = new BookingSafetySweepService(prisma, docplanner, queue, rateLimiter);
+        concurrencyGuard = new ClinicConcurrencyGuard();
+        service = new BookingSafetySweepService(prisma, docplanner, queue, rateLimiter, concurrencyGuard);
     });
 
     const newBooking = (id: string, extra: any = {}) => ({
@@ -141,5 +144,58 @@ describe('BookingSafetySweepService', () => {
 
         expect(result.clinics).toBe(1);
         expect(result.enqueued).toBe(1);
+    });
+
+    it('runSweepAllClinics pula clínica cujo SAFETY_SWEEP já está ativo (guard adquirido externamente)', async () => {
+        client.getBookings.mockResolvedValue({ _items: [newBooking('666')] });
+
+        // Simula sweep automático já em andamento: adquire o guard antes de chamar runSweepAllClinics
+        concurrencyGuard.tryAcquire('clinic-1', 'SAFETY_SWEEP');
+        try {
+            const result = await service.runSweepAllClinics();
+            expect(result.clinics).toBe(0);
+            expect(result.enqueued).toBe(0);
+            expect(client.getBookings).not.toHaveBeenCalled();
+        } finally {
+            concurrencyGuard.release('clinic-1', 'SAFETY_SWEEP');
+        }
+    });
+
+    it('startManualSweep redefine running=false quando o SAFETY_SWEEP guard já está adquirido (sweep automático ativo)', async () => {
+        // Adquire o guard externamente (simula sweep automático em andamento)
+        concurrencyGuard.tryAcquire('clinic-1', 'SAFETY_SWEEP');
+        try {
+            const started = service.startManualSweep(conn);
+            expect(started.started).toBe(true); // resposta imediata à UI
+
+            // Aguarda o fire-and-forget detectar o conflito
+            await new Promise(resolve => setTimeout(resolve, 20));
+
+            const status = service.getManualSweepStatus('clinic-1');
+            // Estado NÃO deve ficar travado em running=true
+            expect(status.running).toBe(false);
+            expect(status.error).toBeDefined();
+            // Nenhuma chamada à Doctoralia deve ter sido feita
+            expect(client.getBookings).not.toHaveBeenCalled();
+        } finally {
+            concurrencyGuard.release('clinic-1', 'SAFETY_SWEEP');
+        }
+    });
+
+    it('startManualSweep redefine running=false quando o POLLING está ativo para a clínica', async () => {
+        concurrencyGuard.tryAcquire('clinic-1', 'POLLING');
+        try {
+            const started = service.startManualSweep(conn);
+            expect(started.started).toBe(true);
+
+            await new Promise(resolve => setTimeout(resolve, 20));
+
+            const status = service.getManualSweepStatus('clinic-1');
+            expect(status.running).toBe(false);
+            expect(status.error).toBeDefined();
+            expect(client.getBookings).not.toHaveBeenCalled();
+        } finally {
+            concurrencyGuard.release('clinic-1', 'POLLING');
+        }
     });
 });

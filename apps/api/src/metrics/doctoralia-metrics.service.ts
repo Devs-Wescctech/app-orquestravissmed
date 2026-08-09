@@ -150,6 +150,11 @@ export class DoctoraliaMetricsService {
     // Assinaturas recentes: signature → timestamp[]
     private readonly recentSignatures = new Map<string, number[]>();
 
+    // WP-02 P2c: Contadores de bloqueio por concorrência
+    private pollSkippedPollActive = 0;
+    private pollSkippedSweepActive = 0;
+    private sweepSkippedPollActive = 0;
+
     // Início da medição
     private startedAt = Date.now();
 
@@ -242,11 +247,50 @@ export class DoctoraliaMetricsService {
             this.recentSignatures.clear();
             this.lastRateSnapshot = null;
             this.rateSnapshots.length = 0;
+            // WP-02 P2c
+            this.pollSkippedPollActive = 0;
+            this.pollSkippedSweepActive = 0;
+            this.sweepSkippedPollActive = 0;
             this.startedAt = Date.now();
         } catch (err: any) {
             this.logger.warn(`[METRICS] reset() error: ${err?.message}`);
             throw err;
         }
+    }
+
+    // ────────────────── WP-02 P2c: Concurrency skip recording ───────────────
+
+    /**
+     * Registra um bloqueio por concorrência de clínica.
+     * Tipos:
+     *   POLL_SKIPPED_POLL_ACTIVE  — Polling bloqueado por Polling ativo na mesma clínica
+     *   POLL_SKIPPED_SWEEP_ACTIVE — Polling bloqueado por Safety Sweep ativo na mesma clínica
+     *   SWEEP_SKIPPED_POLL_ACTIVE — Safety Sweep bloqueado por Polling ativo na mesma clínica
+     */
+    recordConcurrencySkip(
+        type: 'POLL_SKIPPED_POLL_ACTIVE' | 'POLL_SKIPPED_SWEEP_ACTIVE' | 'SWEEP_SKIPPED_POLL_ACTIVE',
+        clinicId?: string,
+    ): void {
+        try {
+            if (type === 'POLL_SKIPPED_POLL_ACTIVE') this.pollSkippedPollActive++;
+            else if (type === 'POLL_SKIPPED_SWEEP_ACTIVE') this.pollSkippedSweepActive++;
+            else if (type === 'SWEEP_SKIPPED_POLL_ACTIVE') this.sweepSkippedPollActive++;
+            this.logger.debug(`[METRICS] ${type} clinicId=${clinicId ?? 'unknown'}`);
+        } catch (err: any) {
+            this.logger.debug(`[METRICS] recordConcurrencySkip() error (non-fatal): ${err?.message}`);
+        }
+    }
+
+    getConcurrencySkipCounts(): {
+        POLL_SKIPPED_POLL_ACTIVE: number;
+        POLL_SKIPPED_SWEEP_ACTIVE: number;
+        SWEEP_SKIPPED_POLL_ACTIVE: number;
+    } {
+        return {
+            POLL_SKIPPED_POLL_ACTIVE: this.pollSkippedPollActive,
+            POLL_SKIPPED_SWEEP_ACTIVE: this.pollSkippedSweepActive,
+            SWEEP_SKIPPED_POLL_ACTIVE: this.sweepSkippedPollActive,
+        };
     }
 
     // ────────────────── Poll tracking ───────────────────────────────────────
@@ -620,6 +664,12 @@ export class DoctoraliaMetricsService {
             duplicates: {
                 POTENTIAL_DUPLICATE_REQUEST_COUNT: this.duplicateEvents.length,
                 recentDuplicates: this.duplicateEvents.slice(-10),
+            },
+            // WP-02 P2c: Guard de concorrência por clínica
+            concurrencyGuard: {
+                POLL_SKIPPED_POLL_ACTIVE: this.pollSkippedPollActive,
+                POLL_SKIPPED_SWEEP_ACTIVE: this.pollSkippedSweepActive,
+                SWEEP_SKIPPED_POLL_ACTIVE: this.sweepSkippedPollActive,
             },
         };
     }
