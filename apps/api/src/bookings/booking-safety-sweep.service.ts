@@ -114,6 +114,7 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
                     }
                     if (!this.concurrencyGuard.tryAcquire(clinicId, 'SAFETY_SWEEP')) {
                         this.logger.warn(`[SAFETY-SWEEP] SWEEP_SKIPPED_SWEEP_ACTIVE clinicId=${clinicId} — Safety Sweep já em andamento, varredura descartada`);
+                        try { getDoctoraliaMetricsService()?.recordConcurrencySkip('SWEEP_SKIPPED_SWEEP_ACTIVE', clinicId); } catch (_e) {}
                         continue;
                     }
                     try {
@@ -180,6 +181,7 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
                 // Pode ocorrer quando o sweep automático adquiriu o guard entre o início do
                 // fire-and-forget e esta linha. Resetar o estado para que a UI não fique travada.
                 this.logger.warn(`[SAFETY-SWEEP] [MANUAL] SWEEP_SKIPPED_SWEEP_ACTIVE clinicId=${clinicId} — sweep automático em andamento, varredura manual descartada`);
+                try { getDoctoraliaMetricsService()?.recordConcurrencySkip('SWEEP_SKIPPED_SWEEP_ACTIVE', clinicId); } catch (_e) {}
                 this.manualSweeps.set(clinicId, {
                     running: false,
                     startedAt: this.manualSweeps.get(clinicId)?.startedAt || new Date().toISOString(),

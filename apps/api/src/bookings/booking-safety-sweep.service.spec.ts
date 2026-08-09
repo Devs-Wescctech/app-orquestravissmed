@@ -1,5 +1,6 @@
 import { BookingSafetySweepService } from './booking-safety-sweep.service';
 import { ClinicConcurrencyGuard } from './clinic-concurrency-guard';
+import { DoctoraliaMetricsService, getDoctoraliaMetricsService } from '../metrics/doctoralia-metrics.service';
 
 describe('BookingSafetySweepService', () => {
     let service: BookingSafetySweepService;
@@ -29,6 +30,8 @@ describe('BookingSafetySweepService', () => {
     };
 
     beforeEach(() => {
+        // Instancia o serviço de métricas; o construtor registra a instância global via _globalInstance.
+        new DoctoraliaMetricsService();
         client = { getBookings: jest.fn() };
         prisma = {
             integrationConnection: { findMany: jest.fn().mockResolvedValue([conn]) },
@@ -156,6 +159,7 @@ describe('BookingSafetySweepService', () => {
             expect(result.clinics).toBe(0);
             expect(result.enqueued).toBe(0);
             expect(client.getBookings).not.toHaveBeenCalled();
+            expect(getDoctoraliaMetricsService()!.getConcurrencySkipCounts().SWEEP_SKIPPED_SWEEP_ACTIVE).toBe(1);
         } finally {
             concurrencyGuard.release('clinic-1', 'SAFETY_SWEEP');
         }
@@ -177,6 +181,7 @@ describe('BookingSafetySweepService', () => {
             expect(status.error).toBeDefined();
             // Nenhuma chamada à Doctoralia deve ter sido feita
             expect(client.getBookings).not.toHaveBeenCalled();
+            expect(getDoctoraliaMetricsService()!.getConcurrencySkipCounts().SWEEP_SKIPPED_SWEEP_ACTIVE).toBe(1);
         } finally {
             concurrencyGuard.release('clinic-1', 'SAFETY_SWEEP');
         }
