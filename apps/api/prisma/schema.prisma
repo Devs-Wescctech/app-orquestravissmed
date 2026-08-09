@@ -570,10 +570,17 @@ model SyncJob {
   nextRunAt     DateTime      @default(now())
   lockedAt      DateTime?
   lockedBy      String?
+  // Chave de deduplicação de produtores. A unicidade é garantida por um índice
+  // ÚNICO PARCIAL criado por migration SQL manual (Prisma 5.x não declara índices
+  // parciais no schema): UNIQUE ("dedupKey") WHERE "dedupKey" IS NOT NULL AND
+  // (status IN ('PENDING','RUNNING') OR (status='FAILED' AND attempts < "maxAttempts")).
+  // Ver migration 20260809_syncjob_dedup_lease.
+  dedupKey      String?
   completedAt   DateTime?
   createdAt     DateTime      @default(now())
   updatedAt     DateTime      @updatedAt
 
+  @@index([dedupKey])
   @@index([status, nextRunAt, priority])
   @@index([clinicId, status])
   @@index([type, status])
