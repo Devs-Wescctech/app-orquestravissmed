@@ -391,12 +391,26 @@ export class DocplannerClient {
             }
 
             if (!response.ok) {
-                // Token do cache pode ter sido revogado/expirado no servidor: renova UMA vez e repete.
-                if (response.status === 401 && !isRetry && this.clientId) {
-                    this.logger.warn(`401 em ${method} ${path} — renovando token OAuth e repetindo a chamada.`);
+                // Token do cache pode ter sido revogado/expirado no servidor.
+                // Sempre renova o token para que a próxima chamada use um token válido,
+                // mas só repete a operação se ela for comprovadamente idempotente.
+                if (response.status === 401 && this.clientId) {
                     await response.text().catch(() => undefined);
+                    const operation401 = this.inferOperation(method, path);
+                    const canRetry = !isRetry && this.isRetryableOperation(method, operation401);
+                    // Renovação SEMPRE ocorre — independente de repetir ou não.
                     await this.getToken(true);
-                    return this.request(method, path, data, true);
+                    if (canRetry) {
+                        this.logger.warn(`401 em ${method} ${path} (${operation401}) — token renovado, repetindo a chamada.`);
+                        return this.request(method, path, data, true);
+                    }
+                    const reason = isRetry
+                        ? 'já é retry'
+                        : `operação ${operation401} não é idempotente`;
+                    this.logger.warn(`401 em ${method} ${path} (${operation401}) — token renovado mas NÃO repetindo (${reason}).`);
+                    const err401 = new Error(`Docplanner API Error: 401 Unauthorized`);
+                    (err401 as any).status = 401;
+                    throw err401;
                 }
                 const errorText = await response.text();
                 this.logger.error(`Docplanner API Error: ${response.status} ${errorText} URL: ${url}`);
@@ -468,6 +482,61 @@ export class DocplannerClient {
                 }
             } catch (_e) { /* fail-safe: metrics never propagate */ }
         }
+    }
+
+    /**
+     * Determina se uma operação pode ser repetida automaticamente após 401.
+     *
+     * Apenas operações **IDEMPOTENTE_COMPROVADA** recebem retry automático:
+     * - Todos os GETs (leitura pura — repetiçao nunca altera estado)
+     * - REPLACE_SLOTS via PUT (substituição total do calendário; mesmo payload → mesmo estado)
+     *
+     * Classificação completa de todas as operações Doctoralia:
+     *
+     * | Operação                          | HTTP   | Classificação           | Justificativa                                          |
+     * |-----------------------------------|--------|-------------------------|--------------------------------------------------------|
+     * | GET_FACILITIES                    | GET    | IDEMPOTENTE_COMPROVADA  | Leitura pura                                           |
+     * | GET_DOCTORS                       | GET    | IDEMPOTENTE_COMPROVADA  | Leitura pura                                           |
+     * | GET_ADDRESSES                     | GET    | IDEMPOTENTE_COMPROVADA  | Leitura pura                                           |
+     * | GET_SERVICES                      | GET    | IDEMPOTENTE_COMPROVADA  | Leitura pura                                           |
+     * | GET_CALENDAR                      | GET    | IDEMPOTENTE_COMPROVADA  | Leitura pura                                           |
+     * | GET_INSURANCES                    | GET    | IDEMPOTENTE_COMPROVADA  | Leitura pura                                           |
+     * | GET_INSURANCE_PROVIDERS           | GET    | IDEMPOTENTE_COMPROVADA  | Leitura pura                                           |
+     * | GET_INSURANCE_PLANS               | GET    | IDEMPOTENTE_COMPROVADA  | Leitura pura                                           |
+     * | GET_ADDRESS_INSURANCE_PROVIDERS   | GET    | IDEMPOTENTE_COMPROVADA  | Leitura pura                                           |
+     * | GET_FACILITY_SERVICES             | GET    | IDEMPOTENTE_COMPROVADA  | Leitura pura                                           |
+     * | GET_FACILITY_SERVICES_CATALOG     | GET    | IDEMPOTENTE_COMPROVADA  | Leitura pura                                           |
+     * | GET_SERVICES_DICTIONARY           | GET    | IDEMPOTENTE_COMPROVADA  | Leitura pura                                           |
+     * | GET_BOOKINGS                      | GET    | IDEMPOTENTE_COMPROVADA  | Leitura pura                                           |
+     * | GET_SLOTS                         | GET    | IDEMPOTENTE_COMPROVADA  | Leitura pura                                           |
+     * | GET_BREAKS                        | GET    | IDEMPOTENTE_COMPROVADA  | Leitura pura                                           |
+     * | GET_NOTIFICATIONS                 | GET    | IDEMPOTENTE_COMPROVADA  | Leitura pura                                           |
+     * | REPLACE_SLOTS                     | PUT    | IDEMPOTENTE_COMPROVADA  | Substituição total; mesmo payload → mesmo estado final |
+     * | PUT_ADDRESS_INSURANCE_PROVIDER    | PUT    | DESCONHECIDA            | Semântica não confirmada pelo contrato; conservador    |
+     * | ADD_ADDRESS_SERVICE               | POST   | NÃO_IDEMPOTENTE         | Cria recurso; segundo POST cria duplicata              |
+     * | ADD_ADDRESS_INSURANCE_PROVIDER    | POST   | NÃO_IDEMPOTENTE         | Cria vínculo; segundo POST pode criar duplicata        |
+     * | BOOK_SLOT                         | POST   | NÃO_IDEMPOTENTE         | Cria booking; segundo POST cria booking duplicado      |
+     * | ENABLE_CALENDAR                   | POST   | NÃO_IDEMPOTENTE         | Dispara ação                                           |
+     * | DISABLE_CALENDAR                  | POST   | NÃO_IDEMPOTENTE         | Dispara ação                                           |
+     * | RELEASE_NOTIFICATIONS             | POST   | NÃO_IDEMPOTENTE         | Consome/libera notificações                            |
+     * | MOVE_BOOKING                      | POST   | NÃO_IDEMPOTENTE         | Move booking; segundo POST pode mover novamente        |
+     * | ADD_BREAK                         | POST   | NÃO_IDEMPOTENTE         | Cria break; segundo POST cria break duplicado          |
+     * | PATCH_ADDRESSES                   | PATCH  | NÃO_IDEMPOTENTE         | Atualização parcial; contrato não garante idempotência |
+     * | PATCH_SERVICES                    | PATCH  | NÃO_IDEMPOTENTE         | Atualização parcial                                    |
+     * | MOVE_BREAK                        | PATCH  | NÃO_IDEMPOTENTE         | Move break; segundo PATCH pode mover novamente         |
+     * | DELETE_SLOTS                      | DELETE | NÃO_IDEMPOTENTE         | Segundo DELETE pode retornar 404 ou erro               |
+     * | DELETE_SERVICES                   | DELETE | NÃO_IDEMPOTENTE         | Segundo DELETE pode retornar 404                       |
+     * | DELETE_ADDRESS_INSURANCE_PROVIDER | DELETE | NÃO_IDEMPOTENTE         | Segundo DELETE pode retornar 404                       |
+     * | DELETE_BREAK                      | DELETE | NÃO_IDEMPOTENTE         | Segundo DELETE pode retornar 404                       |
+     * | CANCEL_BOOKING                    | DELETE | NÃO_IDEMPOTENTE         | Segundo DELETE pode retornar 404 ou efeito colateral   |
+     */
+    private isRetryableOperation(method: string, operation: string): boolean {
+        // Todos os GETs são leitura pura — sempre idempotentes.
+        if (method === 'GET') return true;
+        // REPLACE_SLOTS é substituição total (PUT): mesmo payload → mesmo estado final.
+        if (method === 'PUT' && operation === 'REPLACE_SLOTS') return true;
+        // Tudo o mais (POST, DELETE, PATCH e outros PUTs) não tem idempotência comprovada.
+        return false;
     }
 
     /** Infere nome de operação legível a partir do método HTTP e caminho. */
