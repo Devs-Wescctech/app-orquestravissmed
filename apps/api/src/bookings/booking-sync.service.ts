@@ -2089,17 +2089,53 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
 
         const isNotFound = (err: any) => /\b404\b/.test(String(err?.message || err));
         const isConflict = (err: any) => /\b409\b/.test(String(err?.message || err));
+        /** True for AbortError (30 s fetch timeout) */
+        const isTimeout = (err: any) => err?.name === 'AbortError';
+        /** True for network-level failures (no HTTP status code) that are not 409 */
+        const isNetworkFailure = (err: any) =>
+            !isTimeout(err) && !isConflict(err) && typeof (err as any)?.status !== 'number';
 
-        // Look up the remote break that matches our since/till and persist its id.
-        // Used to recover from 409 (duplicate) or 404 (stale local id).
-        const findRemoteBreakId = async (): Promise<string | null> => {
+        // Tolerances for matching a remote break to the operation we sent.
+        // Named constants so test code can reference the same values without magic numbers.
+        const BREAK_MATCH_SINCE_TOLERANCE_MS = 60_000; // ±60 s for `since` comparison
+        const BREAK_MATCH_TILL_TOLERANCE_MS  = 60_000; // ±60 s for `till`  comparison
+
+        /**
+         * Looks up the remote break that matches BOTH `sinceSent` AND `tillSent`.
+         * Used to recover from:
+         *   - HTTP 409 (duplicate): break already existed before our POST
+         *   - Timeout / network failure: break may or may not have been created
+         *
+         * Matching rules (dual-criterion to avoid false adoption):
+         *   - `since` of candidate within ±60 s of `sinceSent`
+         *   - `till`  of candidate within ±60 s of `tillSent`
+         *
+         * Return semantics by number of candidates after dual filter:
+         *   0  → null   (break not found; caller should rethrow for retry)
+         *   1  → id     (unambiguous match; adopt it)
+         *   N>1→ null   (ambiguous; logs WARN with all IDs; caller should rethrow)
+         */
+        const findRemoteBreakId = async (sinceSent: string, tillSent: string): Promise<string | null> => {
             try {
                 await this.rateLimiter.acquire('doctoralia');
-                const list = await client.getCalendarBreaks(facilityId, mapping.externalId!, addressId, since, till);
+                const list = await client.getCalendarBreaks(facilityId, mapping.externalId!, addressId, sinceSent, tillSent);
                 const items: any[] = Array.isArray(list) ? list : list?._items || [list].filter(Boolean);
-                const target = new Date(since).getTime();
-                const match = items.find((b) => b?.since && Math.abs(new Date(b.since).getTime() - target) < 60_000);
-                return match?.id ? String(match.id) : null;
+                const sinceTarget = new Date(sinceSent).getTime();
+                const tillTarget  = new Date(tillSent).getTime();
+                const candidates = items.filter(
+                    (b) =>
+                        b?.since && Math.abs(new Date(b.since).getTime() - sinceTarget) < BREAK_MATCH_SINCE_TOLERANCE_MS &&
+                        b?.till  && Math.abs(new Date(b.till).getTime()  - tillTarget)  < BREAK_MATCH_TILL_TOLERANCE_MS,
+                );
+                if (candidates.length === 0) return null;
+                if (candidates.length === 1) return candidates[0].id ? String(candidates[0].id) : null;
+                // N > 1: ambiguous — log all IDs and return null (conservative; do not adopt)
+                const ids = candidates.map((c: any) => c.id).join(', ');
+                this.logger.warn(
+                    `[VISMED-POLL] break_ambiguous_after_timeout: multiple remote breaks found for booking ${rec.id} ` +
+                    `(since=${sinceSent}, till=${tillSent}): [${ids}] — not adopting any; will retry on next cycle`,
+                );
+                return null;
             } catch {
                 return null;
             }
@@ -2168,21 +2204,53 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 this.logger.log(`[VISMED-POLL] Created Doctoralia break ${breakId} for booking ${rec.id}`);
             }
         } catch (err: any) {
-            if (!isConflict(err)) throw err;
-            const existingId = await findRemoteBreakId();
-            if (existingId) {
-                await this.prisma.bookingSync.update({
-                    where: { id: rec.id },
-                    data: {
-                        doctoraliaBreakId: existingId,
-                        doctoraliaFacilityId: facilityId,
-                        doctoraliaAddressId: addressId,
-                        syncedToDoctoralia: true,
-                    },
-                });
-                this.logger.log(`[VISMED-POLL] Adopted existing Doctoralia break ${existingId} for booking ${rec.id} (409)`);
+            if (isConflict(err)) {
+                // 409 path — break already existed before our POST (unchanged behaviour).
+                const existingId = await findRemoteBreakId(since, till);
+                if (existingId) {
+                    await this.prisma.bookingSync.update({
+                        where: { id: rec.id },
+                        data: {
+                            doctoraliaBreakId: existingId,
+                            doctoraliaFacilityId: facilityId,
+                            doctoraliaAddressId: addressId,
+                            syncedToDoctoralia: true,
+                        },
+                    });
+                    this.logger.log(`[VISMED-POLL] Adopted existing Doctoralia break ${existingId} for booking ${rec.id} (409)`);
+                } else {
+                    this.logger.warn(`[VISMED-POLL] Got 409 creating break for booking ${rec.id} but could not locate existing one`);
+                }
+            } else if (isTimeout(err) || isNetworkFailure(err)) {
+                // Timeout / network-failure path — the break may or may not have been created
+                // on Doctoralia's side before the connection dropped.  Search for it before
+                // rethrowing so we do not create a duplicate on the next polling cycle.
+                const existingId = await findRemoteBreakId(since, till);
+                if (existingId) {
+                    await this.prisma.bookingSync.update({
+                        where: { id: rec.id },
+                        data: {
+                            doctoraliaBreakId: existingId,
+                            doctoraliaFacilityId: facilityId,
+                            doctoraliaAddressId: addressId,
+                            syncedToDoctoralia: true,
+                        },
+                    });
+                    this.logger.log(
+                        `[VISMED-POLL] break_adopted_after_timeout: adopted remote break ${existingId} ` +
+                        `for booking ${rec.id} after network/timeout failure`,
+                    );
+                } else {
+                    // 0 candidates → break not created; N>1 → ambiguous (already warned).
+                    // In both cases rethrow so the next reconciliation cycle retries.
+                    this.logger.warn(
+                        `[VISMED-POLL] break_not_found_after_timeout: no unambiguous remote break found ` +
+                        `for booking ${rec.id} after network/timeout failure — will retry on next cycle`,
+                    );
+                    throw err;
+                }
             } else {
-                this.logger.warn(`[VISMED-POLL] Got 409 creating break for booking ${rec.id} but could not locate existing one`);
+                throw err;
             }
         }
     }
