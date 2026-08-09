@@ -17,6 +17,11 @@ echo "[post-merge] Sincronizando schema do banco (prisma db push, idempotente)..
 # de propósito: mudanças destrutivas devem falhar aqui em vez de apagar dados silenciosamente.
 (cd apps/api && npx prisma db push --skip-generate)
 
+echo "[post-merge] Aplicando índices parciais (não representáveis no schema Prisma)..."
+# Índice único parcial SyncJob_dedupKey_active_key: db push não o cria (nem o remove).
+# A migration é idempotente (IF NOT EXISTS) e aborta com relatório se houver duplicatas ativas.
+(cd apps/api && npx prisma db execute --file prisma/migrations/20260809_syncjob_dedup_lease/migration.sql --schema prisma/schema.prisma)
+
 echo "[post-merge] Buildando a API (tsc → apps/api/dist)..."
 # A API builda com tsc (não há nest-cli.json). O workflow roda apps/api/dist/main.js.
 (cd apps/api && npx tsc)

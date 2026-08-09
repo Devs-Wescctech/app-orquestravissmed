@@ -25,6 +25,8 @@ Workflow `Start application`: `cd apps/api && node dist/main.js & cd apps/web &&
 ## Database
 PostgreSQL do Replit (Prisma). Schema em `apps/api/prisma/schema.prisma`.
 
+- Índice único parcial `SyncJob_dedupKey_active_key` (dedup atômica de jobs) não é representável no schema Prisma; vive na migration `apps/api/prisma/migrations/20260809_syncjob_dedup_lease/migration.sql`. `prisma db push` NÃO o cria nem o remove (verificado); por isso, tanto o `scripts/post-merge.sh` (dev) quanto o build do deployment em `.replit` aplicam a migration de forma idempotente com `prisma db execute --file` logo após o `db push`. A migration aborta com relatório se houver duplicatas ativas de dedupKey (fail-safe, sem alterar dados).
+
 ## Environment Variables
 - `DATABASE_URL` — conexão PostgreSQL (auto-set pelo Replit)
 - `JWT_SECRET` — chave de assinatura JWT
