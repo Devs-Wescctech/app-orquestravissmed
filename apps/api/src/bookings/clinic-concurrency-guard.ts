@@ -26,7 +26,11 @@ export class ClinicConcurrencyGuard {
             active = new Set();
             this.activeSubsystems.set(clinicId, active);
         }
-        if (active.has(subsystem)) {
+        // Exclusão mútua por clínica: rejeita se QUALQUER subsistema estiver
+        // ativo (não apenas o mesmo). Isso torna o tryAcquire a barreira
+        // atômica — a segurança não depende da sequência isActive() → tryAcquire()
+        // feita pelos chamadores (que serve apenas para escolher o motivo do skip).
+        if (active.size > 0) {
             return false;
         }
         active.add(subsystem);

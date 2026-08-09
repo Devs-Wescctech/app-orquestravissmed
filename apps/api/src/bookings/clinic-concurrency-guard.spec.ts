@@ -112,6 +112,57 @@ describe('ClinicConcurrencyGuard — guard unitário', () => {
         guard.release('clinic-A', 'POLLING');
         expect(() => guard.release('clinic-A', 'POLLING')).not.toThrow();
     });
+
+    // Exclusão cruzada — POLLING ativo bloqueia SAFETY_SWEEP
+    it('exclusão cruzada — tryAcquire SAFETY_SWEEP retorna false com POLLING ativo', () => {
+        const guard = makeGuard();
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(true);
+        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(false);
+        guard.release('clinic-A', 'POLLING');
+    });
+
+    // Exclusão cruzada — SAFETY_SWEEP ativo bloqueia POLLING
+    it('exclusão cruzada — tryAcquire POLLING retorna false com SAFETY_SWEEP ativo', () => {
+        const guard = makeGuard();
+        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(true);
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(false);
+        guard.release('clinic-A', 'SAFETY_SWEEP');
+    });
+
+    // Dois Safety Sweeps — segundo retorna false
+    it('segundo tryAcquire SAFETY_SWEEP na mesma clínica retorna false (SKIP)', () => {
+        const guard = makeGuard();
+        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(true);
+        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(false);
+        guard.release('clinic-A', 'SAFETY_SWEEP');
+    });
+
+    // Release de POLLING → SAFETY_SWEEP pode adquirir depois
+    it('após release de POLLING, SAFETY_SWEEP adquire normalmente', () => {
+        const guard = makeGuard();
+        guard.tryAcquire('clinic-A', 'POLLING');
+        guard.release('clinic-A', 'POLLING');
+        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(true);
+        guard.release('clinic-A', 'SAFETY_SWEEP');
+    });
+
+    // Release de SAFETY_SWEEP → POLLING pode adquirir depois
+    it('após release de SAFETY_SWEEP, POLLING adquire normalmente', () => {
+        const guard = makeGuard();
+        guard.tryAcquire('clinic-A', 'SAFETY_SWEEP');
+        guard.release('clinic-A', 'SAFETY_SWEEP');
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(true);
+        guard.release('clinic-A', 'POLLING');
+    });
+
+    // Independência entre clínicas com subsistemas cruzados
+    it('SAFETY_SWEEP em clínica B adquire mesmo com POLLING ativo em clínica A', () => {
+        const guard = makeGuard();
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(true);
+        expect(guard.tryAcquire('clinic-B', 'SAFETY_SWEEP')).toBe(true);
+        guard.release('clinic-A', 'POLLING');
+        guard.release('clinic-B', 'SAFETY_SWEEP');
+    });
 });
 
 describe('ClinicConcurrencyGuard — integração Polling × Polling', () => {
@@ -311,24 +362,24 @@ describe('ClinicConcurrencyGuard — métricas', () => {
     });
 });
 
-// Cenário 12: Nenhum fluxo Global Sync é afetado
-describe('cenário 12 — escopo do guard: somente POLLING e SAFETY_SWEEP', () => {
-    it('guard não interfere em subsistemas externos não registrados', () => {
+// Cenário 12 (corrigido): POLLING e SAFETY_SWEEP NÃO podem coexistir na mesma clínica
+describe('cenário 12 — exclusão mútua total: POLLING e SAFETY_SWEEP nunca coexistem na mesma clínica', () => {
+    it('segundo subsistema NÃO adquire enquanto o primeiro está ativo', () => {
         const guard = makeGuard();
 
-        // Somente os dois subsistemas definidos no tipo existem
-        // (verificação estática: o TypeScript já garante que outros valores são rejeitados)
         expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(true);
-        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(true);
+        // ANTES este cenário permitia a coexistência — agora deve ser rejeitada.
+        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(false);
 
-        // Dois subsistemas diferentes convivem na mesma clínica
         expect(guard.isActive('clinic-A', 'POLLING')).toBe(true);
-        expect(guard.isActive('clinic-A', 'SAFETY_SWEEP')).toBe(true);
+        expect(guard.isActive('clinic-A', 'SAFETY_SWEEP')).toBe(false);
 
         guard.release('clinic-A', 'POLLING');
-        guard.release('clinic-A', 'SAFETY_SWEEP');
-
         expect(guard.isActive('clinic-A', 'POLLING')).toBe(false);
+
+        // Após o release, o outro subsistema adquire normalmente.
+        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(true);
+        guard.release('clinic-A', 'SAFETY_SWEEP');
         expect(guard.isActive('clinic-A', 'SAFETY_SWEEP')).toBe(false);
     });
 
@@ -338,5 +389,54 @@ describe('cenário 12 — escopo do guard: somente POLLING e SAFETY_SWEEP', () =
         // Este teste documenta o invariante; falha de compilação TypeScript seria evidência de violação.
         const guard = makeGuard();
         expect(guard).toBeInstanceOf(ClinicConcurrencyGuard);
+    });
+});
+
+// Cenário 14: reprodução explícita da race isActive() → tryAcquire()
+describe('race condition — aquisições concorrentes de subsistemas diferentes na mesma clínica', () => {
+    it('somente UM subsistema obtém o guard mesmo quando ambos passam pelo isActive() antes de qualquer tryAcquire()', async () => {
+        const guard = makeGuard();
+
+        // Reproduz a interleaving da auditoria:
+        // 1. Polling verifica isActive(SAFETY_SWEEP) → false
+        // 2. Sweep verifica isActive(POLLING) → false
+        // 3. Polling chama tryAcquire(POLLING)
+        // 4. Sweep chama tryAcquire(SAFETY_SWEEP)
+        const pollSawSweepActive = guard.isActive('clinic-A', 'SAFETY_SWEEP');
+        const sweepSawPollActive = guard.isActive('clinic-A', 'POLLING');
+        expect(pollSawSweepActive).toBe(false);
+        expect(sweepSawPollActive).toBe(false);
+
+        const pollAcquired = guard.tryAcquire('clinic-A', 'POLLING');
+        const sweepAcquired = guard.tryAcquire('clinic-A', 'SAFETY_SWEEP');
+
+        // Barreira atômica: exatamente um dos dois obtém o guard.
+        expect(pollAcquired).toBe(true);
+        expect(sweepAcquired).toBe(false);
+        expect([pollAcquired, sweepAcquired].filter(Boolean)).toHaveLength(1);
+
+        guard.release('clinic-A', 'POLLING');
+    });
+
+    it('duas execuções concorrentes (poll × sweep) na mesma clínica — somente uma executa o corpo', async () => {
+        const guard = makeGuard();
+        let resolvePoll!: () => void;
+        const pollBlock = new Promise<void>(res => (resolvePoll = res));
+
+        const pollBody = jest.fn(() => pollBlock);
+        const sweepBody = jest.fn(async () => {});
+
+        // Dispara os dois "simultaneamente" (mesmo tick)
+        const pollPromise = runPoll(guard, 'clinic-A', pollBody);
+        const sweepPromise = runSweep(guard, 'clinic-A', sweepBody);
+
+        const sweepRan = await sweepPromise;
+        expect(sweepRan).toBe(false);
+        expect(sweepBody).not.toHaveBeenCalled();
+
+        resolvePoll();
+        const pollRan = await pollPromise;
+        expect(pollRan).toBe(true);
+        expect(pollBody).toHaveBeenCalledTimes(1);
     });
 });

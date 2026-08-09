@@ -165,6 +165,21 @@ describe('BookingSafetySweepService', () => {
         }
     });
 
+    it('runSweepAllClinics pula clínica com POLLING ativo e registra SWEEP_SKIPPED_POLL_ACTIVE', async () => {
+        client.getBookings.mockResolvedValue({ _items: [newBooking('777')] });
+
+        concurrencyGuard.tryAcquire('clinic-1', 'POLLING');
+        try {
+            const result = await service.runSweepAllClinics();
+            expect(result.clinics).toBe(0);
+            expect(result.enqueued).toBe(0);
+            expect(client.getBookings).not.toHaveBeenCalled();
+            expect(getDoctoraliaMetricsService()!.getConcurrencySkipCounts().SWEEP_SKIPPED_POLL_ACTIVE).toBe(1);
+        } finally {
+            concurrencyGuard.release('clinic-1', 'POLLING');
+        }
+    });
+
     it('startManualSweep redefine running=false quando o SAFETY_SWEEP guard já está adquirido (sweep automático ativo)', async () => {
         // Adquire o guard externamente (simula sweep automático em andamento)
         concurrencyGuard.tryAcquire('clinic-1', 'SAFETY_SWEEP');
