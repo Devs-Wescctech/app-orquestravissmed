@@ -2301,8 +2301,28 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         const conn = await this.getEligibleConnection(staleConn.clinicId, 'doctoralia');
         if (!conn || !conn.clientId || !conn.clientSecret) return;
 
+        // Task 119: Guard de concorrência — SKIP imediato se o Safety Sweep estiver ativo
+        if (this.concurrencyGuard.isActive(conn.clinicId, 'SAFETY_SWEEP')) {
+            this.logger.warn(`[POLL] POLL_SKIPPED_SWEEP_ACTIVE clinicId=${conn.clinicId} — Safety Sweep em andamento, poll descartado`);
+            try { getDoctoraliaMetricsService()?.recordConcurrencySkip('POLL_SKIPPED_SWEEP_ACTIVE', conn.clinicId); } catch (_e) {}
+            return;
+        }
+        // SKIP imediato se outro Polling já estiver ativo para a mesma clínica.
+        // A aquisição ocorre ANTES de qualquer chamada externa (inclusive rateLimiter),
+        // então um poll skipado não consome nenhuma chamada Doctoralia.
+        if (!this.concurrencyGuard.tryAcquire(conn.clinicId, 'POLLING')) {
+            this.logger.warn(`[POLL] POLL_SKIPPED_POLL_ACTIVE clinicId=${conn.clinicId} — Polling já em andamento, poll descartado`);
+            try { getDoctoraliaMetricsService()?.recordConcurrencySkip('POLL_SKIPPED_POLL_ACTIVE', conn.clinicId); } catch (_e) {}
+            return;
+        }
+
+        // Poll execution tracking + context propagation (apenas quando o poll efetivamente executa)
+        const pollExecutionId = randomUUID();
+        try { getDoctoraliaMetricsService()?.trackPollStart(conn.clinicId, pollExecutionId); } catch (_e) {}
+
+        try {
         // WP-01: propagate POLLING context with clinicId for notification polling calls
-        await runWithDoctoraliaContext({ origin: 'POLLING', clinicId: conn.clinicId }, async () => {
+        await runWithDoctoraliaContext({ origin: 'POLLING', clinicId: conn.clinicId, pollExecutionId }, async () => {
         try {
             await this.rateLimiter.acquire('doctoralia');
 
@@ -2351,6 +2371,11 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             this.logger.warn(`[POLL] Error polling clinic ${conn.clinicId}: ${err.message}`);
         }
         }); // end runWithDoctoraliaContext(POLLING)
+        } finally {
+            try { getDoctoraliaMetricsService()?.trackPollEnd(conn.clinicId, pollExecutionId); } catch (_e) {}
+            // Task 119: liberar guard em qualquer cenário (sucesso, erro ou exception)
+            this.concurrencyGuard.release(conn.clinicId, 'POLLING');
+        }
     }
 
     private async pollAllClinics() {
