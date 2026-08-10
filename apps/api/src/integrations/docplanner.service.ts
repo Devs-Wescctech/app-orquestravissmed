@@ -339,7 +339,55 @@ export class DocplannerClient {
         return data.access_token;
     }
 
+    /**
+     * WP-05: Deduplicação de GETs idênticos in-flight (mesmo padrão do inflightAuth).
+     * Mapa GLOBAL (static) porque DocplannerService.createClient() cria uma instância
+     * nova por uso. Chave: domain|clientId|method|path (path inclui a query completa).
+     * NÃO é cache: a entrada sai do mapa em finally — sucesso OU erro — e a próxima
+     * chamada após conclusão faz requisição nova. Erros jamais ficam armazenados.
+     */
+    private static inflightGets = new Map<string, Promise<any>>();
+
+    /**
+     * Cada awaiter recebe cópia independente do resultado, para que a mutação local
+     * de um consumidor não afete o outro. structuredClone é nativo do Node ≥17
+     * (sem dependência nova); fallback JSON para o improvável caso não-clonável.
+     */
+    private static cloneResult(result: any): any {
+        if (result === null || result === undefined || typeof result !== 'object') return result;
+        try {
+            return structuredClone(result);
+        } catch {
+            return JSON.parse(JSON.stringify(result));
+        }
+    }
+
     private async request(method: string, path: string, data?: any, isRetry = false): Promise<any> {
+        // WP-05: dedup APENAS para GET, excluindo GET_NOTIFICATIONS (stream consumível).
+        // Mutações (POST/PUT/PATCH/DELETE) e OAuth ficam explicitamente fora.
+        // O join acontece AQUI, ANTES de acquireRateSlot — o segundo chamador não
+        // consome slot WAF nem posição na fila de vazão.
+        if (method === 'GET' && !isRetry && this.inferOperation(method, path) !== 'GET_NOTIFICATIONS') {
+            const domain = this.getBaseUrl().replace(/^https?:\/\//, '');
+            const key = `${domain}|${this.clientId ?? ''}|${method}|${path}`;
+            const existing = DocplannerClient.inflightGets.get(key);
+            if (existing) {
+                this.logger.debug(`[DEDUP] GET idêntico já em voo — juntando-se à requisição existente: ${path}`);
+                try {
+                    getDoctoraliaMetricsService()?.recordDedupedGet();
+                } catch (_e) { /* fail-safe */ }
+                return DocplannerClient.cloneResult(await existing);
+            }
+            const flight = this.executeRequest(method, path, data, isRetry).finally(() => {
+                DocplannerClient.inflightGets.delete(key);
+            });
+            DocplannerClient.inflightGets.set(key, flight);
+            return DocplannerClient.cloneResult(await flight);
+        }
+        return this.executeRequest(method, path, data, isRetry);
+    }
+
+    private async executeRequest(method: string, path: string, data?: any, isRetry = false): Promise<any> {
         if (this.clientId) {
             // Sempre passa pelo cache: pega token válido, renova se expirado, e re-tenta
             // autenticar mesmo que a autenticação inicial (fire-and-forget do createClient)
@@ -402,7 +450,9 @@ export class DocplannerClient {
                     await this.getToken(true);
                     if (canRetry) {
                         this.logger.warn(`401 em ${method} ${path} (${operation401}) — token renovado, repetindo a chamada.`);
-                        return this.request(method, path, data, true);
+                        // WP-05: retry direto em executeRequest — permanece DENTRO do voo
+                        // único do dedup (não cria nem se junta a outra entrada do mapa).
+                        return this.executeRequest(method, path, data, true);
                     }
                     const reason = isRetry
                         ? 'já é retry'

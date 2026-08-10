@@ -771,3 +771,39 @@ describe('DoctoraliaMetricsService — 10 testes WP-01', () => {
         expect(afterReset.queue.rateLimitUsage.min).toBeNull();
     });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WP-05 — contador de GETs deduplicados
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('DoctoraliaMetricsService — contador de GETs deduplicados (WP-05)', () => {
+    let service: DoctoraliaMetricsService;
+
+    beforeEach(() => {
+        service = new DoctoraliaMetricsService();
+    });
+
+    it('recordDedupedGet() incrementa o contador', () => {
+        expect(service.getDedupedGetCount()).toBe(0);
+        service.recordDedupedGet();
+        service.recordDedupedGet();
+        expect(service.getDedupedGetCount()).toBe(2);
+    });
+
+    it('o contador aparece no baseline em dedup.DOCTORALIA_DEDUPED_GET_COUNT', () => {
+        service.recordDedupedGet();
+        service.recordDedupedGet();
+        service.recordDedupedGet();
+        const baseline = service.getBaseline();
+        expect(baseline.dedup).toBeDefined();
+        expect(baseline.dedup.DOCTORALIA_DEDUPED_GET_COUNT).toBe(3);
+    });
+
+    it('reset() zera o contador (e o baseline reflete o zero)', () => {
+        service.recordDedupedGet();
+        expect(service.getDedupedGetCount()).toBe(1);
+        service.reset();
+        expect(service.getDedupedGetCount()).toBe(0);
+        expect(service.getBaseline().dedup.DOCTORALIA_DEDUPED_GET_COUNT).toBe(0);
+    });
+});

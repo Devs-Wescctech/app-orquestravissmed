@@ -179,6 +179,9 @@ export class DoctoraliaMetricsService {
     // WP-02 P2c + WP-04: Contadores de bloqueio por concorrência (todos os cruzamentos)
     private concurrencySkipCounts: Record<ConcurrencySkipType, number> = emptyConcurrencySkipCounts();
 
+    // WP-05: GETs que se juntaram a um voo idêntico já em andamento (dedup in-flight)
+    private dedupedGetCount = 0;
+
     // Início da medição
     private startedAt = Date.now();
 
@@ -273,6 +276,8 @@ export class DoctoraliaMetricsService {
             this.rateSnapshots.length = 0;
             // WP-02 P2c + WP-04
             this.concurrencySkipCounts = emptyConcurrencySkipCounts();
+            // WP-05
+            this.dedupedGetCount = 0;
             this.startedAt = Date.now();
         } catch (err: any) {
             this.logger.warn(`[METRICS] reset() error: ${err?.message}`);
@@ -300,6 +305,20 @@ export class DoctoraliaMetricsService {
 
     getConcurrencySkipCounts(): Record<ConcurrencySkipType, number> {
         return { ...this.concurrencySkipCounts };
+    }
+
+    // ─────────── WP-05: contador de GETs deduplicados (fail-safe, aditivo) ───
+
+    recordDedupedGet(): void {
+        try {
+            this.dedupedGetCount++;
+        } catch (err: any) {
+            this.logger.debug(`[METRICS] recordDedupedGet() error (non-fatal): ${err?.message}`);
+        }
+    }
+
+    getDedupedGetCount(): number {
+        return this.dedupedGetCount;
     }
 
     // ────────────────── Poll tracking ───────────────────────────────────────
@@ -645,6 +664,11 @@ export class DoctoraliaMetricsService {
                     p95: percentile(rlWaitMs, 95),
                     max: rlWaitMs[rlWaitMs.length - 1] ?? 0,
                 },
+            },
+            // WP-05: GETs idênticos que se juntaram a um voo em andamento (não consumiram
+            // slot WAF nem posição na fila). Seção aditiva — não altera métricas atuais.
+            dedup: {
+                DOCTORALIA_DEDUPED_GET_COUNT: this.dedupedGetCount,
             },
             errors: errorCounts,
             polling: {
