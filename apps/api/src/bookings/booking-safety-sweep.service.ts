@@ -4,7 +4,7 @@ import { DocplannerClient, DocplannerService } from '../integrations/docplanner.
 import { QueueService } from './queue.service';
 import { RateLimiterService } from './rate-limiter.service';
 import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
-import { getDoctoraliaMetricsService } from '../metrics/doctoralia-metrics.service';
+import { getDoctoraliaMetricsService, concurrencyActorOf } from '../metrics/doctoralia-metrics.service';
 import { ClinicConcurrencyGuard } from './clinic-concurrency-guard';
 
 /**
@@ -113,8 +113,9 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
                         continue;
                     }
                     if (!this.concurrencyGuard.tryAcquire(clinicId, 'SAFETY_SWEEP')) {
-                        this.logger.warn(`[SAFETY-SWEEP] SWEEP_SKIPPED_SWEEP_ACTIVE clinicId=${clinicId} — Safety Sweep já em andamento, varredura descartada`);
-                        try { getDoctoraliaMetricsService()?.recordConcurrencySkip('SWEEP_SKIPPED_SWEEP_ACTIVE', clinicId); } catch (_e) {}
+                        const blocker = concurrencyActorOf(this.concurrencyGuard.getActiveSubsystem(clinicId) ?? 'SAFETY_SWEEP');
+                        this.logger.warn(`[SAFETY-SWEEP] SWEEP_SKIPPED_${blocker}_ACTIVE clinicId=${clinicId} — ${blocker} já em andamento, varredura descartada`);
+                        try { getDoctoraliaMetricsService()?.recordConcurrencySkip(`SWEEP_SKIPPED_${blocker}_ACTIVE`, clinicId); } catch (_e) {}
                         continue;
                     }
                     try {
@@ -180,13 +181,14 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
             if (!this.concurrencyGuard.tryAcquire(clinicId, 'SAFETY_SWEEP')) {
                 // Pode ocorrer quando o sweep automático adquiriu o guard entre o início do
                 // fire-and-forget e esta linha. Resetar o estado para que a UI não fique travada.
-                this.logger.warn(`[SAFETY-SWEEP] [MANUAL] SWEEP_SKIPPED_SWEEP_ACTIVE clinicId=${clinicId} — sweep automático em andamento, varredura manual descartada`);
-                try { getDoctoraliaMetricsService()?.recordConcurrencySkip('SWEEP_SKIPPED_SWEEP_ACTIVE', clinicId); } catch (_e) {}
+                const blocker = concurrencyActorOf(this.concurrencyGuard.getActiveSubsystem(clinicId) ?? 'SAFETY_SWEEP');
+                this.logger.warn(`[SAFETY-SWEEP] [MANUAL] SWEEP_SKIPPED_${blocker}_ACTIVE clinicId=${clinicId} — ${blocker} em andamento, varredura manual descartada`);
+                try { getDoctoraliaMetricsService()?.recordConcurrencySkip(`SWEEP_SKIPPED_${blocker}_ACTIVE`, clinicId); } catch (_e) {}
                 this.manualSweeps.set(clinicId, {
                     running: false,
                     startedAt: this.manualSweeps.get(clinicId)?.startedAt || new Date().toISOString(),
                     finishedAt: new Date().toISOString(),
-                    error: 'Varredura automática em andamento para esta clínica — tente novamente em instantes',
+                    error: 'Outra execução em andamento para esta clínica — tente novamente em instantes',
                 });
                 return;
             }

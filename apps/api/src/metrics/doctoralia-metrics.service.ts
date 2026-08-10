@@ -117,6 +117,32 @@ function percentile(sorted: number[], p: number): number {
     return sorted[Math.max(0, Math.min(idx, sorted.length - 1))];
 }
 
+// ─────────── WP-02 P2c + WP-04: tipos de skip do guard de concorrência ──────
+
+/** Rótulo curto de cada subsistema no nome do contador. */
+const CONCURRENCY_ACTORS = ['POLL', 'SWEEP', 'GLOBAL_SYNC', 'SLOT_SYNC'] as const;
+type ConcurrencyActor = (typeof CONCURRENCY_ACTORS)[number];
+
+/** <QUEM FOI SKIPADO>_SKIPPED_<QUEM ESTAVA ATIVO>_ACTIVE — todos os cruzamentos. */
+export type ConcurrencySkipType = `${ConcurrencyActor}_SKIPPED_${ConcurrencyActor}_ACTIVE`;
+
+export function emptyConcurrencySkipCounts(): Record<ConcurrencySkipType, number> {
+    const counts = {} as Record<ConcurrencySkipType, number>;
+    for (const skipped of CONCURRENCY_ACTORS) {
+        for (const active of CONCURRENCY_ACTORS) {
+            counts[`${skipped}_SKIPPED_${active}_ACTIVE`] = 0;
+        }
+    }
+    return counts;
+}
+
+/** Mapeia o subsistema do guard para o rótulo do contador. */
+export function concurrencyActorOf(subsystem: 'POLLING' | 'SAFETY_SWEEP' | 'GLOBAL_SYNC' | 'SLOT_SYNC'): ConcurrencyActor {
+    if (subsystem === 'POLLING') return 'POLL';
+    if (subsystem === 'SAFETY_SWEEP') return 'SWEEP';
+    return subsystem;
+}
+
 // ──────────────────────────── Serviço ────────────────────────────────────────
 
 /** Singleton global acessível por DocplannerClient (não-NestJS) de forma fail-safe. */
@@ -150,11 +176,8 @@ export class DoctoraliaMetricsService {
     // Assinaturas recentes: signature → timestamp[]
     private readonly recentSignatures = new Map<string, number[]>();
 
-    // WP-02 P2c: Contadores de bloqueio por concorrência
-    private pollSkippedPollActive = 0;
-    private pollSkippedSweepActive = 0;
-    private sweepSkippedPollActive = 0;
-    private sweepSkippedSweepActive = 0;
+    // WP-02 P2c + WP-04: Contadores de bloqueio por concorrência (todos os cruzamentos)
+    private concurrencySkipCounts: Record<ConcurrencySkipType, number> = emptyConcurrencySkipCounts();
 
     // Início da medição
     private startedAt = Date.now();
@@ -248,11 +271,8 @@ export class DoctoraliaMetricsService {
             this.recentSignatures.clear();
             this.lastRateSnapshot = null;
             this.rateSnapshots.length = 0;
-            // WP-02 P2c
-            this.pollSkippedPollActive = 0;
-            this.pollSkippedSweepActive = 0;
-            this.sweepSkippedPollActive = 0;
-            this.sweepSkippedSweepActive = 0;
+            // WP-02 P2c + WP-04
+            this.concurrencySkipCounts = emptyConcurrencySkipCounts();
             this.startedAt = Date.now();
         } catch (err: any) {
             this.logger.warn(`[METRICS] reset() error: ${err?.message}`);
@@ -260,43 +280,26 @@ export class DoctoraliaMetricsService {
         }
     }
 
-    // ────────────────── WP-02 P2c: Concurrency skip recording ───────────────
+    // ─────────── WP-02 P2c + WP-04: Concurrency skip recording ──────────────
 
     /**
      * Registra um bloqueio por concorrência de clínica.
-     * Tipos:
-     *   POLL_SKIPPED_POLL_ACTIVE   — Polling bloqueado por Polling ativo na mesma clínica
-     *   POLL_SKIPPED_SWEEP_ACTIVE  — Polling bloqueado por Safety Sweep ativo na mesma clínica
-     *   SWEEP_SKIPPED_POLL_ACTIVE  — Safety Sweep bloqueado por Polling ativo na mesma clínica
-     *   SWEEP_SKIPPED_SWEEP_ACTIVE — Safety Sweep bloqueado por Safety Sweep ativo na mesma clínica
+     * Formato: <QUEM FOI SKIPADO>_SKIPPED_<QUEM ESTAVA ATIVO>_ACTIVE.
+     * Subsistemas: POLL (polling), SWEEP (safety sweep), GLOBAL_SYNC (sync
+     * completo Doctoralia por clínica) e SLOT_SYNC (re-sync do Block Watcher).
+     * WP-04 adicionou todos os cruzamentos de/por GLOBAL_SYNC e SLOT_SYNC.
      */
-    recordConcurrencySkip(
-        type: 'POLL_SKIPPED_POLL_ACTIVE' | 'POLL_SKIPPED_SWEEP_ACTIVE' | 'SWEEP_SKIPPED_POLL_ACTIVE' | 'SWEEP_SKIPPED_SWEEP_ACTIVE',
-        clinicId?: string,
-    ): void {
+    recordConcurrencySkip(type: ConcurrencySkipType, clinicId?: string): void {
         try {
-            if (type === 'POLL_SKIPPED_POLL_ACTIVE') this.pollSkippedPollActive++;
-            else if (type === 'POLL_SKIPPED_SWEEP_ACTIVE') this.pollSkippedSweepActive++;
-            else if (type === 'SWEEP_SKIPPED_POLL_ACTIVE') this.sweepSkippedPollActive++;
-            else if (type === 'SWEEP_SKIPPED_SWEEP_ACTIVE') this.sweepSkippedSweepActive++;
+            this.concurrencySkipCounts[type] = (this.concurrencySkipCounts[type] ?? 0) + 1;
             this.logger.debug(`[METRICS] ${type} clinicId=${clinicId ?? 'unknown'}`);
         } catch (err: any) {
             this.logger.debug(`[METRICS] recordConcurrencySkip() error (non-fatal): ${err?.message}`);
         }
     }
 
-    getConcurrencySkipCounts(): {
-        POLL_SKIPPED_POLL_ACTIVE: number;
-        POLL_SKIPPED_SWEEP_ACTIVE: number;
-        SWEEP_SKIPPED_POLL_ACTIVE: number;
-        SWEEP_SKIPPED_SWEEP_ACTIVE: number;
-    } {
-        return {
-            POLL_SKIPPED_POLL_ACTIVE: this.pollSkippedPollActive,
-            POLL_SKIPPED_SWEEP_ACTIVE: this.pollSkippedSweepActive,
-            SWEEP_SKIPPED_POLL_ACTIVE: this.sweepSkippedPollActive,
-            SWEEP_SKIPPED_SWEEP_ACTIVE: this.sweepSkippedSweepActive,
-        };
+    getConcurrencySkipCounts(): Record<ConcurrencySkipType, number> {
+        return { ...this.concurrencySkipCounts };
     }
 
     // ────────────────── Poll tracking ───────────────────────────────────────
@@ -671,13 +674,8 @@ export class DoctoraliaMetricsService {
                 POTENTIAL_DUPLICATE_REQUEST_COUNT: this.duplicateEvents.length,
                 recentDuplicates: this.duplicateEvents.slice(-10),
             },
-            // WP-02 P2c: Guard de concorrência por clínica
-            concurrencyGuard: {
-                POLL_SKIPPED_POLL_ACTIVE: this.pollSkippedPollActive,
-                POLL_SKIPPED_SWEEP_ACTIVE: this.pollSkippedSweepActive,
-                SWEEP_SKIPPED_POLL_ACTIVE: this.sweepSkippedPollActive,
-                SWEEP_SKIPPED_SWEEP_ACTIVE: this.sweepSkippedSweepActive,
-            },
+            // WP-02 P2c + WP-04: Guard de concorrência por clínica (todos os cruzamentos)
+            concurrencyGuard: { ...this.concurrencySkipCounts },
         };
     }
 

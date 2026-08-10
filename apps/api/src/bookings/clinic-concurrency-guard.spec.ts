@@ -383,12 +383,16 @@ describe('cenário 12 — exclusão mútua total: POLLING e SAFETY_SWEEP nunca c
         expect(guard.isActive('clinic-A', 'SAFETY_SWEEP')).toBe(false);
     });
 
-    it('guard não é importado nem usado em serviços de Global Sync', () => {
-        // Verificação por ausência: ClinicConcurrencyGuard existe no módulo Bookings;
-        // não há referência a ele nos serviços de sync externo.
-        // Este teste documenta o invariante; falha de compilação TypeScript seria evidência de violação.
+    it('WP-04: guard cobre também GLOBAL_SYNC e SLOT_SYNC (Global Sync deixou de ficar fora do guard)', () => {
+        // ANTES (WP-02 P2c) o Global Sync ficava explicitamente fora do guard.
+        // Agora GLOBAL_SYNC e SLOT_SYNC fazem parte do union e da exclusão mútua.
         const guard = makeGuard();
-        expect(guard).toBeInstanceOf(ClinicConcurrencyGuard);
+        expect(guard.tryAcquire('clinic-A', 'GLOBAL_SYNC')).toBe(true);
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(false);
+        expect(guard.tryAcquire('clinic-A', 'SLOT_SYNC')).toBe(false);
+        guard.release('clinic-A', 'GLOBAL_SYNC');
+        expect(guard.tryAcquire('clinic-A', 'SLOT_SYNC')).toBe(true);
+        guard.release('clinic-A', 'SLOT_SYNC');
     });
 });
 

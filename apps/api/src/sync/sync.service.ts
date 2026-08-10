@@ -7,6 +7,8 @@ import { DocplannerService } from '../integrations/docplanner.service';
 import { MatchingEngineService } from '../mappings/matching-engine.service';
 import { PushSyncService } from './push-sync.service';
 import { getDoctoraliaContext, runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
+import { ClinicConcurrencyGuard } from '../bookings/clinic-concurrency-guard';
+import { getDoctoraliaMetricsService, concurrencyActorOf } from '../metrics/doctoralia-metrics.service';
 
 @Injectable()
 export class SyncService {
@@ -19,7 +21,8 @@ export class SyncService {
         private vismedClient: VismedService,
         private docplanner: DocplannerService,
         private matchingEngine: MatchingEngineService,
-        private pushSync: PushSyncService
+        private pushSync: PushSyncService,
+        private concurrencyGuard: ClinicConcurrencyGuard
     ) { }
 
     private async isQueuePaused(clinicId: string): Promise<boolean> {
@@ -348,9 +351,27 @@ export class SyncService {
     }
 
     private async runDoctoraliaSyncDirect(syncRunId: string, clinicId: string, observabilityOrigin: string = 'SCHEDULER') {
-        this.logger.log(`[DIRECT] Starting Doctoralia sync for clinic ${clinicId}`);
-        // WP-01: reconstruct Doctoralia context (ALS doesn't propagate across async fire-and-forget)
-        return runWithDoctoraliaContext({ origin: observabilityOrigin as any, clinicId }, () => this._runDoctoraliaSyncDirectBody(syncRunId, clinicId));
+        // WP-04: exclusão mútua por clínica — GLOBAL_SYNC (caminho direto sem Redis)
+        // nunca roda junto com POLLING/SAFETY_SWEEP/SLOT_SYNC (ou outro GLOBAL_SYNC).
+        // Política SKIP: finaliza o run como 'skipped' para não deixar órfão em 'running'.
+        if (!this.concurrencyGuard.tryAcquire(clinicId, 'GLOBAL_SYNC')) {
+            const blocker = concurrencyActorOf(this.concurrencyGuard.getActiveSubsystem(clinicId) ?? 'GLOBAL_SYNC');
+            this.logger.warn(`[DIRECT] GLOBAL_SYNC_SKIPPED_${blocker}_ACTIVE clinicId=${clinicId} — ${blocker} em andamento, sync global descartado`);
+            try { getDoctoraliaMetricsService()?.recordConcurrencySkip(`GLOBAL_SYNC_SKIPPED_${blocker}_ACTIVE`, clinicId); } catch (_e) {}
+            await this.prisma.syncRun.update({
+                where: { id: syncRunId },
+                data: { status: 'skipped', endedAt: new Date(), metrics: { skipReason: `GLOBAL_SYNC_SKIPPED_${blocker}_ACTIVE` } }
+            }).catch(err => this.logger.error(`[DIRECT] Falha ao finalizar SyncRun skipado ${syncRunId}: ${err?.message}`));
+            return;
+        }
+        try {
+            this.logger.log(`[DIRECT] Starting Doctoralia sync for clinic ${clinicId}`);
+            // WP-01: reconstruct Doctoralia context (ALS doesn't propagate across async fire-and-forget)
+            return await runWithDoctoraliaContext({ origin: observabilityOrigin as any, clinicId }, () => this._runDoctoraliaSyncDirectBody(syncRunId, clinicId));
+        } finally {
+            // WP-04: liberar guard em qualquer cenário
+            this.concurrencyGuard.release(clinicId, 'GLOBAL_SYNC');
+        }
     }
 
     private async _runDoctoraliaSyncDirectBody(syncRunId: string, clinicId: string) {

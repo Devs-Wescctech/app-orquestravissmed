@@ -6,7 +6,7 @@ import { QueueService } from './queue.service';
 import { RateLimiterService } from './rate-limiter.service';
 import { MatchingEngineService } from '../mappings/matching-engine.service';
 import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
-import { getDoctoraliaMetricsService } from '../metrics/doctoralia-metrics.service';
+import { getDoctoraliaMetricsService, concurrencyActorOf } from '../metrics/doctoralia-metrics.service';
 import { ClinicConcurrencyGuard } from './clinic-concurrency-guard';
 import { randomUUID } from 'crypto';
 
@@ -208,10 +208,12 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             try { getDoctoraliaMetricsService()?.recordConcurrencySkip('POLL_SKIPPED_SWEEP_ACTIVE', conn.clinicId); } catch (_e) {}
             return;
         }
-        // SKIP imediato se outro Polling já estiver ativo para a mesma clínica
+        // SKIP imediato se outro subsistema já estiver ativo para a mesma clínica
+        // (Polling, Global Sync ou Slot Sync — WP-04)
         if (!this.concurrencyGuard.tryAcquire(conn.clinicId, 'POLLING')) {
-            this.logger.warn(`[VISMED-POLL] POLL_SKIPPED_POLL_ACTIVE clinicId=${conn.clinicId} — Polling já em andamento, poll descartado`);
-            try { getDoctoraliaMetricsService()?.recordConcurrencySkip('POLL_SKIPPED_POLL_ACTIVE', conn.clinicId); } catch (_e) {}
+            const blocker = concurrencyActorOf(this.concurrencyGuard.getActiveSubsystem(conn.clinicId) ?? 'POLLING');
+            this.logger.warn(`[VISMED-POLL] POLL_SKIPPED_${blocker}_ACTIVE clinicId=${conn.clinicId} — ${blocker} já em andamento, poll descartado`);
+            try { getDoctoraliaMetricsService()?.recordConcurrencySkip(`POLL_SKIPPED_${blocker}_ACTIVE`, conn.clinicId); } catch (_e) {}
             return;
         }
 
@@ -2307,12 +2309,14 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             try { getDoctoraliaMetricsService()?.recordConcurrencySkip('POLL_SKIPPED_SWEEP_ACTIVE', conn.clinicId); } catch (_e) {}
             return;
         }
-        // SKIP imediato se outro Polling já estiver ativo para a mesma clínica.
-        // A aquisição ocorre ANTES de qualquer chamada externa (inclusive rateLimiter),
-        // então um poll skipado não consome nenhuma chamada Doctoralia.
+        // SKIP imediato se outro subsistema já estiver ativo para a mesma clínica
+        // (Polling, Global Sync ou Slot Sync — WP-04). A aquisição ocorre ANTES de
+        // qualquer chamada externa (inclusive rateLimiter), então um poll skipado
+        // não consome nenhuma chamada Doctoralia.
         if (!this.concurrencyGuard.tryAcquire(conn.clinicId, 'POLLING')) {
-            this.logger.warn(`[POLL] POLL_SKIPPED_POLL_ACTIVE clinicId=${conn.clinicId} — Polling já em andamento, poll descartado`);
-            try { getDoctoraliaMetricsService()?.recordConcurrencySkip('POLL_SKIPPED_POLL_ACTIVE', conn.clinicId); } catch (_e) {}
+            const blocker = concurrencyActorOf(this.concurrencyGuard.getActiveSubsystem(conn.clinicId) ?? 'POLLING');
+            this.logger.warn(`[POLL] POLL_SKIPPED_${blocker}_ACTIVE clinicId=${conn.clinicId} — ${blocker} já em andamento, poll descartado`);
+            try { getDoctoraliaMetricsService()?.recordConcurrencySkip(`POLL_SKIPPED_${blocker}_ACTIVE`, conn.clinicId); } catch (_e) {}
             return;
         }
 

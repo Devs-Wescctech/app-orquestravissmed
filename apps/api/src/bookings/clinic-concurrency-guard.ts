@@ -1,16 +1,23 @@
 /**
- * WP-02 P2c — Guard de Concorrência entre Polling e Safety Sweep
+ * WP-02 P2c + WP-04 — Guard de Concorrência por clínica
  *
- * Garante que dois subsistemas (POLLING e SAFETY_SWEEP) nunca executem
- * simultaneamente para a mesma clínica. Política: SKIP (nunca WAIT).
+ * Garante que os subsistemas POLLING, SAFETY_SWEEP, GLOBAL_SYNC e SLOT_SYNC
+ * nunca executem simultaneamente para a mesma clínica. Política: SKIP (nunca WAIT).
  *
- * - Puramente em memória; sem dependências externas.
+ * - GLOBAL_SYNC = sync completo Doctoralia por clínica (processor BullMQ ou caminho
+ *   direto sem Redis). O lock cobre o run INTEIRO (decisão aprovada: não reduzir à
+ *   fase push_to_doctoralia — starvation temporária do polling é aceita e visível
+ *   via métricas).
+ * - SLOT_SYNC = re-sync direcionado do Block Watcher (fast-lane 10min). O acquire
+ *   fica no watcher (watchClinic), NUNCA dentro do SlotSyncService — o Global Sync
+ *   o chama internamente e se auto-bloquearia.
+ * - Puramente em memória; sem dependências externas (sem lock cross-instance).
  * - Clínicas diferentes são completamente independentes.
  * - Guard liberado em `finally` em qualquer cenário de execução.
  */
 import { Injectable } from '@nestjs/common';
 
-export type ConcurrencySubsystem = 'POLLING' | 'SAFETY_SWEEP';
+export type ConcurrencySubsystem = 'POLLING' | 'SAFETY_SWEEP' | 'GLOBAL_SYNC' | 'SLOT_SYNC';
 
 @Injectable()
 export class ClinicConcurrencyGuard {
@@ -56,5 +63,16 @@ export class ClinicConcurrencyGuard {
      */
     isActive(clinicId: string, subsystem: ConcurrencySubsystem): boolean {
         return this.activeSubsystems.get(clinicId)?.has(subsystem) ?? false;
+    }
+
+    /**
+     * Retorna o subsistema atualmente ativo para a clínica (ou null).
+     * Usado APENAS para escolher o motivo do skip em logs/métricas após um
+     * tryAcquire falho — a barreira atômica continua sendo o tryAcquire.
+     */
+    getActiveSubsystem(clinicId: string): ConcurrencySubsystem | null {
+        const active = this.activeSubsystems.get(clinicId);
+        if (!active || active.size === 0) return null;
+        return active.values().next().value ?? null;
     }
 }

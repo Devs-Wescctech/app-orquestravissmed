@@ -6,6 +6,8 @@ import { VismedService } from '../integrations/vismed/vismed.service';
 import { DocplannerService } from '../integrations/docplanner.service';
 import { SlotSyncService } from './slot-sync.service';
 import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
+import { ClinicConcurrencyGuard } from '../bookings/clinic-concurrency-guard';
+import { getDoctoraliaMetricsService, concurrencyActorOf } from '../metrics/doctoralia-metrics.service';
 
 /**
  * Vigia leve de bloqueios de agenda (fast-lane, a cada 10min).
@@ -37,6 +39,7 @@ export class BlockWatcherService implements OnModuleInit {
         private readonly vismed: VismedService,
         private readonly docplanner: DocplannerService,
         private readonly slotSync: SlotSyncService,
+        private readonly concurrencyGuard: ClinicConcurrencyGuard,
     ) {
         this.disabled = process.env.DISABLE_BLOCK_WATCHER === 'true';
     }
@@ -118,6 +121,29 @@ export class BlockWatcherService implements OnModuleInit {
         const idEmpresaGestora = vismedConn.clientId ? Number(vismedConn.clientId) : 286;
         const baseUrl = vismedConn.domain || undefined;
 
+        // WP-04: exclusão mútua por clínica — SLOT_SYNC nunca roda junto com
+        // GLOBAL_SYNC/POLLING/SAFETY_SWEEP (ou outro SLOT_SYNC) da mesma clínica.
+        // O acquire cobre do fetch de bloqueios ao commit do snapshot. No SKIP não
+        // tocamos o snapshot: o próximo ciclo (10min) redetecta e tenta de novo.
+        // O check de syncRun 'running' acima permanece como pré-filtro barato.
+        // NÃO adquirir dentro do SlotSyncService — o Global Sync o chama internamente
+        // e se auto-bloquearia.
+        if (!this.concurrencyGuard.tryAcquire(clinicId, 'SLOT_SYNC')) {
+            const blocker = concurrencyActorOf(this.concurrencyGuard.getActiveSubsystem(clinicId) ?? 'SLOT_SYNC');
+            this.logger.warn(`[BLOCK-WATCHER] SLOT_SYNC_SKIPPED_${blocker}_ACTIVE clinicId=${clinicId} — ${blocker} em andamento, vigia descartado (snapshot intacto)`);
+            try { getDoctoraliaMetricsService()?.recordConcurrencySkip(`SLOT_SYNC_SKIPPED_${blocker}_ACTIVE`, clinicId); } catch (_e) {}
+            return;
+        }
+        try {
+            await this.watchClinicLocked(clinicId, clinicName, idEmpresaGestora, baseUrl, doctoraliaConn);
+        } finally {
+            // WP-04: liberar guard em qualquer cenário
+            this.concurrencyGuard.release(clinicId, 'SLOT_SYNC');
+        }
+    }
+
+    /** Corpo do vigia executado JÁ com o guard SLOT_SYNC adquirido. */
+    private async watchClinicLocked(clinicId: string, clinicName: string, idEmpresaGestora: number, baseUrl: string | undefined, doctoraliaConn: any) {
         // Se o fetch falhar, lança → o try/catch do chamador pula a clínica SEM atualizar o
         // snapshot (evita tratar erro de rede como "bloqueios removidos").
         const blocks = await this.vismed.getBloqueiosProfissional(idEmpresaGestora, baseUrl);

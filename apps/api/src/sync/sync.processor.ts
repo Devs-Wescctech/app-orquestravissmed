@@ -7,6 +7,8 @@ import { MappingEntityType, MappingStatus } from '@prisma/client';
 import { MatchingEngineService } from '../mappings/matching-engine.service';
 import { PushSyncService } from './push-sync.service';
 import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
+import { ClinicConcurrencyGuard } from '../bookings/clinic-concurrency-guard';
+import { getDoctoraliaMetricsService, concurrencyActorOf } from '../metrics/doctoralia-metrics.service';
 
 @Processor('sync-queue')
 export class SyncProcessor extends WorkerHost {
@@ -16,7 +18,8 @@ export class SyncProcessor extends WorkerHost {
         private prisma: PrismaService,
         private docplanner: DocplannerService,
         private matchingEngine: MatchingEngineService,
-        private pushSync: PushSyncService
+        private pushSync: PushSyncService,
+        private concurrencyGuard: ClinicConcurrencyGuard
     ) {
         super();
     }
@@ -26,9 +29,29 @@ export class SyncProcessor extends WorkerHost {
         const origin = (_observabilityOrigin as any) ?? 'SCHEDULER';
         this.logger.log(`Processing sync job for clinic ${clinicId}, run ID ${syncRunId}`);
 
-        // WP-01: BullMQ runs jobs in a new async context; ALS does not propagate.
-        // Reconstruct the Doctoralia observability context from the serialized job payload.
-        return runWithDoctoraliaContext({ origin, clinicId }, () => this._processInner(job, syncRunId, clinicId));
+        // WP-04: exclusão mútua por clínica — GLOBAL_SYNC nunca roda junto com
+        // POLLING/SAFETY_SWEEP/SLOT_SYNC (ou outro GLOBAL_SYNC) da mesma clínica.
+        // Política SKIP: o run é finalizado como 'skipped' (nunca fica órfão em
+        // 'running') e NÃO relançamos erro (evita retry do BullMQ para um skip).
+        if (!this.concurrencyGuard.tryAcquire(clinicId, 'GLOBAL_SYNC')) {
+            const blocker = concurrencyActorOf(this.concurrencyGuard.getActiveSubsystem(clinicId) ?? 'GLOBAL_SYNC');
+            this.logger.warn(`[GLOBAL-SYNC] GLOBAL_SYNC_SKIPPED_${blocker}_ACTIVE clinicId=${clinicId} — ${blocker} em andamento, sync global descartado`);
+            try { getDoctoraliaMetricsService()?.recordConcurrencySkip(`GLOBAL_SYNC_SKIPPED_${blocker}_ACTIVE`, clinicId); } catch (_e) {}
+            await this.prisma.syncRun.update({
+                where: { id: syncRunId },
+                data: { status: 'skipped', endedAt: new Date(), metrics: { skipReason: `GLOBAL_SYNC_SKIPPED_${blocker}_ACTIVE` } }
+            }).catch(err => this.logger.error(`[GLOBAL-SYNC] Falha ao finalizar SyncRun skipado ${syncRunId}: ${err?.message}`));
+            return { status: 'skipped', reason: `GLOBAL_SYNC_SKIPPED_${blocker}_ACTIVE` };
+        }
+
+        try {
+            // WP-01: BullMQ runs jobs in a new async context; ALS does not propagate.
+            // Reconstruct the Doctoralia observability context from the serialized job payload.
+            return await runWithDoctoraliaContext({ origin, clinicId }, () => this._processInner(job, syncRunId, clinicId));
+        } finally {
+            // WP-04: liberar guard em qualquer cenário (sucesso, erro, exceção)
+            this.concurrencyGuard.release(clinicId, 'GLOBAL_SYNC');
+        }
     }
 
     private async _processInner(job: Job<any, any, string>, syncRunId: string, clinicId: string): Promise<any> {

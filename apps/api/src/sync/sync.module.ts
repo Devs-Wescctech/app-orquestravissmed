@@ -14,6 +14,7 @@ import { SlotSyncService } from './slot-sync.service';
 import { VismedAvailabilityService } from './vismed-availability.service';
 import { SyncSchedulerService } from './sync-scheduler.service';
 import { BlockWatcherService } from './block-watcher.service';
+import { BookingsModule } from '../bookings/bookings.module';
 
 @Module({
     imports: [
@@ -21,6 +22,9 @@ import { BlockWatcherService } from './block-watcher.service';
         IntegrationsModule,
         MappingsModule,
         AuthModule,
+        // WP-04: compartilha a MESMA instância do ClinicConcurrencyGuard usada por
+        // Polling/Safety Sweep — exclusão mútua cruzada exige singleton único.
+        BookingsModule,
         BullModule.registerQueue({
             name: 'vismed-sync',
         }),

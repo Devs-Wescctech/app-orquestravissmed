@@ -1,4 +1,4 @@
-import { Controller, Post, Param, UseGuards, Get, Body, Request, Query, NotFoundException, ForbiddenException, BadRequestException } from '@nestjs/common';
+import { Controller, Post, Param, UseGuards, Get, Body, Request, Query, NotFoundException, ForbiddenException, BadRequestException, ConflictException } from '@nestjs/common';
 import { SyncService } from './sync.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
@@ -9,6 +9,8 @@ import { PushSyncService } from './push-sync.service';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 import { randomUUID } from 'crypto';
+import { ClinicConcurrencyGuard } from '../bookings/clinic-concurrency-guard';
+import { getDoctoraliaMetricsService, concurrencyActorOf } from '../metrics/doctoralia-metrics.service';
 
 @ApiTags('sync')
 @ApiBearerAuth()
@@ -21,7 +23,30 @@ export class SyncController {
         private docplanner: DocplannerService,
         private slotSync: SlotSyncService,
         private pushSync: PushSyncService,
+        private concurrencyGuard: ClinicConcurrencyGuard,
     ) { }
+
+    /**
+     * WP-04: executa um slot-sync disparado pelo usuário sob o guard SLOT_SYNC.
+     * Política SKIP: se qualquer subsistema (GLOBAL_SYNC/POLLING/SAFETY_SWEEP/SLOT_SYNC)
+     * estiver ativo para a clínica, responde 409 SEM fazer nenhuma chamada externa.
+     * O acquire fica AQUI (entrada externa), nunca dentro do SlotSyncService —
+     * o Global Sync o chama internamente e se auto-bloquearia.
+     */
+    private async runUserSlotSync<T>(clinicId: string, logger: string, body: () => Promise<T>): Promise<T> {
+        if (!this.concurrencyGuard.tryAcquire(clinicId, 'SLOT_SYNC')) {
+            const blocker = concurrencyActorOf(this.concurrencyGuard.getActiveSubsystem(clinicId) ?? 'SLOT_SYNC');
+            try { getDoctoraliaMetricsService()?.recordConcurrencySkip(`SLOT_SYNC_SKIPPED_${blocker}_ACTIVE`, clinicId); } catch (_e) {}
+            throw new ConflictException(
+                `Outra sincronização (${blocker}) está em andamento para esta clínica — tente novamente em instantes. [${logger}: SLOT_SYNC_SKIPPED_${blocker}_ACTIVE]`,
+            );
+        }
+        try {
+            return await body();
+        } finally {
+            this.concurrencyGuard.release(clinicId, 'SLOT_SYNC');
+        }
+    }
 
     private validateUserClinicAccess(user: any, clinicId: string) {
         const isSuperAdmin = user?.roles?.some((r: any) => r.role === 'SUPER_ADMIN');
@@ -300,11 +325,14 @@ export class SyncController {
         this.validateUserClinicAccess(req?.user, clinicId);
         await this.validateDoctorBelongsToClinic(vismedDoctorId, clinicId);
         // WP-01: USER_INTERACTIVE — slotSync.syncSlotsForDoctor will re-wrap as SLOT_SYNC
-        return runWithDoctoraliaContext({ origin: 'USER_INTERACTIVE', clinicId, requestId: randomUUID() }, async () => {
-            const client = await this.getDoctoraliaClient(clinicId);
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            return this.slotSync.syncSlotsForDoctor(vismedDoctorId, client, undefined, daysAhead || 30, clinicId);
-        });
+        // WP-04: guard SLOT_SYNC — exclusão mútua com GLOBAL_SYNC/POLLING/SAFETY_SWEEP/watcher
+        return this.runUserSlotSync(clinicId, 'syncSlotsForDoctor', async () =>
+            runWithDoctoraliaContext({ origin: 'USER_INTERACTIVE', clinicId, requestId: randomUUID() }, async () => {
+                const client = await this.getDoctoraliaClient(clinicId);
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                return this.slotSync.syncSlotsForDoctor(vismedDoctorId, client, undefined, daysAhead || 30, clinicId);
+            }),
+        );
     }
 
     @ApiOperation({ summary: 'Sync slots for all mapped doctors' })
@@ -315,11 +343,14 @@ export class SyncController {
         @Request() req?: any,
     ) {
         this.validateUserClinicAccess(req?.user, clinicId);
-        return runWithDoctoraliaContext({ origin: 'USER_INTERACTIVE', clinicId, requestId: randomUUID() }, async () => {
-            const client = await this.getDoctoraliaClient(clinicId);
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            return this.slotSync.syncAllSlots(client, undefined, daysAhead || 30, clinicId);
-        });
+        // WP-04: guard SLOT_SYNC — exclusão mútua com GLOBAL_SYNC/POLLING/SAFETY_SWEEP/watcher
+        return this.runUserSlotSync(clinicId, 'syncAllSlots', async () =>
+            runWithDoctoraliaContext({ origin: 'USER_INTERACTIVE', clinicId, requestId: randomUUID() }, async () => {
+                const client = await this.getDoctoraliaClient(clinicId);
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                return this.slotSync.syncAllSlots(client, undefined, daysAhead || 30, clinicId);
+            }),
+        );
     }
 
     @ApiOperation({ summary: 'Get shifts (turnos) for a VisMed doctor' })
