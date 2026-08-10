@@ -139,14 +139,26 @@ Opcionais / com default:
 No boot, o `docker-entrypoint.sh`:
 1. Roda `prisma db push` (idempotente, **sem** `--accept-data-loss`) — cria/atualiza o
    schema sem apagar dados. Pule com `SKIP_DB_INIT=true`.
-2. Roda o `seed.js` (idempotente — `upsert`/`findFirst`). Pule com `SKIP_SEED=true`.
-3. Sobe API (`node dist/main.js`) e Web (`next start -p 5000`) juntos; se um cair, o
+2. Roda a **migration P1 do SyncJob** (`prisma db execute --file
+   prisma/migrations/20260809_syncjob_dedup_lease/migration.sql`) — cria o índice
+   único parcial `SyncJob_dedupKey_active_key` (dedup atômica de jobs), que o
+   `db push` não cria. É idempotente: re-runs são no-op (`IF NOT EXISTS`).
+   **Se existirem duplicatas ativas de dedupKey**, a migration ABORTA com um
+   relatório nos logs (nenhum job é alterado — rollback total) e o **container
+   encerra antes da API subir** — a API nunca processa SyncJobs com o banco
+   inconsistente. Resolva as duplicatas manualmente e reinicie o container.
+   Também é pulada com `SKIP_DB_INIT=true`.
+3. Roda o `seed.js` (idempotente — `upsert`/`findFirst`). Pule com `SKIP_SEED=true`.
+4. Sobe API (`node dist/main.js`) e Web (`next start -p 5000`) juntos; se um cair, o
    container encerra e a *restart policy* reinicia.
 
 **Passo manual (alternativa)** — se preferir controlar a migração fora do boot, setar
 `SKIP_DB_INIT=true` e `SKIP_SEED=true` e rodar uma vez:
 ```bash
 docker exec -it vismed npx prisma db push --schema=/app/apps/api/prisma/schema.prisma --skip-generate
+docker exec -it vismed npx prisma db execute \
+  --file /app/apps/api/prisma/migrations/20260809_syncjob_dedup_lease/migration.sql \
+  --schema=/app/apps/api/prisma/schema.prisma
 docker exec -it vismed node /app/apps/api/prisma/seed.js
 ```
 
