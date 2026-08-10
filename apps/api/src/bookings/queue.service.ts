@@ -20,9 +20,14 @@ const MAX_CONCURRENT = 10;
  *    renovações sem sucesso com A ainda progredindo), A e B podem ambos
  *    executar POST na VisMed — mitigado apenas pelo lookup pré-create do
  *    caminho de retry. Classificação: POSSÍVEL MAS CONTROLADO.
- * 2. O cliente HTTP VisMed não tem timeout: um handler pendurado num HTTP
- *    mantém o heartbeat vivo e bloqueia a dedupKey indefinidamente. Follow-up
- *    recomendado: timeout no cliente VisMed (fora do escopo desta task).
+ * 2. RESOLVIDO: o cliente HTTP VisMed agora tem timeout (30s leitura / 60s
+ *    escrita, configuráveis via VISMED_READ_TIMEOUT_MS/VISMED_WRITE_TIMEOUT_MS),
+ *    com deadline TOTAL por request (cobre respostas "gota a gota") além do
+ *    timeout de inatividade de socket.
+ *    No timeout a request é destruída com VismedTimeoutError (code
+ *    'VISMED_TIMEOUT'), a Promise rejeita e o job segue o fluxo normal de
+ *    failJob (retry com backoff, DEAD após maxAttempts) — sem RUNNING eterno
+ *    e sem dedupKey bloqueada.
  */
 @Injectable()
 export class QueueService implements OnModuleInit, OnModuleDestroy {

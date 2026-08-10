@@ -1,10 +1,58 @@
 import { Injectable, Logger } from '@nestjs/common';
 import * as https from 'https';
+import * as http from 'http';
+
+/**
+ * Erro tipado para timeout de chamadas HTTP à VisMed.
+ * Distinguível de erros HTTP (>=400) e de erros de rede pelo `code`.
+ */
+export class VismedTimeoutError extends Error {
+    readonly code = 'VISMED_TIMEOUT';
+    constructor(url: string, timeoutMs: number) {
+        super(`VisMed HTTP timeout após ${timeoutMs}ms: ${url}`);
+        this.name = 'VismedTimeoutError';
+    }
+}
+
+// Timeouts padrão (sempre muito menores que o lease de 5min da fila).
+const DEFAULT_READ_TIMEOUT_MS = 30_000;
+const DEFAULT_WRITE_TIMEOUT_MS = 60_000;
+
+function parseTimeoutEnv(raw: string | undefined, fallback: number): number {
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+}
 
 @Injectable()
 export class VismedService {
     private readonly logger = new Logger(VismedService.name);
     private readonly defaultBaseUrl = 'https://app.vissmed.com.br/api-vissmed-7';
+    private readonly readTimeoutMs = parseTimeoutEnv(process.env.VISMED_READ_TIMEOUT_MS, DEFAULT_READ_TIMEOUT_MS);
+    private readonly writeTimeoutMs = parseTimeoutEnv(process.env.VISMED_WRITE_TIMEOUT_MS, DEFAULT_WRITE_TIMEOUT_MS);
+
+    /**
+     * Aplica dois limites à request:
+     * 1. Deadline TOTAL: timer iniciado na criação da request que destrói a
+     *    request com VismedTimeoutError ao estourar — cobre respostas
+     *    "gota a gota" que mantêm o socket ativo sem nunca terminar. O timer
+     *    é limpo no evento `close` (emitido em qualquer conclusão: sucesso,
+     *    erro ou destroy).
+     * 2. Timeout de inatividade de socket (`setTimeout`): proteção adicional;
+     *    o evento `timeout` sozinho NÃO encerra a request, por isso o handler
+     *    executa `req.destroy(...)`, garantindo que a Promise rejeite via o
+     *    `req.on('error')` já existente.
+     */
+    private applyTimeout(req: http.ClientRequest, url: string, timeoutMs: number): void {
+        const deadline = setTimeout(() => {
+            req.destroy(new VismedTimeoutError(url, timeoutMs));
+        }, timeoutMs);
+        // não segurar o event loop vivo por causa do timer
+        if (typeof (deadline as any)?.unref === 'function') (deadline as any).unref();
+        req.on('close', () => clearTimeout(deadline));
+        req.setTimeout(timeoutMs, () => {
+            req.destroy(new VismedTimeoutError(url, timeoutMs));
+        });
+    }
 
     private normalizeBaseUrl(raw: string): string {
         let url = raw.trim().replace(/\/+$/, '');
@@ -49,6 +97,7 @@ export class VismedService {
             req.on('error', (e) => {
                 reject(e);
             });
+            this.applyTimeout(req, url, this.readTimeoutMs);
         });
     }
 
@@ -94,6 +143,7 @@ export class VismedService {
             });
 
             req.on('error', (e) => { reject(e); });
+            this.applyTimeout(req, url, this.writeTimeoutMs);
             req.write(body);
             req.end();
         });
@@ -134,6 +184,7 @@ export class VismedService {
             });
 
             req.on('error', (e) => { reject(e); });
+            this.applyTimeout(req, url, this.writeTimeoutMs);
             req.write(postBody);
             req.end();
         });
