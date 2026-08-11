@@ -202,6 +202,11 @@ export class DoctoraliaMetricsService {
         queueSizeHigh: number;
         queueSizeLow: number;
         recordedAt: number;
+        // Budget WRITE (opcional — preenchido quando o client propaga esses valores)
+        writeUsedInMinute?: number;
+        writeRemainingInMinute?: number;
+        writeUsedInHour?: number;
+        writeRemainingInHour?: number;
     } | null = null;
 
     // Histórico circular de snapshots (máx. MAX_RATE_SNAPSHOTS entradas, FIFO)
@@ -211,6 +216,10 @@ export class DoctoraliaMetricsService {
         queueSizeHigh: number;
         queueSizeLow: number;
         recordedAt: number;
+        writeUsedInMinute?: number;
+        writeRemainingInMinute?: number;
+        writeUsedInHour?: number;
+        writeRemainingInHour?: number;
     }> = [];
 
     constructor() {
@@ -247,12 +256,18 @@ export class DoctoraliaMetricsService {
      * Armazena o snapshot mais recente do estado do rate limiter/fila do DocplannerClient.
      * Chamado dentro de acquireRateSlot() ao liberar cada slot.
      * Mantém histórico circular (MAX_RATE_SNAPSHOTS entradas) para cálculo de picos na janela.
+     * Os campos de budget WRITE são opcionais para retrocompatibilidade.
      */
     recordRateSnapshot(snapshot: {
         usedInWindow: number;
         remainingInWindow: number;
         queueSizeHigh: number;
         queueSizeLow: number;
+        // Budget WRITE (aditivo — não quebra consumidores existentes)
+        writeUsedInMinute?: number;
+        writeRemainingInMinute?: number;
+        writeUsedInHour?: number;
+        writeRemainingInHour?: number;
     }): void {
         try {
             const entry = { ...snapshot, recordedAt: Date.now() };
@@ -722,6 +737,38 @@ export class DoctoraliaMetricsService {
             dedup: {
                 DOCTORALIA_DEDUPED_GET_COUNT: this.dedupedGetCount,
             },
+            // Budget WRITE (PUT/POST/PATCH/DELETE): limites oficiais Doctoralia.
+            // Seção aditiva — não altera campos existentes; só presente quando o client
+            // tiver emitido ao menos um snapshot com dados de WRITE.
+            writeBudget: (() => {
+                const snap = this.lastRateSnapshot;
+                if (!snap || snap.writeUsedInMinute === undefined) return null;
+                // Estatísticas do histórico circular (máx/mín/corrente por janela)
+                const snapsWithWrite = this.rateSnapshots.filter(s => s.writeUsedInMinute !== undefined);
+                const usedMinValues = snapsWithWrite.map(s => s.writeUsedInMinute!);
+                const usedHourValues = snapsWithWrite.map(s => s.writeUsedInHour!);
+                return {
+                    limitPerMinute: 40,
+                    limitPerHour: 2400,
+                    current: {
+                        usedInMinute: snap.writeUsedInMinute,
+                        remainingInMinute: snap.writeRemainingInMinute ?? null,
+                        usedInHour: snap.writeUsedInHour ?? null,
+                        remainingInHour: snap.writeRemainingInHour ?? null,
+                    },
+                    historical: {
+                        snapshotCount: snapsWithWrite.length,
+                        usedInMinute: {
+                            max: usedMinValues.length ? Math.max(...usedMinValues) : null,
+                            min: usedMinValues.length ? Math.min(...usedMinValues) : null,
+                        },
+                        usedInHour: {
+                            max: usedHourValues.length ? Math.max(...usedHourValues) : null,
+                            min: usedHourValues.length ? Math.min(...usedHourValues) : null,
+                        },
+                    },
+                };
+            })(),
             errors: errorCounts,
             polling: {
                 clinicsPolled: Object.keys(clinicPollCounts).length,

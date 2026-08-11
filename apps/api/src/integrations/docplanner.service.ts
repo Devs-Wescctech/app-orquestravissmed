@@ -41,16 +41,43 @@ export class DocplannerClient {
     private static lastThrottleLogAt = 0;
 
     /**
+     * Limites oficiais para requisições WRITE (PUT/POST/PATCH/DELETE), conforme
+     * informado pela Doctoralia: 40 writes/minuto e 2.400 writes/hora.
+     * O teto agregado de 400/5min permanece intacto e aplicado a TODOS os métodos.
+     * GETs são limitados apenas pela janela agregada (conservadora: ~4.800/h << 8.000/h oficial).
+     */
+    private static readonly WRITE_LIMIT_MIN = 40;
+    private static readonly WRITE_WINDOW_MIN_MS = 60 * 1000;
+    private static readonly WRITE_LIMIT_HOUR = 2400;
+    private static readonly WRITE_WINDOW_HOUR_MS = 60 * 60 * 1000;
+    /**
+     * Timestamps de requisições WRITE: entradas são mantidas até WRITE_WINDOW_HOUR_MS.
+     * Contagem de 1min é obtida filtrando em tempo real; contagem de 1h usa o array completo.
+     */
+    private static writeTimestamps: number[] = [];
+    private static lastWriteThrottleLogAt = 0;
+
+    /**
      * Duas filas de espera pela vazão: a prioritária (varredura de segurança e outras
      * operações pequenas/urgentes) passa na frente da normal (sync global em massa).
      * IMPORTANTE: isso apenas REORDENA quem usa cada slot — o teto continua sendo
      * exatamente RATE_LIMIT (400) requisições por janela de 5 minutos.
+     * Cada item carrega a classe do método (GET ou WRITE) para que o pump possa
+     * conceder slots a GETs enquanto a janela WRITE estiver cheia.
      */
-    private static waitingHigh: Array<() => void> = [];
-    private static waitingLow: Array<() => void> = [];
+    private static waitingHigh: Array<{ methodClass: 'GET' | 'WRITE'; resolve: () => void }> = [];
+    private static waitingLow: Array<{ methodClass: 'GET' | 'WRITE'; resolve: () => void }> = [];
     private static pumping = false;
     /** Grants prioritários consecutivos (para a cota anti-inanição da fila normal). */
     private static consecutiveHighGrants = 0;
+
+    /**
+     * Wakeup para o pump quando ele está dormindo na espera do budget WRITE.
+     * Quando um novo item é enfileirado (acquireRateSlot), chamamos este resolve
+     * para que o pump reavalie elegibilidade imediatamente — essencial para que
+     * um GET recém-chegado não fique preso atrás de um write bloqueado.
+     */
+    private static wakeupFn: (() => void) | null = null;
 
     /** Contexto assíncrono: marca chamadas feitas dentro de runWithPriority(). */
     private static priorityAls = new AsyncLocalStorage<boolean>();
@@ -64,6 +91,44 @@ export class DocplannerClient {
         return DocplannerClient.priorityAls.run(true, fn);
     }
 
+    /**
+     * Retorna o estado atual das janelas WRITE (sem modificar nada).
+     * Evicta entradas expiradas como efeito colateral (necessário para contagens corretas).
+     */
+    private static snapshotWriteWindows(now: number): {
+        writeUsedMin: number; writeRemainingMin: number;
+        writeUsedHour: number; writeRemainingHour: number;
+        writeFull: boolean;
+    } {
+        const wts = DocplannerClient.writeTimestamps;
+        const cutoffHour = now - DocplannerClient.WRITE_WINDOW_HOUR_MS;
+        while (wts.length && wts[0] <= cutoffHour) wts.shift();
+        const cutoffMin = now - DocplannerClient.WRITE_WINDOW_MIN_MS;
+        const writeUsedHour = wts.length;
+        const writeUsedMin = wts.filter(t => t > cutoffMin).length;
+        const writeRemainingMin = Math.max(0, DocplannerClient.WRITE_LIMIT_MIN - writeUsedMin);
+        const writeRemainingHour = Math.max(0, DocplannerClient.WRITE_LIMIT_HOUR - writeUsedHour);
+        const writeFull = writeUsedMin >= DocplannerClient.WRITE_LIMIT_MIN
+            || writeUsedHour >= DocplannerClient.WRITE_LIMIT_HOUR;
+        return { writeUsedMin, writeRemainingMin, writeUsedHour, writeRemainingHour, writeFull };
+    }
+
+    /**
+     * Encontra o índice do primeiro item elegível na fila.
+     * Se writeFull=true, somente GETs são elegíveis (writes precisam esperar).
+     * Retorna -1 se nenhum item elegível existe.
+     */
+    private static findEligible(
+        queue: Array<{ methodClass: 'GET' | 'WRITE'; resolve: () => void }>,
+        writeFull: boolean,
+    ): number {
+        if (!writeFull) return queue.length > 0 ? 0 : -1;
+        for (let i = 0; i < queue.length; i++) {
+            if (queue[i].methodClass === 'GET') return i;
+        }
+        return -1;
+    }
+
     private static async pumpRateQueue(logger: Logger): Promise<void> {
         if (DocplannerClient.pumping) return;
         DocplannerClient.pumping = true;
@@ -71,65 +136,149 @@ export class DocplannerClient {
             while (DocplannerClient.waitingHigh.length || DocplannerClient.waitingLow.length) {
                 for (;;) {
                     const now = Date.now();
+
+                    // ── Janela agregada ─────────────────────────────────────
                     const cutoff = now - DocplannerClient.RATE_WINDOW_MS;
                     const ts = DocplannerClient.rateTimestamps;
                     while (ts.length && ts[0] <= cutoff) ts.shift();
-                    if (ts.length < DocplannerClient.RATE_LIMIT) {
-                        ts.push(now);
-                        break;
+                    const aggFull = ts.length >= DocplannerClient.RATE_LIMIT;
+
+                    // ── Janelas WRITE ───────────────────────────────────────
+                    const wSnap = DocplannerClient.snapshotWriteWindows(now);
+
+                    // ── Elegibilidade ───────────────────────────────────────
+                    const eligHighIdx = DocplannerClient.findEligible(DocplannerClient.waitingHigh, wSnap.writeFull);
+                    const eligLowIdx = DocplannerClient.findEligible(DocplannerClient.waitingLow, wSnap.writeFull);
+                    const anyEligible = eligHighIdx >= 0 || eligLowIdx >= 0;
+
+                    if (aggFull) {
+                        // Todos aguardam a janela agregada
+                        const waitMs = Math.max(ts[0] + DocplannerClient.RATE_WINDOW_MS - now, 250);
+                        if (now - DocplannerClient.lastThrottleLogAt > 30_000) {
+                            DocplannerClient.lastThrottleLogAt = now;
+                            logger.warn(
+                                `[RATE-LIMIT] Janela de ${DocplannerClient.RATE_LIMIT} req/5min cheia — segurando ` +
+                                `requisições por ~${Math.ceil(waitMs / 1000)}s para não disparar o WAF da Doctoralia ` +
+                                `(fila: ${DocplannerClient.waitingHigh.length} prioritária(s), ${DocplannerClient.waitingLow.length} normal(is)).`,
+                            );
+                        }
+                        await new Promise(r => setTimeout(r, waitMs));
+                        continue;
                     }
-                    const waitMs = Math.max(ts[0] + DocplannerClient.RATE_WINDOW_MS - now, 250);
-                    if (now - DocplannerClient.lastThrottleLogAt > 30_000) {
-                        DocplannerClient.lastThrottleLogAt = now;
-                        logger.warn(`[RATE-LIMIT] Janela de ${DocplannerClient.RATE_LIMIT} req/5min cheia — segurando requisições por ~${Math.ceil(waitMs / 1000)}s para não disparar o WAF da Doctoralia (fila: ${DocplannerClient.waitingHigh.length} prioritária(s), ${DocplannerClient.waitingLow.length} normal(is)).`);
+
+                    if (!anyEligible) {
+                        // Janela agregada tem espaço, mas só há writes e a janela WRITE está cheia.
+                        // IMPORTANTE: usamos Promise.race com um wakeup para que um GET recém-chegado
+                        // acorde o pump imediatamente — sem isso, o GET ficaria preso na fila enquanto
+                        // o pump dorme esperando o budget WRITE liberar (potencialmente por 1h).
+                        const wts = DocplannerClient.writeTimestamps;
+                        const cutoffMin = now - DocplannerClient.WRITE_WINDOW_MIN_MS;
+                        const firstInMin = wts.find(t => t > cutoffMin);
+                        const waitMin = wSnap.writeUsedMin >= DocplannerClient.WRITE_LIMIT_MIN && firstInMin !== undefined
+                            ? Math.max(firstInMin + DocplannerClient.WRITE_WINDOW_MIN_MS - now, 50)
+                            : Infinity;
+                        const waitHour = wSnap.writeUsedHour >= DocplannerClient.WRITE_LIMIT_HOUR && wts.length > 0
+                            ? Math.max(wts[0] + DocplannerClient.WRITE_WINDOW_HOUR_MS - now, 50)
+                            : Infinity;
+                        const naturalWaitMs = Math.min(waitMin, waitHour);
+                        if (now - DocplannerClient.lastWriteThrottleLogAt > 30_000) {
+                            DocplannerClient.lastWriteThrottleLogAt = now;
+                            logger.warn(
+                                `[RATE-LIMIT-WRITE] Janela WRITE cheia (${wSnap.writeUsedMin}/${DocplannerClient.WRITE_LIMIT_MIN}/min, ` +
+                                `${wSnap.writeUsedHour}/${DocplannerClient.WRITE_LIMIT_HOUR}/h) — segurando writes por ` +
+                                `~${Math.ceil(Math.min(naturalWaitMs, 9_999_999) / 1000)}s ` +
+                                `(fila: ${DocplannerClient.waitingHigh.length} prioritária(s), ${DocplannerClient.waitingLow.length} normal(is)).`,
+                            );
+                        }
+                        // Wakeup imediato quando um novo item (ex.: GET) é enfileirado.
+                        // IMPORTANTE: o timer perdedor é sempre cancelado — sem isso,
+                        // cada GET que acorda o pump deixaria um setTimeout vivo por até
+                        // 1h (budget/hora), causando leak de recursos e open handles no Jest.
+                        const sleepMs = naturalWaitMs === Infinity ? 250 : naturalWaitMs;
+                        let timerId: ReturnType<typeof setTimeout> | undefined;
+                        const timerPromise = new Promise<void>(r => { timerId = setTimeout(r, sleepMs); });
+                        const wakeup = new Promise<void>(r => { DocplannerClient.wakeupFn = r; });
+                        await Promise.race([timerPromise, wakeup]);
+                        clearTimeout(timerId); // cancela o timer se o wakeup venceu (e vice-versa — no-op se timer venceu)
+                        DocplannerClient.wakeupFn = null;
+                        continue;
                     }
-                    await new Promise(r => setTimeout(r, waitMs));
+
+                    // Reserva slot agregado
+                    ts.push(now);
+                    break;
                 }
+
                 // Anti-inanição: a cada 4 slots prioritários seguidos, cede 1 à fila normal.
-                let next: (() => void) | undefined;
+                // Recomputa elegibilidade (write window pode ter mudado após a espera acima).
+                const now2 = Date.now();
+                const wSnap2 = DocplannerClient.snapshotWriteWindows(now2);
+                const eligHighIdx2 = DocplannerClient.findEligible(DocplannerClient.waitingHigh, wSnap2.writeFull);
+                const eligLowIdx2 = DocplannerClient.findEligible(DocplannerClient.waitingLow, wSnap2.writeFull);
+
+                let next: { methodClass: 'GET' | 'WRITE'; resolve: () => void } | undefined;
                 if (
-                    DocplannerClient.waitingLow.length &&
-                    (DocplannerClient.consecutiveHighGrants >= 4 || !DocplannerClient.waitingHigh.length)
+                    eligLowIdx2 >= 0 &&
+                    (DocplannerClient.consecutiveHighGrants >= 4 || eligHighIdx2 < 0)
                 ) {
-                    next = DocplannerClient.waitingLow.shift();
+                    next = DocplannerClient.waitingLow.splice(eligLowIdx2, 1)[0];
                     DocplannerClient.consecutiveHighGrants = 0;
-                } else {
-                    next = DocplannerClient.waitingHigh.shift();
+                } else if (eligHighIdx2 >= 0) {
+                    next = DocplannerClient.waitingHigh.splice(eligHighIdx2, 1)[0];
                     DocplannerClient.consecutiveHighGrants++;
                 }
-                if (next) next();
-                else DocplannerClient.rateTimestamps.pop(); // slot reservado sem ninguém na fila (corrida rara): devolve
+
+                if (next) {
+                    // Registra no budget WRITE se for uma mutação
+                    if (next.methodClass === 'WRITE') {
+                        DocplannerClient.writeTimestamps.push(now2);
+                    }
+                    next.resolve();
+                } else {
+                    // Slot reservado sem candidato elegível (corrida rara): devolve
+                    DocplannerClient.rateTimestamps.pop();
+                }
             }
         } finally {
             DocplannerClient.pumping = false;
         }
     }
 
-    /** Aguarda (se necessário) até haver espaço na janela de vazão e registra a requisição. */
-    private static acquireRateSlot(logger: Logger): Promise<void> {
+    /** Aguarda (se necessário) até haver espaço nas janelas de vazão e registra a requisição. */
+    private static acquireRateSlot(logger: Logger, methodClass: 'GET' | 'WRITE'): Promise<void> {
         const priority = DocplannerClient.priorityAls.getStore() === true;
-        const enqueuedAt = Date.now();
         return new Promise<void>(resolve => {
-            (priority ? DocplannerClient.waitingHigh : DocplannerClient.waitingLow).push(() => {
-                // Emite snapshot de fila sem alterar o algoritmo
-                try {
-                    const metrics = getDoctoraliaMetricsService();
-                    if (metrics) {
-                        const now = Date.now();
-                        const cutoff = now - DocplannerClient.RATE_WINDOW_MS;
-                        const ts = DocplannerClient.rateTimestamps;
-                        const used = ts.filter(t => t > cutoff).length;
-                        const remaining = DocplannerClient.RATE_LIMIT - used;
-                        metrics.recordRateSnapshot({
-                            usedInWindow: used,
-                            remainingInWindow: remaining,
-                            queueSizeHigh: DocplannerClient.waitingHigh.length,
-                            queueSizeLow: DocplannerClient.waitingLow.length,
-                        });
-                    }
-                } catch (_e) { /* fail-safe */ }
-                resolve();
+            (priority ? DocplannerClient.waitingHigh : DocplannerClient.waitingLow).push({
+                methodClass,
+                resolve: () => {
+                    // Emite snapshot de fila sem alterar o algoritmo
+                    try {
+                        const metrics = getDoctoraliaMetricsService();
+                        if (metrics) {
+                            const now = Date.now();
+                            const cutoffAgg = now - DocplannerClient.RATE_WINDOW_MS;
+                            const ts = DocplannerClient.rateTimestamps;
+                            const used = ts.filter(t => t > cutoffAgg).length;
+                            const remaining = DocplannerClient.RATE_LIMIT - used;
+                            const wSnap = DocplannerClient.snapshotWriteWindows(now);
+                            metrics.recordRateSnapshot({
+                                usedInWindow: used,
+                                remainingInWindow: remaining,
+                                queueSizeHigh: DocplannerClient.waitingHigh.length,
+                                queueSizeLow: DocplannerClient.waitingLow.length,
+                                writeUsedInMinute: wSnap.writeUsedMin,
+                                writeRemainingInMinute: wSnap.writeRemainingMin,
+                                writeUsedInHour: wSnap.writeUsedHour,
+                                writeRemainingInHour: wSnap.writeRemainingHour,
+                            });
+                        }
+                    } catch (_e) { /* fail-safe */ }
+                    resolve();
+                },
             });
+            // Acorda o pump se ele estiver dormindo na espera do budget WRITE
+            // (ex.: pump bloqueado por write-full mas acabou de chegar um GET elegível).
+            DocplannerClient.wakeupFn?.();
             void DocplannerClient.pumpRateQueue(logger);
         });
     }
@@ -260,7 +409,7 @@ export class DocplannerClient {
         const basicAuth = Buffer.from(`${this.clientId}:${this.clientSecret}`).toString('base64');
 
         const _oauthEnqueuedAt = Date.now();
-        await DocplannerClient.acquireRateSlot(this.logger);
+        await DocplannerClient.acquireRateSlot(this.logger, 'WRITE');
         const _oauthReleasedAt = Date.now();
         const _oauthSentAt = Date.now();
         // WP-01: httpStatus default para NETWORK; será sobrescrito se fetch retornar
@@ -484,8 +633,10 @@ export class DocplannerClient {
         const enqueuedAt = Date.now();
 
         // Adquire o slot ANTES de armar o timeout de 30s — a espera na fila de vazão
-        // não pode consumir o tempo da requisição em si.
-        await DocplannerClient.acquireRateSlot(this.logger);
+        // não pode consumir o tempo da requisição em si. Classifica como GET ou WRITE
+        // para que cada tentativa (retry transitório ou pós-401) consuma o budget correto.
+        const methodClass: 'GET' | 'WRITE' = method === 'GET' ? 'GET' : 'WRITE';
+        await DocplannerClient.acquireRateSlot(this.logger, methodClass);
         attemptState.attempts++;
         const releasedAt = Date.now();
         const controller = new AbortController();
