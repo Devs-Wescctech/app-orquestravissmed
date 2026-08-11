@@ -123,8 +123,16 @@ function percentile(sorted: number[], p: number): number {
 const CONCURRENCY_ACTORS = ['POLL', 'SWEEP', 'GLOBAL_SYNC', 'SLOT_SYNC'] as const;
 type ConcurrencyActor = (typeof CONCURRENCY_ACTORS)[number];
 
-/** <QUEM FOI SKIPADO>_SKIPPED_<QUEM ESTAVA ATIVO>_ACTIVE — todos os cruzamentos. */
-export type ConcurrencySkipType = `${ConcurrencyActor}_SKIPPED_${ConcurrencyActor}_ACTIVE`;
+/**
+ * <QUEM FOI SKIPADO>_SKIPPED_<QUEM ESTAVA ATIVO>_ACTIVE — todos os cruzamentos.
+ * Task 133 adiciona <QUEM FOI SKIPADO>_SKIPPED_GLOBAL_SYNC_PENDING (bloqueio por
+ * reserva de prioridade do Global Sync, sem subsistema ativo) e
+ * GLOBAL_SYNC_RESERVATION_EXPIRED (expiração de reserva por TTL — evento anômalo).
+ */
+export type ConcurrencySkipType =
+    | `${ConcurrencyActor}_SKIPPED_${ConcurrencyActor}_ACTIVE`
+    | `${ConcurrencyActor}_SKIPPED_GLOBAL_SYNC_PENDING`
+    | 'GLOBAL_SYNC_RESERVATION_EXPIRED';
 
 export function emptyConcurrencySkipCounts(): Record<ConcurrencySkipType, number> {
     const counts = {} as Record<ConcurrencySkipType, number>;
@@ -132,7 +140,9 @@ export function emptyConcurrencySkipCounts(): Record<ConcurrencySkipType, number
         for (const active of CONCURRENCY_ACTORS) {
             counts[`${skipped}_SKIPPED_${active}_ACTIVE`] = 0;
         }
+        counts[`${skipped}_SKIPPED_GLOBAL_SYNC_PENDING`] = 0;
     }
+    counts['GLOBAL_SYNC_RESERVATION_EXPIRED'] = 0;
     return counts;
 }
 

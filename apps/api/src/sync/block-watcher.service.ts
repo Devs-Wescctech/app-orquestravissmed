@@ -129,7 +129,14 @@ export class BlockWatcherService implements OnModuleInit {
         // NÃO adquirir dentro do SlotSyncService — o Global Sync o chama internamente
         // e se auto-bloquearia.
         if (!this.concurrencyGuard.tryAcquire(clinicId, 'SLOT_SYNC')) {
-            const blocker = concurrencyActorOf(this.concurrencyGuard.getActiveSubsystem(clinicId) ?? 'SLOT_SYNC');
+            // Task 133: reserva de prioridade do Global Sync tem motivo próprio
+            const blockReason = this.concurrencyGuard.getBlockReason(clinicId);
+            if (blockReason === 'GLOBAL_SYNC_PENDING') {
+                this.logger.warn(`[BLOCK-WATCHER] SLOT_SYNC_SKIPPED_GLOBAL_SYNC_PENDING clinicId=${clinicId} — Global Sync aguardando prioridade, vigia descartado (snapshot intacto)`);
+                try { getDoctoraliaMetricsService()?.recordConcurrencySkip('SLOT_SYNC_SKIPPED_GLOBAL_SYNC_PENDING', clinicId); } catch (_e) {}
+                return;
+            }
+            const blocker = concurrencyActorOf(blockReason ?? 'SLOT_SYNC');
             this.logger.warn(`[BLOCK-WATCHER] SLOT_SYNC_SKIPPED_${blocker}_ACTIVE clinicId=${clinicId} — ${blocker} em andamento, vigia descartado (snapshot intacto)`);
             try { getDoctoraliaMetricsService()?.recordConcurrencySkip(`SLOT_SYNC_SKIPPED_${blocker}_ACTIVE`, clinicId); } catch (_e) {}
             return;

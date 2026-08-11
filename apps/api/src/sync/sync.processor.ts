@@ -10,6 +10,7 @@ import { PushSyncService } from './push-sync.service';
 import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 import { ClinicConcurrencyGuard } from '../bookings/clinic-concurrency-guard';
 import { getDoctoraliaMetricsService, concurrencyActorOf } from '../metrics/doctoralia-metrics.service';
+import { SyncService } from './sync.service';
 
 @Processor('sync-queue')
 export class SyncProcessor extends WorkerHost {
@@ -22,6 +23,9 @@ export class SyncProcessor extends WorkerHost {
         private pushSync: PushSyncService,
         private concurrencyGuard: ClinicConcurrencyGuard,
         private stableCache: StableDataCacheService,
+        // Task 133: usado apenas para o re-disparo do Global Sync adiado.
+        // Sem dependência circular: SyncService não importa o SyncProcessor.
+        private syncService: SyncService,
     ) {
         super();
     }
@@ -36,14 +40,28 @@ export class SyncProcessor extends WorkerHost {
         // Política SKIP: o run é finalizado como 'skipped' (nunca fica órfão em
         // 'running') e NÃO relançamos erro (evita retry do BullMQ para um skip).
         if (!this.concurrencyGuard.tryAcquire(clinicId, 'GLOBAL_SYNC')) {
+            // Task 133: em vez de perder a janela, registra reserva de prioridade —
+            // quando o subsistema atual liberar a clínica, o sync é re-disparado.
             const blocker = concurrencyActorOf(this.concurrencyGuard.getActiveSubsystem(clinicId) ?? 'GLOBAL_SYNC');
-            this.logger.warn(`[GLOBAL-SYNC] GLOBAL_SYNC_SKIPPED_${blocker}_ACTIVE clinicId=${clinicId} — ${blocker} em andamento, sync global descartado`);
+            const skipReason = `GLOBAL_SYNC_DEFERRED_${blocker}_ACTIVE`;
+            this.logger.warn(`[GLOBAL-SYNC] ${skipReason} clinicId=${clinicId} — ${blocker} em andamento, sync global ADIADO (reserva de prioridade registrada)`);
             try { getDoctoraliaMetricsService()?.recordConcurrencySkip(`GLOBAL_SYNC_SKIPPED_${blocker}_ACTIVE`, clinicId); } catch (_e) {}
+            this.concurrencyGuard.requestPriority(
+                clinicId,
+                () => {
+                    this.syncService.resumeDeferredGlobalSync(clinicId, syncRunId).catch(err =>
+                        this.logger.error(`[GLOBAL-SYNC] Re-disparo do sync adiado falhou clinicId=${clinicId}: ${err?.message}`));
+                },
+                {
+                    tag: syncRunId,
+                    onExpire: () => { try { getDoctoraliaMetricsService()?.recordConcurrencySkip('GLOBAL_SYNC_RESERVATION_EXPIRED', clinicId); } catch (_e) {} },
+                },
+            );
             await this.prisma.syncRun.update({
                 where: { id: syncRunId },
-                data: { status: 'skipped', endedAt: new Date(), metrics: { skipReason: `GLOBAL_SYNC_SKIPPED_${blocker}_ACTIVE` } }
-            }).catch(err => this.logger.error(`[GLOBAL-SYNC] Falha ao finalizar SyncRun skipado ${syncRunId}: ${err?.message}`));
-            return { status: 'skipped', reason: `GLOBAL_SYNC_SKIPPED_${blocker}_ACTIVE` };
+                data: { status: 'skipped', endedAt: new Date(), metrics: { skipReason } }
+            }).catch(err => this.logger.error(`[GLOBAL-SYNC] Falha ao finalizar SyncRun adiado ${syncRunId}: ${err?.message}`));
+            return { status: 'skipped', reason: skipReason };
         }
 
         try {
@@ -51,8 +69,18 @@ export class SyncProcessor extends WorkerHost {
             // Reconstruct the Doctoralia observability context from the serialized job payload.
             return await runWithDoctoraliaContext({ origin, clinicId }, () => this._processInner(job, syncRunId, clinicId));
         } finally {
+            // Task 133: qualquer execução GLOBAL_SYNC (sucesso ou falha) CONSOME a
+            // reserva de prioridade — consumo ANTES do release para que o release
+            // não re-dispare o callback da reserva já satisfeita. Se a reserva foi
+            // de OUTRO run adiado (ex.: job independente na fila), correlaciona o
+            // run adiado a este run — satisfação nunca é silenciosa.
+            const consumed = this.concurrencyGuard.consumePriority(clinicId);
             // WP-04: liberar guard em qualquer cenário (sucesso, erro, exceção)
             this.concurrencyGuard.release(clinicId, 'GLOBAL_SYNC');
+            if (consumed?.tag && consumed.tag !== syncRunId) {
+                this.logger.log(`[GLOBAL-SYNC] Reserva de prioridade do run adiado ${consumed.tag} satisfeita por este run ${syncRunId} clinicId=${clinicId}`);
+                await this.syncService.correlateSatisfiedReservation(consumed.tag, syncRunId);
+            }
         }
     }
 

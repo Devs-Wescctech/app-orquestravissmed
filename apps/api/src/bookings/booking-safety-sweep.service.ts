@@ -113,7 +113,14 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
                         continue;
                     }
                     if (!this.concurrencyGuard.tryAcquire(clinicId, 'SAFETY_SWEEP')) {
-                        const blocker = concurrencyActorOf(this.concurrencyGuard.getActiveSubsystem(clinicId) ?? 'SAFETY_SWEEP');
+                        // Task 133: reserva de prioridade do Global Sync tem motivo próprio
+                        const blockReason = this.concurrencyGuard.getBlockReason(clinicId);
+                        if (blockReason === 'GLOBAL_SYNC_PENDING') {
+                            this.logger.warn(`[SAFETY-SWEEP] SWEEP_SKIPPED_GLOBAL_SYNC_PENDING clinicId=${clinicId} — Global Sync aguardando prioridade, varredura descartada`);
+                            try { getDoctoraliaMetricsService()?.recordConcurrencySkip('SWEEP_SKIPPED_GLOBAL_SYNC_PENDING', clinicId); } catch (_e) {}
+                            continue;
+                        }
+                        const blocker = concurrencyActorOf(blockReason ?? 'SAFETY_SWEEP');
                         this.logger.warn(`[SAFETY-SWEEP] SWEEP_SKIPPED_${blocker}_ACTIVE clinicId=${clinicId} — ${blocker} já em andamento, varredura descartada`);
                         try { getDoctoraliaMetricsService()?.recordConcurrencySkip(`SWEEP_SKIPPED_${blocker}_ACTIVE`, clinicId); } catch (_e) {}
                         continue;
@@ -181,9 +188,16 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
             if (!this.concurrencyGuard.tryAcquire(clinicId, 'SAFETY_SWEEP')) {
                 // Pode ocorrer quando o sweep automático adquiriu o guard entre o início do
                 // fire-and-forget e esta linha. Resetar o estado para que a UI não fique travada.
-                const blocker = concurrencyActorOf(this.concurrencyGuard.getActiveSubsystem(clinicId) ?? 'SAFETY_SWEEP');
-                this.logger.warn(`[SAFETY-SWEEP] [MANUAL] SWEEP_SKIPPED_${blocker}_ACTIVE clinicId=${clinicId} — ${blocker} em andamento, varredura manual descartada`);
-                try { getDoctoraliaMetricsService()?.recordConcurrencySkip(`SWEEP_SKIPPED_${blocker}_ACTIVE`, clinicId); } catch (_e) {}
+                // Task 133: reserva de prioridade do Global Sync tem motivo próprio.
+                const blockReason = this.concurrencyGuard.getBlockReason(clinicId);
+                if (blockReason === 'GLOBAL_SYNC_PENDING') {
+                    this.logger.warn(`[SAFETY-SWEEP] [MANUAL] SWEEP_SKIPPED_GLOBAL_SYNC_PENDING clinicId=${clinicId} — Global Sync aguardando prioridade, varredura manual descartada`);
+                    try { getDoctoraliaMetricsService()?.recordConcurrencySkip('SWEEP_SKIPPED_GLOBAL_SYNC_PENDING', clinicId); } catch (_e) {}
+                } else {
+                    const blocker = concurrencyActorOf(blockReason ?? 'SAFETY_SWEEP');
+                    this.logger.warn(`[SAFETY-SWEEP] [MANUAL] SWEEP_SKIPPED_${blocker}_ACTIVE clinicId=${clinicId} — ${blocker} em andamento, varredura manual descartada`);
+                    try { getDoctoraliaMetricsService()?.recordConcurrencySkip(`SWEEP_SKIPPED_${blocker}_ACTIVE`, clinicId); } catch (_e) {}
+                }
                 this.manualSweeps.set(clinicId, {
                     running: false,
                     startedAt: this.manualSweeps.get(clinicId)?.startedAt || new Date().toISOString(),

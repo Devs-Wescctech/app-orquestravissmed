@@ -75,6 +75,23 @@ describe('WP-04 — SyncController.syncSlotsForDoctor sob o guard (caminho real)
         guard.release(CLINIC, blocker);
     });
 
+    it('Task 133: reserva de prioridade pendente → 409 com SLOT_SYNC_SKIPPED_GLOBAL_SYNC_PENDING (nunca motivo enganoso)', async () => {
+        const { controller, slotSync, createClient } = makeController(guard);
+        guard.requestPriority(CLINIC, () => {});
+
+        await expect(
+            controller.syncSlotsForDoctor(CLINIC, 'doc-1', 30, SUPER_ADMIN_REQ),
+        ).rejects.toThrow(/GLOBAL_SYNC_PENDING/);
+
+        expect(createClient).not.toHaveBeenCalled();
+        expect(slotSync.syncSlotsForDoctor).not.toHaveBeenCalled();
+        const counts = metrics.getConcurrencySkipCounts();
+        expect(counts.SLOT_SYNC_SKIPPED_GLOBAL_SYNC_PENDING).toBe(1);
+        expect(counts.SLOT_SYNC_SKIPPED_SLOT_SYNC_ACTIVE).toBe(0);
+
+        guard.clearPriority(CLINIC);
+    });
+
     it('clínica livre → executa, chama SlotSyncService e libera o guard em finally', async () => {
         const { controller, slotSync } = makeController(guard);
 

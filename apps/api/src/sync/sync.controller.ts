@@ -35,7 +35,15 @@ export class SyncController {
      */
     private async runUserSlotSync<T>(clinicId: string, logger: string, body: () => Promise<T>): Promise<T> {
         if (!this.concurrencyGuard.tryAcquire(clinicId, 'SLOT_SYNC')) {
-            const blocker = concurrencyActorOf(this.concurrencyGuard.getActiveSubsystem(clinicId) ?? 'SLOT_SYNC');
+            // Task 133: reserva de prioridade do Global Sync tem motivo próprio.
+            const blockReason = this.concurrencyGuard.getBlockReason(clinicId);
+            if (blockReason === 'GLOBAL_SYNC_PENDING') {
+                try { getDoctoraliaMetricsService()?.recordConcurrencySkip('SLOT_SYNC_SKIPPED_GLOBAL_SYNC_PENDING', clinicId); } catch (_e) {}
+                throw new ConflictException(
+                    `Uma sincronização global está aguardando prioridade para esta clínica — tente novamente em instantes. [${logger}: SLOT_SYNC_SKIPPED_GLOBAL_SYNC_PENDING]`,
+                );
+            }
+            const blocker = concurrencyActorOf(blockReason ?? 'SLOT_SYNC');
             try { getDoctoraliaMetricsService()?.recordConcurrencySkip(`SLOT_SYNC_SKIPPED_${blocker}_ACTIVE`, clinicId); } catch (_e) {}
             throw new ConflictException(
                 `Outra sincronização (${blocker}) está em andamento para esta clínica — tente novamente em instantes. [${logger}: SLOT_SYNC_SKIPPED_${blocker}_ACTIVE]`,

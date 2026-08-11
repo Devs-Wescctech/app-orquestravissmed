@@ -444,3 +444,276 @@ describe('race condition — aquisições concorrentes de subsistemas diferentes
         expect(pollBody).toHaveBeenCalledTimes(1);
     });
 });
+
+// ─── Task 133: reserva de prioridade do Global Sync ──────────────────────────
+describe('Task 133 — reserva de prioridade do Global Sync', () => {
+    const flushImmediates = () => new Promise<void>(res => setImmediate(res));
+
+    it('polling ativo + reserva registrada → callback dispara quando o polling termina', async () => {
+        const guard = makeGuard();
+        const cb = jest.fn();
+
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(true);
+        guard.requestPriority('clinic-A', cb);
+        expect(guard.hasPriorityPending('clinic-A')).toBe(true);
+
+        // Callback não dispara enquanto a clínica está ocupada
+        await flushImmediates();
+        expect(cb).not.toHaveBeenCalled();
+
+        guard.release('clinic-A', 'POLLING');
+        await flushImmediates();
+        expect(cb).toHaveBeenCalledTimes(1);
+    });
+
+    it('novos POLLING/SAFETY_SWEEP/SLOT_SYNC são rejeitados com motivo GLOBAL_SYNC_PENDING (nunca POLLING_ACTIVE)', () => {
+        const guard = makeGuard();
+        guard.requestPriority('clinic-A', () => {});
+
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(false);
+        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(false);
+        expect(guard.tryAcquire('clinic-A', 'SLOT_SYNC')).toBe(false);
+
+        // Motivo inequívoco: reserva, não subsistema ativo
+        expect(guard.getActiveSubsystem('clinic-A')).toBeNull();
+        expect(guard.getBlockReason('clinic-A')).toBe('GLOBAL_SYNC_PENDING');
+    });
+
+    it('getBlockReason prioriza o subsistema ativo sobre a reserva', () => {
+        const guard = makeGuard();
+        guard.tryAcquire('clinic-A', 'POLLING');
+        guard.requestPriority('clinic-A', () => {});
+        expect(guard.getBlockReason('clinic-A')).toBe('POLLING');
+        guard.release('clinic-A', 'POLLING');
+    });
+
+    it('GLOBAL_SYNC não é bloqueado pela própria reserva', () => {
+        const guard = makeGuard();
+        guard.requestPriority('clinic-A', () => {});
+        expect(guard.tryAcquire('clinic-A', 'GLOBAL_SYNC')).toBe(true);
+        guard.clearPriority('clinic-A');
+        guard.release('clinic-A', 'GLOBAL_SYNC');
+        expect(guard.getBlockReason('clinic-A')).toBeNull();
+    });
+
+    it('apenas UMA reserva por clínica — coalescência substitui o callback e preserva o deadline', async () => {
+        const guard = makeGuard();
+        const cb1 = jest.fn();
+        const cb2 = jest.fn();
+
+        guard.tryAcquire('clinic-A', 'POLLING');
+        guard.requestPriority('clinic-A', cb1);
+        guard.requestPriority('clinic-A', cb2);
+
+        guard.release('clinic-A', 'POLLING');
+        await flushImmediates();
+        // Apenas o callback mais recente dispara — nunca duplica
+        expect(cb1).not.toHaveBeenCalled();
+        expect(cb2).toHaveBeenCalledTimes(1);
+    });
+
+    it('clínicas diferentes são independentes — reserva em A não afeta B', () => {
+        const guard = makeGuard();
+        guard.requestPriority('clinic-A', () => {});
+        expect(guard.tryAcquire('clinic-B', 'POLLING')).toBe(true);
+        expect(guard.hasPriorityPending('clinic-B')).toBe(false);
+        guard.release('clinic-B', 'POLLING');
+    });
+
+    it('clearPriority remove a reserva (sucesso ou falha do Global Sync)', () => {
+        const guard = makeGuard();
+        guard.requestPriority('clinic-A', () => {});
+        guard.clearPriority('clinic-A');
+        expect(guard.hasPriorityPending('clinic-A')).toBe(false);
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(true);
+        guard.release('clinic-A', 'POLLING');
+    });
+
+    it('clearPriority antes do release não re-dispara o callback (reserva consumida)', async () => {
+        const guard = makeGuard();
+        const cb = jest.fn();
+        guard.tryAcquire('clinic-A', 'GLOBAL_SYNC');
+        guard.requestPriority('clinic-A', cb);
+        // Simula o finally da execução GLOBAL_SYNC: clear ANTES do release
+        guard.clearPriority('clinic-A');
+        guard.release('clinic-A', 'GLOBAL_SYNC');
+        await flushImmediates();
+        expect(cb).not.toHaveBeenCalled();
+    });
+
+    it('TTL expira a reserva com onExpire (métrica) e libera a clínica', () => {
+        const guard = makeGuard();
+        const onExpire = jest.fn();
+        const nowSpy = jest.spyOn(Date, 'now');
+        const t0 = 1_000_000;
+        nowSpy.mockReturnValue(t0);
+
+        guard.requestPriority('clinic-A', () => {}, { onExpire });
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(false);
+
+        // Avança além do TTL de 25min
+        nowSpy.mockReturnValue(t0 + 26 * 60 * 1000);
+        expect(guard.hasPriorityPending('clinic-A')).toBe(false);
+        expect(onExpire).toHaveBeenCalledTimes(1);
+        expect(guard.getBlockReason('clinic-A')).toBeNull();
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(true);
+        guard.release('clinic-A', 'POLLING');
+        nowSpy.mockRestore();
+    });
+
+    it('reserva expirada NÃO dispara callback no release (só a próxima janela do cron cobre)', async () => {
+        const guard = makeGuard();
+        const cb = jest.fn();
+        const nowSpy = jest.spyOn(Date, 'now');
+        const t0 = 2_000_000;
+        nowSpy.mockReturnValue(t0);
+
+        guard.tryAcquire('clinic-A', 'POLLING');
+        guard.requestPriority('clinic-A', cb);
+        nowSpy.mockReturnValue(t0 + 30 * 60 * 1000);
+        guard.release('clinic-A', 'POLLING');
+        await new Promise<void>(res => setImmediate(res));
+        expect(cb).not.toHaveBeenCalled();
+        nowSpy.mockRestore();
+    });
+
+    it('exceção no callback não trava a clínica (reserva descartada)', async () => {
+        const guard = makeGuard();
+        guard.tryAcquire('clinic-A', 'POLLING');
+        guard.requestPriority('clinic-A', () => { throw new Error('callback crashed'); });
+        guard.release('clinic-A', 'POLLING');
+        await new Promise<void>(res => setImmediate(res));
+        // Reserva descartada; clínica volta a aceitar execuções normalmente
+        expect(guard.hasPriorityPending('clinic-A')).toBe(false);
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(true);
+        guard.release('clinic-A', 'POLLING');
+    });
+
+    it('consumePriority remove a reserva e devolve a tag opaca (correlação no domínio)', () => {
+        const guard = makeGuard();
+        guard.requestPriority('clinic-A', () => {}, { tag: 'run-A' });
+
+        const consumed = guard.consumePriority('clinic-A');
+        expect(consumed).toEqual({ tag: 'run-A' });
+        expect(guard.hasPriorityPending('clinic-A')).toBe(false);
+        // Exatamente uma vez: segundo consumo retorna null
+        expect(guard.consumePriority('clinic-A')).toBeNull();
+    });
+
+    it('GLOBAL_SYNC independente já na fila consome a reserva de A com tag (satisfação observável, nunca perda silenciosa)', async () => {
+        const guard = makeGuard();
+        const resumeA = jest.fn();
+
+        // Run A adiado: POLLING ativo, reserva registrada com tag do run adiado
+        guard.tryAcquire('clinic-A', 'POLLING');
+        guard.requestPriority('clinic-A', resumeA, { tag: 'run-A' });
+        guard.release('clinic-A', 'POLLING');
+        // Callback de A agendado via setImmediate, mas ANTES dele um GLOBAL_SYNC B
+        // (job independente na fila) consegue o acquire — reserva não bloqueia GLOBAL_SYNC.
+        expect(guard.tryAcquire('clinic-A', 'GLOBAL_SYNC')).toBe(true);
+
+        // O callback de A dispara e simula o re-disparo: encontra a clínica ocupada
+        // (run B rodando) — o fluxo real re-registra/descarta; aqui só registramos a chamada.
+        await flushImmediates();
+        expect(resumeA).toHaveBeenCalledTimes(1);
+
+        // B termina: finally consome a reserva com a tag de A para correlacionar
+        const consumed = guard.consumePriority('clinic-A');
+        guard.release('clinic-A', 'GLOBAL_SYNC');
+        expect(consumed).toEqual({ tag: 'run-A' });
+
+        // Nada pendente, callback de A não re-dispara, clínica livre
+        await flushImmediates();
+        expect(resumeA).toHaveBeenCalledTimes(1);
+        expect(guard.hasPriorityPending('clinic-A')).toBe(false);
+        expect(guard.getBlockReason('clinic-A')).toBeNull();
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(true);
+        guard.release('clinic-A', 'POLLING');
+    });
+
+    it('consumo antes do release não re-dispara o callback da reserva satisfeita', async () => {
+        const guard = makeGuard();
+        const cb = jest.fn();
+        guard.tryAcquire('clinic-A', 'GLOBAL_SYNC');
+        guard.requestPriority('clinic-A', cb, { tag: 'run-A' });
+        // Simula o finally da execução GLOBAL_SYNC: consume ANTES do release
+        expect(guard.consumePriority('clinic-A')).toEqual({ tag: 'run-A' });
+        guard.release('clinic-A', 'GLOBAL_SYNC');
+        await flushImmediates();
+        expect(cb).not.toHaveBeenCalled();
+    });
+
+    it('coalescência preserva a tag existente quando o re-registro não informa tag', () => {
+        const guard = makeGuard();
+        guard.requestPriority('clinic-A', () => {}, { tag: 'run-A' });
+        guard.requestPriority('clinic-A', () => {}); // re-registro por corrida, sem tag
+        expect(guard.consumePriority('clinic-A')).toEqual({ tag: 'run-A' });
+    });
+
+    it('race: reserva consumida entre o agendamento do callback (release) e sua execução → callback obsoleto NÃO dispara', async () => {
+        const guard = makeGuard();
+        const cb = jest.fn();
+
+        guard.tryAcquire('clinic-A', 'POLLING');
+        guard.requestPriority('clinic-A', cb, { tag: 'run-A' });
+        // release agenda o callback via setImmediate...
+        guard.release('clinic-A', 'POLLING');
+        // ...mas ANTES do immediate rodar, um GLOBAL_SYNC independente consome a reserva
+        expect(guard.consumePriority('clinic-A')).toEqual({ tag: 'run-A' });
+
+        await flushImmediates();
+        expect(cb).not.toHaveBeenCalled();
+        expect(guard.hasPriorityPending('clinic-A')).toBe(false);
+    });
+
+    it('race: clearPriority entre o agendamento do callback e sua execução → callback obsoleto NÃO dispara', async () => {
+        const guard = makeGuard();
+        const cb = jest.fn();
+
+        guard.tryAcquire('clinic-A', 'POLLING');
+        guard.requestPriority('clinic-A', cb);
+        guard.release('clinic-A', 'POLLING');
+        guard.clearPriority('clinic-A');
+
+        await flushImmediates();
+        expect(cb).not.toHaveBeenCalled();
+    });
+
+    it('race: coalescência substitui a reserva entre o agendamento e a execução → callback ANTIGO não dispara (identidade)', async () => {
+        const guard = makeGuard();
+        const cbOld = jest.fn();
+        const cbNew = jest.fn();
+
+        guard.tryAcquire('clinic-A', 'POLLING');
+        guard.requestPriority('clinic-A', cbOld, { tag: 'run-A' });
+        guard.release('clinic-A', 'POLLING');
+        // Antes do immediate: outro run adiado coalesce/substitui a reserva
+        guard.requestPriority('clinic-A', cbNew, { tag: 'run-B' });
+
+        await flushImmediates();
+        // O callback antigo não dispara; o novo aguarda o próximo release/ciclo
+        expect(cbOld).not.toHaveBeenCalled();
+        expect(cbNew).not.toHaveBeenCalled();
+        expect(guard.hasPriorityPending('clinic-A')).toBe(true);
+        // A reserva substituída mantém deadline original mas callback/tag novos
+        expect(guard.consumePriority('clinic-A')).toEqual({ tag: 'run-B' });
+    });
+
+    it('recordConcurrencySkip aceita os novos tipos GLOBAL_SYNC_PENDING e RESERVATION_EXPIRED', () => {
+        const metrics = makeMetrics();
+        metrics.recordConcurrencySkip('POLL_SKIPPED_GLOBAL_SYNC_PENDING', 'c1');
+        metrics.recordConcurrencySkip('SWEEP_SKIPPED_GLOBAL_SYNC_PENDING', 'c1');
+        metrics.recordConcurrencySkip('SLOT_SYNC_SKIPPED_GLOBAL_SYNC_PENDING', 'c1');
+        metrics.recordConcurrencySkip('GLOBAL_SYNC_RESERVATION_EXPIRED', 'c1');
+
+        const counts = metrics.getConcurrencySkipCounts();
+        expect(counts.POLL_SKIPPED_GLOBAL_SYNC_PENDING).toBe(1);
+        expect(counts.SWEEP_SKIPPED_GLOBAL_SYNC_PENDING).toBe(1);
+        expect(counts.SLOT_SYNC_SKIPPED_GLOBAL_SYNC_PENDING).toBe(1);
+        expect(counts.GLOBAL_SYNC_RESERVATION_EXPIRED).toBe(1);
+
+        metrics.reset();
+        expect(metrics.getConcurrencySkipCounts().POLL_SKIPPED_GLOBAL_SYNC_PENDING).toBe(0);
+        expect(metrics.getConcurrencySkipCounts().GLOBAL_SYNC_RESERVATION_EXPIRED).toBe(0);
+    });
+});

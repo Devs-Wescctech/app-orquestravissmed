@@ -211,7 +211,15 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         // SKIP imediato se outro subsistema já estiver ativo para a mesma clínica
         // (Polling, Global Sync ou Slot Sync — WP-04)
         if (!this.concurrencyGuard.tryAcquire(conn.clinicId, 'POLLING')) {
-            const blocker = concurrencyActorOf(this.concurrencyGuard.getActiveSubsystem(conn.clinicId) ?? 'POLLING');
+            // Task 133: motivo inequívoco — reserva de prioridade do Global Sync
+            // NUNCA é reportada com fallback enganoso tipo "POLLING ativo".
+            const blockReason = this.concurrencyGuard.getBlockReason(conn.clinicId);
+            if (blockReason === 'GLOBAL_SYNC_PENDING') {
+                this.logger.warn(`[VISMED-POLL] POLL_SKIPPED_GLOBAL_SYNC_PENDING clinicId=${conn.clinicId} — Global Sync aguardando prioridade, poll descartado`);
+                try { getDoctoraliaMetricsService()?.recordConcurrencySkip('POLL_SKIPPED_GLOBAL_SYNC_PENDING', conn.clinicId); } catch (_e) {}
+                return;
+            }
+            const blocker = concurrencyActorOf(blockReason ?? 'POLLING');
             this.logger.warn(`[VISMED-POLL] POLL_SKIPPED_${blocker}_ACTIVE clinicId=${conn.clinicId} — ${blocker} já em andamento, poll descartado`);
             try { getDoctoraliaMetricsService()?.recordConcurrencySkip(`POLL_SKIPPED_${blocker}_ACTIVE`, conn.clinicId); } catch (_e) {}
             return;
@@ -2314,7 +2322,15 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         // qualquer chamada externa (inclusive rateLimiter), então um poll skipado
         // não consome nenhuma chamada Doctoralia.
         if (!this.concurrencyGuard.tryAcquire(conn.clinicId, 'POLLING')) {
-            const blocker = concurrencyActorOf(this.concurrencyGuard.getActiveSubsystem(conn.clinicId) ?? 'POLLING');
+            // Task 133: motivo inequívoco — reserva de prioridade do Global Sync
+            // NUNCA é reportada com fallback enganoso tipo "POLLING ativo".
+            const blockReason = this.concurrencyGuard.getBlockReason(conn.clinicId);
+            if (blockReason === 'GLOBAL_SYNC_PENDING') {
+                this.logger.warn(`[POLL] POLL_SKIPPED_GLOBAL_SYNC_PENDING clinicId=${conn.clinicId} — Global Sync aguardando prioridade, poll descartado`);
+                try { getDoctoraliaMetricsService()?.recordConcurrencySkip('POLL_SKIPPED_GLOBAL_SYNC_PENDING', conn.clinicId); } catch (_e) {}
+                return;
+            }
+            const blocker = concurrencyActorOf(blockReason ?? 'POLLING');
             this.logger.warn(`[POLL] POLL_SKIPPED_${blocker}_ACTIVE clinicId=${conn.clinicId} — ${blocker} já em andamento, poll descartado`);
             try { getDoctoraliaMetricsService()?.recordConcurrencySkip(`POLL_SKIPPED_${blocker}_ACTIVE`, conn.clinicId); } catch (_e) {}
             return;

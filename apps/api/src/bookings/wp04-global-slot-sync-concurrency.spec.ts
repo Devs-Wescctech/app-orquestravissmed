@@ -389,7 +389,8 @@ describe('WP-04 — métricas dos novos cruzamentos', () => {
     it('todos os 16 contadores existem zerados e aparecem no baseline', () => {
         const metrics = new DoctoraliaMetricsService();
         const counts = metrics.getConcurrencySkipCounts();
-        expect(Object.keys(counts)).toHaveLength(16);
+        // 16 cruzamentos WP-04 + 4 *_SKIPPED_GLOBAL_SYNC_PENDING + GLOBAL_SYNC_RESERVATION_EXPIRED (Task 133)
+        expect(Object.keys(counts)).toHaveLength(21);
         for (const v of Object.values(counts)) expect(v).toBe(0);
 
         metrics.recordConcurrencySkip('GLOBAL_SYNC_SKIPPED_POLL_ACTIVE', 'c1');

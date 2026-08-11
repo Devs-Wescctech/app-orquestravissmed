@@ -127,6 +127,9 @@ export default function SyncDashboardPage() {
     };
 
     const getSkipMessage = (metrics?: { skipReason?: string } | null): string => {
+        if (metrics?.skipReason?.startsWith('GLOBAL_SYNC_DEFERRED_')) {
+            return 'Sincronização adiada: outro processo desta clínica estava em andamento. O sistema reservou prioridade e executará automaticamente assim que a clínica ficar livre.';
+        }
         if (metrics?.skipReason === 'GLOBAL_SYNC_SKIPPED_POLL_ACTIVE') {
             return 'Sincronização não executada porque já havia um polling em andamento. O sistema evitou processamento concorrente e tentará novamente no próximo ciclo.';
         }

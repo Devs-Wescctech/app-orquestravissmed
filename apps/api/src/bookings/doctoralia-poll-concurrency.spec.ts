@@ -231,3 +231,58 @@ describe('Task 119 — pollClinic Doctoralia × ClinicConcurrencyGuard', () => {
         expect(counts.POLL_SKIPPED_SWEEP_ACTIVE).toBe(1);
     });
 });
+
+// ─── Task 133: skip do poll por reserva de prioridade do Global Sync ─────────
+// Espelha o padrão pós-Task 133 de BookingSyncService.pollClinic /
+// pollVismedClinic: em tryAcquire falho, o motivo vem de getBlockReason() e a
+// reserva NUNCA é reportada com fallback enganoso tipo POLL_SKIPPED_POLL_ACTIVE.
+describe('Task 133 — poll × reserva de prioridade (GLOBAL_SYNC_PENDING)', () => {
+    async function runPollWithBlockReason(
+        guard: ClinicConcurrencyGuard,
+        metrics: DoctoraliaMetricsService,
+        clinicId: string,
+        externalCall: () => Promise<void> = async () => {},
+    ): Promise<{ ran: boolean; skipReason?: string }> {
+        if (guard.isActive(clinicId, 'SAFETY_SWEEP')) {
+            metrics.recordConcurrencySkip('POLL_SKIPPED_SWEEP_ACTIVE', clinicId);
+            return { ran: false, skipReason: 'POLL_SKIPPED_SWEEP_ACTIVE' };
+        }
+        if (!guard.tryAcquire(clinicId, 'POLLING')) {
+            const blockReason = guard.getBlockReason(clinicId);
+            if (blockReason === 'GLOBAL_SYNC_PENDING') {
+                metrics.recordConcurrencySkip('POLL_SKIPPED_GLOBAL_SYNC_PENDING', clinicId);
+                return { ran: false, skipReason: 'POLL_SKIPPED_GLOBAL_SYNC_PENDING' };
+            }
+            metrics.recordConcurrencySkip('POLL_SKIPPED_POLL_ACTIVE', clinicId);
+            return { ran: false, skipReason: 'POLL_SKIPPED_POLL_ACTIVE' };
+        }
+        try {
+            await externalCall();
+            return { ran: true };
+        } finally {
+            guard.release(clinicId, 'POLLING');
+        }
+    }
+
+    it('reserva pendente → poll skipado com POLL_SKIPPED_GLOBAL_SYNC_PENDING, sem chamada externa (nunca POLL_ACTIVE)', async () => {
+        const guard = new ClinicConcurrencyGuard();
+        const metrics = new DoctoraliaMetricsService();
+        const externalCall = jest.fn(async () => {});
+
+        guard.requestPriority('clinic-A', () => {});
+        const result = await runPollWithBlockReason(guard, metrics, 'clinic-A', externalCall);
+
+        expect(result.ran).toBe(false);
+        expect(result.skipReason).toBe('POLL_SKIPPED_GLOBAL_SYNC_PENDING');
+        expect(externalCall).not.toHaveBeenCalled();
+        const counts = metrics.getConcurrencySkipCounts();
+        expect(counts.POLL_SKIPPED_GLOBAL_SYNC_PENDING).toBe(1);
+        expect(counts.POLL_SKIPPED_POLL_ACTIVE).toBe(0);
+
+        // Reserva consumida pelo Global Sync → poll volta ao normal
+        guard.clearPriority('clinic-A');
+        const next = await runPollWithBlockReason(guard, metrics, 'clinic-A', externalCall);
+        expect(next.ran).toBe(true);
+        expect(externalCall).toHaveBeenCalledTimes(1);
+    });
+});

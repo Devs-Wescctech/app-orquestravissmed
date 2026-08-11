@@ -180,6 +180,42 @@ describe('BookingSafetySweepService', () => {
         }
     });
 
+    it('Task 133: runSweepAllClinics pula com SWEEP_SKIPPED_GLOBAL_SYNC_PENDING quando há reserva de prioridade (nunca fallback enganoso)', async () => {
+        client.getBookings.mockResolvedValue({ _items: [newBooking('888')] });
+
+        // Reserva pendente, NENHUM subsistema ativo
+        concurrencyGuard.requestPriority('clinic-1', () => {});
+        try {
+            const result = await service.runSweepAllClinics();
+            expect(result.clinics).toBe(0);
+            expect(result.enqueued).toBe(0);
+            expect(client.getBookings).not.toHaveBeenCalled();
+            const counts = getDoctoraliaMetricsService()!.getConcurrencySkipCounts();
+            expect(counts.SWEEP_SKIPPED_GLOBAL_SYNC_PENDING).toBe(1);
+            expect(counts.SWEEP_SKIPPED_SWEEP_ACTIVE).toBe(0);
+            expect(counts.SWEEP_SKIPPED_POLL_ACTIVE).toBe(0);
+        } finally {
+            concurrencyGuard.clearPriority('clinic-1');
+        }
+    });
+
+    it('Task 133: startManualSweep descartada com SWEEP_SKIPPED_GLOBAL_SYNC_PENDING quando há reserva de prioridade', async () => {
+        concurrencyGuard.requestPriority('clinic-1', () => {});
+        try {
+            service.startManualSweep(conn);
+            await new Promise(res => setImmediate(res));
+            await new Promise(res => setImmediate(res));
+            const status = service.getManualSweepStatus('clinic-1') as any;
+            expect(status.running).toBe(false);
+            expect(client.getBookings).not.toHaveBeenCalled();
+            const counts = getDoctoraliaMetricsService()!.getConcurrencySkipCounts();
+            expect(counts.SWEEP_SKIPPED_GLOBAL_SYNC_PENDING).toBe(1);
+            expect(counts.SWEEP_SKIPPED_SWEEP_ACTIVE).toBe(0);
+        } finally {
+            concurrencyGuard.clearPriority('clinic-1');
+        }
+    });
+
     it('startManualSweep redefine running=false quando o SAFETY_SWEEP guard já está adquirido (sweep automático ativo)', async () => {
         // Adquire o guard externamente (simula sweep automático em andamento)
         concurrencyGuard.tryAcquire('clinic-1', 'SAFETY_SWEEP');

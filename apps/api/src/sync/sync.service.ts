@@ -108,6 +108,101 @@ export class SyncService {
         return syncRun;
     }
 
+    /**
+     * Task 133: re-disparo de um Global Sync adiado por reserva de prioridade.
+     * Chamado pelo callback opaco registrado no ClinicConcurrencyGuard quando a
+     * clínica fica livre. Revalida clínica ativa e ausência de run em andamento,
+     * cria um NOVO SyncRun correlacionado ao adiado e enfileira (ou executa
+     * direto no fallback sem Redis).
+     */
+    async resumeDeferredGlobalSync(clinicId: string, deferredFromRunId: string): Promise<void> {
+        try {
+            const clinic = await this.prisma.clinic.findUnique({
+                where: { id: clinicId },
+                select: { active: true },
+            });
+            if (!clinic?.active) {
+                this.logger.warn(`[DEFERRED-SYNC] Clínica ${clinicId} inexistente/desativada — reserva de prioridade descartada`);
+                this.concurrencyGuard.clearPriority(clinicId);
+                return;
+            }
+            // Um run Doctoralia 'running' pode estar EXECUTANDO (guard ativo) ou
+            // apenas ENFILEIRADO (BullMQ ainda não fez o acquire). Em ambos os
+            // casos ele consumirá a reserva no finally e correlacionará o run
+            // adiado — a reserva é MANTIDA, nunca descartada aqui (descarte só em
+            // caso terminal comprovado: clínica desativada; TTL cobre abandono).
+            // Runs VisMed não tocam o guard nem conflitam com o Global Sync
+            // Doctoralia (o próprio triggerGlobalSync dispara ambos juntos).
+            const doctoraliaInFlight = await this.prisma.syncRun.count({
+                where: { clinicId, status: 'running', type: { not: 'vismed-full' } },
+            });
+            if (doctoraliaInFlight > 0) {
+                this.logger.log(`[DEFERRED-SYNC] Clínica ${clinicId} já tem ${doctoraliaInFlight} run(s) Doctoralia em andamento/enfileirado(s) — reserva mantida para consumo/correlação por esse run`);
+                return;
+            }
+
+            const newRun = await this.prisma.syncRun.create({
+                data: {
+                    clinicId,
+                    type: 'full',
+                    status: 'running',
+                    metrics: { deferredFromRunId },
+                },
+            });
+            // Correlação reversa no run adiado (merge preservando metrics existentes)
+            await this.correlateSatisfiedReservation(deferredFromRunId, newRun.id);
+
+            this.logger.log(`[DEFERRED-SYNC] Re-disparando Global Sync adiado clinicId=${clinicId} — run ${newRun.id} (adiado: ${deferredFromRunId})`);
+            const _observabilityOrigin = getDoctoraliaContext()?.origin ?? 'SCHEDULER';
+            try {
+                await this.doctoraliaQueue.add('process-sync', {
+                    syncRunId: newRun.id,
+                    clinicId,
+                    type: 'full',
+                    _observabilityOrigin,
+                }, { attempts: 3, backoff: { type: 'exponential', delay: 2000 } });
+            } catch (e: any) {
+                if (this.isRedisUnavailable(e)) {
+                    this.logger.warn(`[DEFERRED-SYNC] Redis indisponível — executando direto clinicId=${clinicId}`);
+                    this.runDoctoraliaSyncDirect(newRun.id, clinicId, _observabilityOrigin).catch(err =>
+                        this.logger.error(`[DEFERRED-SYNC] Execução direta falhou: ${err?.message}`));
+                } else {
+                    this.logger.error(`[DEFERRED-SYNC] Falha ao enfileirar (não-Redis): ${e?.message}`);
+                    this.concurrencyGuard.clearPriority(clinicId);
+                    await this.prisma.syncRun.update({
+                        where: { id: newRun.id },
+                        data: { status: 'failed', endedAt: new Date(), metrics: { deferredFromRunId, error: e?.message } },
+                    }).catch(() => {});
+                }
+            }
+        } catch (err: any) {
+            // Nunca deixar a clínica permanentemente bloqueada: em exceção,
+            // descarta a reserva — a próxima janela do cron cobre.
+            this.logger.error(`[DEFERRED-SYNC] Erro no re-disparo clinicId=${clinicId}: ${err?.message}`);
+            this.concurrencyGuard.clearPriority(clinicId);
+            throw err;
+        }
+    }
+
+    /**
+     * Task 133: grava metrics.resumedByRunId no run adiado, apontando para o run
+     * que satisfez a reserva (o re-disparo OU um Global Sync independente que
+     * consumiu a reserva ao terminar). Merge preserva metrics existentes.
+     * Fail-safe: nunca lança (correlação é observabilidade, não fluxo).
+     */
+    async correlateSatisfiedReservation(deferredRunId: string, satisfiedByRunId: string): Promise<void> {
+        try {
+            const deferred = await this.prisma.syncRun.findUnique({ where: { id: deferredRunId }, select: { metrics: true } });
+            const prevMetrics = (deferred?.metrics && typeof deferred.metrics === 'object') ? deferred.metrics as Record<string, any> : {};
+            await this.prisma.syncRun.update({
+                where: { id: deferredRunId },
+                data: { metrics: { ...prevMetrics, resumedByRunId: satisfiedByRunId } },
+            });
+        } catch (err: any) {
+            this.logger.warn(`[DEFERRED-SYNC] Falha ao correlacionar run adiado ${deferredRunId} → ${satisfiedByRunId}: ${err?.message}`);
+        }
+    }
+
     async triggerGlobalSync(clinicId: string, idEmpresaGestora?: number) {
         const vismedRun = await this.triggerManualSync(clinicId, 'vismed-full', idEmpresaGestora);
         const doctoraliaRun = await this.triggerManualSync(clinicId, 'full');
@@ -357,13 +452,27 @@ export class SyncService {
         // nunca roda junto com POLLING/SAFETY_SWEEP/SLOT_SYNC (ou outro GLOBAL_SYNC).
         // Política SKIP: finaliza o run como 'skipped' para não deixar órfão em 'running'.
         if (!this.concurrencyGuard.tryAcquire(clinicId, 'GLOBAL_SYNC')) {
+            // Task 133: em vez de perder a janela, registra reserva de prioridade —
+            // quando o subsistema atual liberar a clínica, o sync é re-disparado.
             const blocker = concurrencyActorOf(this.concurrencyGuard.getActiveSubsystem(clinicId) ?? 'GLOBAL_SYNC');
-            this.logger.warn(`[DIRECT] GLOBAL_SYNC_SKIPPED_${blocker}_ACTIVE clinicId=${clinicId} — ${blocker} em andamento, sync global descartado`);
+            const skipReason = `GLOBAL_SYNC_DEFERRED_${blocker}_ACTIVE`;
+            this.logger.warn(`[DIRECT] ${skipReason} clinicId=${clinicId} — ${blocker} em andamento, sync global ADIADO (reserva de prioridade registrada)`);
             try { getDoctoraliaMetricsService()?.recordConcurrencySkip(`GLOBAL_SYNC_SKIPPED_${blocker}_ACTIVE`, clinicId); } catch (_e) {}
+            this.concurrencyGuard.requestPriority(
+                clinicId,
+                () => {
+                    this.resumeDeferredGlobalSync(clinicId, syncRunId).catch(err =>
+                        this.logger.error(`[DIRECT] Re-disparo do sync adiado falhou clinicId=${clinicId}: ${err?.message}`));
+                },
+                {
+                    tag: syncRunId,
+                    onExpire: () => { try { getDoctoraliaMetricsService()?.recordConcurrencySkip('GLOBAL_SYNC_RESERVATION_EXPIRED', clinicId); } catch (_e) {} },
+                },
+            );
             await this.prisma.syncRun.update({
                 where: { id: syncRunId },
-                data: { status: 'skipped', endedAt: new Date(), metrics: { skipReason: `GLOBAL_SYNC_SKIPPED_${blocker}_ACTIVE` } }
-            }).catch(err => this.logger.error(`[DIRECT] Falha ao finalizar SyncRun skipado ${syncRunId}: ${err?.message}`));
+                data: { status: 'skipped', endedAt: new Date(), metrics: { skipReason } }
+            }).catch(err => this.logger.error(`[DIRECT] Falha ao finalizar SyncRun adiado ${syncRunId}: ${err?.message}`));
             return;
         }
         try {
@@ -371,8 +480,16 @@ export class SyncService {
             // WP-01: reconstruct Doctoralia context (ALS doesn't propagate across async fire-and-forget)
             return await runWithDoctoraliaContext({ origin: observabilityOrigin as any, clinicId }, () => this._runDoctoraliaSyncDirectBody(syncRunId, clinicId));
         } finally {
+            // Task 133: qualquer execução GLOBAL_SYNC CONSOME a reserva de prioridade
+            // — consumo ANTES do release para não re-disparar a reserva já satisfeita.
+            // Se a reserva era de OUTRO run adiado, correlaciona (nunca silencioso).
+            const consumed = this.concurrencyGuard.consumePriority(clinicId);
             // WP-04: liberar guard em qualquer cenário
             this.concurrencyGuard.release(clinicId, 'GLOBAL_SYNC');
+            if (consumed?.tag && consumed.tag !== syncRunId) {
+                this.logger.log(`[DIRECT] Reserva de prioridade do run adiado ${consumed.tag} satisfeita por este run ${syncRunId} clinicId=${clinicId}`);
+                await this.correlateSatisfiedReservation(consumed.tag, syncRunId);
+            }
         }
     }
 
