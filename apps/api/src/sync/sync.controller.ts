@@ -197,14 +197,16 @@ export class SyncController {
             where: { clinicId },
             orderBy: { startedAt: 'desc' },
             take: 10,
-            select: { id: true, type: true, status: true, startedAt: true, endedAt: true, totalRecords: true },
+            select: { id: true, type: true, status: true, startedAt: true, endedAt: true, totalRecords: true, metrics: true },
         });
 
         const lastVismedRun = allHistoryRuns.find(r => r.type === 'vismed-full');
         const lastDoctoraliaRun = allHistoryRuns.find(r => r.type === 'full' && r.status === 'completed');
 
-        const successCount = allHistoryRuns.filter(r => r.status === 'completed').length;
-        const successRate = allHistoryRuns.length > 0 ? Math.round((successCount / allHistoryRuns.length) * 100) : 0;
+        // Runs 'skipped' (ex.: concurrency guard) não são execuções efetivas — ficam fora do denominador
+        const executedRuns = allHistoryRuns.filter(r => r.status !== 'skipped');
+        const successCount = executedRuns.filter(r => r.status === 'completed').length;
+        const successRate = executedRuns.length > 0 ? Math.round((successCount / executedRuns.length) * 100) : 0;
 
         // Insurance health: conta warnings de regressão no último syncRun completed
         let insuranceRegressionWarnings = 0;

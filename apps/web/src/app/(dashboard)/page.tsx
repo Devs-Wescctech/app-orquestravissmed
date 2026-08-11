@@ -1,6 +1,6 @@
 'use client';
 import { useState, useEffect } from 'react';
-import { CheckCircle2, Hourglass, AlertTriangle, Settings2, Users, Loader2, UserSquare2, CalendarDays, ExternalLink, Activity, ShieldCheck, ArrowUpRight, Link2Off, X } from 'lucide-react';
+import { CheckCircle2, Hourglass, AlertTriangle, Settings2, Users, Loader2, UserSquare2, CalendarDays, ExternalLink, Activity, ShieldCheck, ArrowUpRight, Link2Off, X, Clock } from 'lucide-react';
 import Link from 'next/link';
 import { api } from '@/lib/api';
 import { useClinic } from '@/lib/clinic-store';
@@ -76,14 +76,17 @@ export default function DashboardOverview() {
 
                 const allLogs = syncRes.data || [];
                 let health = 100;
-                if (allLogs.length > 0) {
-                    const successLogs = allLogs.filter((l: any) => l.status === 'completed' || l.status === 'success').length;
-                    health = Math.round((successLogs / allLogs.length) * 100);
+                // Runs 'skipped' não são execuções efetivas — ficam fora do denominador
+                const executedLogs = allLogs.filter((l: any) => l.status !== 'skipped');
+                if (executedLogs.length > 0) {
+                    const successLogs = executedLogs.filter((l: any) => l.status === 'completed' || l.status === 'success').length;
+                    health = Math.round((successLogs / executedLogs.length) * 100);
                 }
 
                 const topLogs = allLogs.slice(0, 3).map((log: any) => {
-                    let logStatus: 'success' | 'warning' | 'failed' | 'pending' = 'pending';
+                    let logStatus: 'success' | 'warning' | 'failed' | 'pending' | 'skipped' = 'pending';
                     if (log.status === 'completed' || log.status === 'success') logStatus = 'success';
+                    else if (log.status === 'skipped') logStatus = 'skipped';
                     else if (log.status === 'partially' || log.status === 'warning') logStatus = 'warning';
                     else if (log.status === 'failed' || log.status === 'error') logStatus = 'failed';
                     return {
@@ -405,10 +408,12 @@ export default function DashboardOverview() {
                                     <div className="flex items-center gap-5">
                                         <div className={`h-14 w-14 rounded-2xl flex items-center justify-center shrink-0 border-2 transition-all group-hover/item:scale-105 ${log.status === 'success' ? 'bg-white border-emerald-100 text-primary shadow-emerald-100/20' :
                                             log.status === 'pending' ? 'bg-white border-blue-100 text-blue-500 shadow-blue-100/20' :
+                                                log.status === 'skipped' ? 'bg-white border-amber-100 text-amber-500 shadow-amber-100/20' :
                                                 'bg-white border-rose-100 text-rose-500 shadow-rose-100/20'
                                             } shadow-lg`}>
                                             {log.status === 'success' ? <CheckCircle2 className="h-6 w-6" /> :
                                                 log.status === 'pending' ? <Loader2 className="h-6 w-6 animate-spin" /> :
+                                                    log.status === 'skipped' ? <Clock className="h-6 w-6" /> :
                                                     <AlertTriangle className="h-6 w-6" />}
                                         </div>
                                         <div>
@@ -422,9 +427,10 @@ export default function DashboardOverview() {
                                     <div className="text-right">
                                         <span className={`px-3 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest shadow-sm ${log.status === 'success' ? 'bg-primary text-white' :
                                             log.status === 'pending' ? 'bg-blue-500 text-white' :
+                                                log.status === 'skipped' ? 'bg-amber-500 text-white' :
                                                 'bg-rose-500 text-white'
                                             }`}>
-                                            {log.status === 'success' ? 'Sucesso' : log.status === 'pending' ? 'Processando' : 'Falha'}
+                                            {log.status === 'success' ? 'Sucesso' : log.status === 'pending' ? 'Processando' : log.status === 'skipped' ? 'Pulado' : 'Falha'}
                                         </span>
                                         <p className="text-[10px] font-black text-slate-400 mt-2.5 flex items-center justify-end gap-1.5 uppercase tracking-widest">
                                             <CalendarDays className="h-3.5 w-3.5 opacity-50" />
