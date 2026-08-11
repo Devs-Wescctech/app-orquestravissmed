@@ -4,6 +4,7 @@ import { Queue } from 'bullmq';
 import { PrismaService } from '../prisma/prisma.service';
 import { VismedService } from '../integrations/vismed/vismed.service';
 import { DocplannerService } from '../integrations/docplanner.service';
+import { StableDataCacheService, STABLE_DATA_TTLS } from '../integrations/stable-data-cache.service';
 import { MatchingEngineService } from '../mappings/matching-engine.service';
 import { PushSyncService } from './push-sync.service';
 import { getDoctoraliaContext, runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
@@ -22,7 +23,8 @@ export class SyncService {
         private docplanner: DocplannerService,
         private matchingEngine: MatchingEngineService,
         private pushSync: PushSyncService,
-        private concurrencyGuard: ClinicConcurrencyGuard
+        private concurrencyGuard: ClinicConcurrencyGuard,
+        private stableCache: StableDataCacheService,
     ) { }
 
     private async isQueuePaused(clinicId: string): Promise<boolean> {
@@ -386,7 +388,12 @@ export class SyncService {
             const client = this.docplanner.createClient(conn.domain || 'www.doctoralia.com.br', conn.clientId, conn.clientSecret || '');
 
             await this.updateSyncStatus(syncRunId, 'syncing_facilities');
-            const facilitiesInfo = await client.getFacilities();
+            // WP-06: cache TTL para dados estáveis (caminho fallback direto, sem Redis).
+            const facilitiesInfo = await this.stableCache.getOrFetch(
+                `${client.getCacheIdentity()}|facilities`,
+                STABLE_DATA_TTLS.facilities,
+                () => client.getFacilities(),
+            );
             const facilitiesList = facilitiesInfo._items || [];
             await this.logEvent(syncRunId, 'FACILITY', 'fetch_success', `Found ${facilitiesList.length} facilities`);
             let totalProcessed = facilitiesList.length;
@@ -403,7 +410,11 @@ export class SyncService {
             }
 
             await this.updateSyncStatus(syncRunId, 'syncing_doctors_services');
-            const docsRes = await client.getDoctors(facilityId);
+            const docsRes = await this.stableCache.getOrFetch(
+                `${client.getCacheIdentity()}|doctors|${facilityId}`,
+                STABLE_DATA_TTLS.doctors,
+                () => client.getDoctors(facilityId),
+            );
             const doctorsList = docsRes._items || [];
             await this.logEvent(syncRunId, 'DOCTOR', 'fetch_success', `Found ${doctorsList.length} doctors`);
             const activeDoctorIds: string[] = [];
@@ -430,11 +441,19 @@ export class SyncService {
                 });
 
                 try {
-                    const addrsRes = await client.getAddresses(facilityId, docId);
+                    const addrsRes = await this.stableCache.getOrFetch(
+                        `${client.getCacheIdentity()}|addresses|${facilityId}|${docId}`,
+                        STABLE_DATA_TTLS.addresses,
+                        () => client.getAddresses(facilityId, docId),
+                    );
                     for (const addr of (addrsRes._items || [])) {
                         const addrId = String(addr.id);
                         try {
-                            const srvRes = await client.getServices(facilityId, docId, addrId);
+                            const srvRes = await this.stableCache.getOrFetch(
+                                `${client.getCacheIdentity()}|services|${facilityId}|${docId}|${addrId}`,
+                                STABLE_DATA_TTLS.services,
+                                () => client.getServices(facilityId, docId, addrId),
+                            );
                             for (const srv of (srvRes._items || [])) {
                                 // srv.id é o id do VÍNCULO serviço↔endereço (address_service id).
                                 // srv.service_id é o id do DICIONÁRIO global de serviços.
@@ -505,7 +524,11 @@ export class SyncService {
             this.logger.log('Importando dicionário global de Serviços da Doctoralia...');
             await this.updateSyncStatus(syncRunId, 'importing_services_dictionary');
             try {
-                const dictRes = await client.getServicesDictionary();
+                const dictRes = await this.stableCache.getOrFetch(
+                    `${client.getCacheIdentity()}|servicesDictionary`,
+                    STABLE_DATA_TTLS.servicesDictionary,
+                    () => client.getServicesDictionary(),
+                );
                 const dictItems = dictRes._items || [];
                 this.logger.log(`Dicionário de Serviços: ${dictItems.length} encontrados.`);
                 await this.logEvent(syncRunId, 'SERVICE_CATALOG', 'fetch_success', `Dicionário global: ${dictItems.length} serviços encontrados.`);
@@ -551,7 +574,11 @@ export class SyncService {
             this.logger.log('Importando dicionário global de Insurance Providers da Doctoralia...');
             await this.updateSyncStatus(syncRunId, 'syncing_insurance_providers');
             try {
-                const insProvidersRes = await client.getInsuranceProviders();
+                const insProvidersRes = await this.stableCache.getOrFetch(
+                    `${client.getCacheIdentity()}|insuranceProviders`,
+                    STABLE_DATA_TTLS.insuranceProviders,
+                    () => client.getInsuranceProviders(),
+                );
                 const insProviders = insProvidersRes._items || [];
                 this.logger.log(`Insurance Providers: ${insProviders.length} encontrados no dicionário global.`);
                 await this.logEvent(syncRunId, 'INSURANCE', 'fetch_success', `Dicionário global: ${insProviders.length} insurance providers encontrados.`);

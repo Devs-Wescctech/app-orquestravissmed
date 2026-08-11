@@ -166,6 +166,14 @@ export class DocplannerClient {
         return this.baseUrl || 'https://www.doctoralia.com.br';
     }
 
+    /**
+     * WP-06: identidade estável `domain|clientId` desta conexão, usada como prefixo
+     * das chaves do StableDataCache. Acessor de leitura — não altera comportamento.
+     */
+    getCacheIdentity(): string {
+        return `${this.getBaseUrl().replace(/^https?:\/\//, '')}|${this.clientId ?? ''}`;
+    }
+
     async authenticate(clientId: string, clientSecret: string): Promise<string> {
         this.clientId = clientId;
         this.clientSecret = clientSecret;

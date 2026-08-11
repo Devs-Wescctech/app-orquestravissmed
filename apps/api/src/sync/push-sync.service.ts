@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { DocplannerClient } from '../integrations/docplanner.service';
+import { StableDataCacheService, STABLE_DATA_TTLS } from '../integrations/stable-data-cache.service';
 import { SlotSyncService } from './slot-sync.service';
 import { VismedAvailabilityService, ClinicAvailability } from './vismed-availability.service';
 import { SyncCycleContext } from './sync-cycle-context';
@@ -14,6 +15,7 @@ export class PushSyncService {
         private prisma: PrismaService,
         private slotSync: SlotSyncService,
         private availabilityService: VismedAvailabilityService,
+        private stableCache: StableDataCacheService,
     ) { }
 
     async pushToDoctoralia(clinicId: string, syncRunId: string, client: DocplannerClient): Promise<void> {
@@ -105,7 +107,12 @@ export class PushSyncService {
             // Let's get the active addresses for the doctor on Doctoralia.
             let doctoraliaAddresses = [];
             try {
-                const addrsRes = await client.getAddresses(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId);
+                // WP-06: cache TTL entre ciclos (o cycleCtx cobre apenas o ciclo corrente).
+                const addrsRes = await this.stableCache.getOrFetch(
+                    `${client.getCacheIdentity()}|addresses|${dDoc.doctoraliaFacilityId}|${dDoc.doctoraliaDoctorId}`,
+                    STABLE_DATA_TTLS.addresses,
+                    () => client.getAddresses(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId),
+                );
                 doctoraliaAddresses = addrsRes._items || [];
                 // Armazena no contexto para reuso pelo SlotSync no mesmo ciclo.
                 cycleCtx.setAddresses(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, doctoraliaAddresses);
@@ -157,6 +164,8 @@ export class PushSyncService {
                         await this.logEvent(syncRunId, 'ADDRESS_PUSH', 'address_patch_skipped', `Doctor ${dDoc.name}: PATCH endereço ${addrId} omitido — estado remoto já está correto (${reason})`);
                     } else {
                         await client.updateAddress(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, addressPayload);
+                        // WP-06: PATCH mudou o endereço na Doctoralia — invalida o cache de addresses do médico.
+                        this.stableCache.invalidate(`${client.getCacheIdentity()}|addresses|${dDoc.doctoraliaFacilityId}|${dDoc.doctoraliaDoctorId}`);
                         this.logger.log(`Doctor ${dDoc.name}: [ADDR] address_patch_sent clinic=${clinicId} addr=${addrId} — ${reason} (insurance_support=${desiredInsuranceSupport})`);
                         await this.logEvent(syncRunId, 'ADDRESS_PUSH', 'address_patch_sent', `Doctor ${dDoc.name}: Endereço ${addrId} atualizado (insurance_support=${desiredInsuranceSupport})`);
                     }
@@ -226,7 +235,12 @@ export class PushSyncService {
             if (cached !== undefined) {
                 currentServices = cached;
             } else {
-                const res = await client.getServices(facilityId, doctorId, addressId);
+                // WP-06: cache TTL entre ciclos, por baixo do cycleCtx.
+                const res = await this.stableCache.getOrFetch(
+                    `${client.getCacheIdentity()}|services|${facilityId}|${doctorId}|${addressId}`,
+                    STABLE_DATA_TTLS.services,
+                    () => client.getServices(facilityId, doctorId, addressId),
+                );
                 currentServices = res._items || [];
                 cycleCtx?.setServices(facilityId, doctorId, addressId, currentServices);
             }
@@ -346,6 +360,8 @@ export class PushSyncService {
                         description: `Sincronizado via VisMed - ${specName}`
                     };
                     await client.addAddressService(facilityId, doctorId, addressId, payload);
+                    // WP-06: mutação de services — invalida o cache TTL do endereço afetado.
+                    this.stableCache.invalidate(`${client.getCacheIdentity()}|services|${facilityId}|${doctorId}|${addressId}`);
                     addedDictIds.add(dictId);
                     servicesMutated = true;
                     this.logger.log(`Doctor ${doctorName}: [ADD] Service dict:${dictId} (${specName}) to Address ${addressId}`);
@@ -385,6 +401,8 @@ export class PushSyncService {
                     try {
                         const addrSvcId = String(addrSvc.id);
                         await client.deleteAddressService(facilityId, doctorId, addressId, addrSvcId);
+                        // WP-06: mutação de services — invalida o cache TTL do endereço afetado.
+                        this.stableCache.invalidate(`${client.getCacheIdentity()}|services|${facilityId}|${doctorId}|${addressId}`);
                         servicesMutated = true;
                         this.logger.log(`Doctor ${doctorName}: [DELETE] Service addr_svc:${addrSvcId} (dict:${dictId}) from Address ${addressId}`);
                         await this.logEvent(syncRunId, 'SERVICE_PUSH', 'deleted', `Doctor ${doctorName}: Removido serviço excessivo (dict:${dictId}) do endereço ${addressId}`);
@@ -454,7 +472,12 @@ export class PushSyncService {
         const resolveDefaultPlanId = async (providerId: string): Promise<string | null> => {
             if (defaultPlanCache.has(providerId)) return defaultPlanCache.get(providerId)!;
             try {
-                const plansRes = await client.getInsurancePlans(providerId);
+                // WP-06: planos de convênio são estáveis — cache TTL por provider.
+                const plansRes = await this.stableCache.getOrFetch(
+                    `${client.getCacheIdentity()}|insurancePlans|${providerId}`,
+                    STABLE_DATA_TTLS.insurancePlans,
+                    () => client.getInsurancePlans(providerId),
+                );
                 const items = plansRes?._items || [];
                 const firstId = items.length > 0 ? String(items[0].insurance_plan_id) : null;
                 defaultPlanCache.set(providerId, firstId);
@@ -581,7 +604,12 @@ export class PushSyncService {
 
         let ids: Set<string> | null = null;
         try {
-            const res = await client.getFacilityServicesCatalog(facilityId);
+            // WP-06: catálogo da unidade é estável (sem mutação no código) — cache TTL longo.
+            const res = await this.stableCache.getOrFetch(
+                `${client.getCacheIdentity()}|facilityServicesCatalog|${facilityId}`,
+                STABLE_DATA_TTLS.facilityServicesCatalog,
+                () => client.getFacilityServicesCatalog(facilityId),
+            );
             const items = res?._items || [];
             if (items.length > 0) {
                 ids = new Set<string>();

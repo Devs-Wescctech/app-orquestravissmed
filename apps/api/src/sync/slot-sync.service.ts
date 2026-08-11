@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { DocplannerClient } from '../integrations/docplanner.service';
+import { StableDataCacheService, STABLE_DATA_TTLS } from '../integrations/stable-data-cache.service';
 import { VismedAvailabilityService, ClinicAvailability, AvailRange } from './vismed-availability.service';
 import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 import { getDoctoraliaMetricsService } from '../metrics/doctoralia-metrics.service';
@@ -21,6 +22,7 @@ export class SlotSyncService {
     constructor(
         private prisma: PrismaService,
         private availabilityService: VismedAvailabilityService,
+        private stableCache: StableDataCacheService,
     ) {}
 
     private async upsertSlotPushState(doctoraliaDoctorId: string, addressId: string, availabilityHash: string): Promise<void> {
@@ -245,7 +247,13 @@ export class SlotSyncService {
             if (cachedAddrs !== undefined) {
                 doctoraliaAddresses = cachedAddrs;
             } else {
-                const res = await client.getAddresses(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId);
+                // WP-06: cache TTL entre ciclos — cobre também as execuções do block watcher
+                // (que chamam syncSlotsForDoctor com cycleCtx undefined).
+                const res = await this.stableCache.getOrFetch(
+                    `${client.getCacheIdentity()}|addresses|${dDoc.doctoraliaFacilityId}|${dDoc.doctoraliaDoctorId}`,
+                    STABLE_DATA_TTLS.addresses,
+                    () => client.getAddresses(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId),
+                );
                 doctoraliaAddresses = res._items || [];
                 cycleCtx?.setAddresses(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, doctoraliaAddresses);
             }
@@ -320,7 +328,12 @@ export class SlotSyncService {
                 if (cachedSvcs !== undefined) {
                     addressServices = cachedSvcs;
                 } else {
-                    const svcRes = await client.getServices(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId);
+                    // WP-06: cache TTL entre ciclos, por baixo do cycleCtx.
+                    const svcRes = await this.stableCache.getOrFetch(
+                        `${client.getCacheIdentity()}|services|${dDoc.doctoraliaFacilityId}|${dDoc.doctoraliaDoctorId}|${addrId}`,
+                        STABLE_DATA_TTLS.services,
+                        () => client.getServices(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId),
+                    );
                     addressServices = svcRes._items || [];
                     cycleCtx?.setServices(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, addressServices);
                 }
@@ -396,7 +409,12 @@ export class SlotSyncService {
                         continue;
                     }
                     try {
-                        const plansRes = await client.getInsurancePlans(String(providerId));
+                        // WP-06: planos de convênio são estáveis — cache TTL por provider.
+                        const plansRes = await this.stableCache.getOrFetch(
+                            `${client.getCacheIdentity()}|insurancePlans|${providerId}`,
+                            STABLE_DATA_TTLS.insurancePlans,
+                            () => client.getInsurancePlans(String(providerId)),
+                        );
                         const firstPlan = plansRes?._items?.[0];
                         if (firstPlan?.id) {
                             const planIdNum = parseInt(String(firstPlan.id), 10);
@@ -796,6 +814,9 @@ export class SlotSyncService {
                     if (newAddressServiceId) {
                         provisionedServices.push({ id: newAddressServiceId, service_id: Number(candidateId), name: svc.name });
                     } else {
+                        // WP-06 BYPASS obrigatório: re-leitura logo após addAddressService para
+                        // descobrir o vínculo recém-criado — precisa de estado FRESCO da Doctoralia,
+                        // nunca do cache TTL. Vai direto ao client.
                         const svcRes = await client.getServices(facilityId, doctorId, addressId);
                         const items = svcRes._items || [];
                         const found = items.find((s: any) => String(s.service_id) === String(candidateId));
@@ -810,6 +831,9 @@ export class SlotSyncService {
                     if (syncRunId) {
                         await this.logEvent(syncRunId, 'SERVICE_PROVISION', 'created', `Serviço "${svc.name}" (service_id: ${candidateId}) adicionado ao endereço ${addressId} do médico ${doctor.name}`);
                     }
+                    // WP-06: POST de auto-provisionamento mudou os services do endereço —
+                    // invalida o cache TTL para o próximo leitor buscar a lista atualizada.
+                    this.stableCache.invalidate(`${client.getCacheIdentity()}|services|${facilityId}|${doctorId}|${addressId}`);
                     provisioned = true;
                     break;
                 } catch (error: any) {
@@ -842,6 +866,8 @@ export class SlotSyncService {
         }
 
         if (provisionedServices.length === 0) {
+            // WP-06 BYPASS obrigatório: fallback de resolução no fim do provisionamento —
+            // precisa do estado CORRENTE (pós-POSTs) da Doctoralia; nunca usar o cache TTL.
             const svcRes = await client.getServices(facilityId, doctorId, addressId);
             return svcRes._items || [];
         }
@@ -855,7 +881,12 @@ export class SlotSyncService {
      */
     private async resolveFacilityCatalogIds(client: DocplannerClient, facilityId: string): Promise<Set<string> | null> {
         try {
-            const res = await client.getFacilityServicesCatalog(facilityId);
+            // WP-06: catálogo da unidade é estável (sem mutação no código) — cache TTL longo.
+            const res = await this.stableCache.getOrFetch(
+                `${client.getCacheIdentity()}|facilityServicesCatalog|${facilityId}`,
+                STABLE_DATA_TTLS.facilityServicesCatalog,
+                () => client.getFacilityServicesCatalog(facilityId),
+            );
             const items = res?._items || [];
             if (items.length === 0) return null;
             const ids = new Set<string>();
