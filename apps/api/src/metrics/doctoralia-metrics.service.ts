@@ -182,6 +182,16 @@ export class DoctoraliaMetricsService {
     // WP-05: GETs que se juntaram a um voo idêntico já em andamento (dedup in-flight)
     private dedupedGetCount = 0;
 
+    // WP-07: contadores aditivos de retries transitórios do DocplannerClient
+    private transientRetryStats = {
+        total: 0,
+        byClassification: {} as Record<string, number>,
+        succeeded: 0,
+        exhausted: 0,
+        retryAfterWaits: 0,
+        retryAfterWaitMsTotal: 0,
+    };
+
     // Início da medição
     private startedAt = Date.now();
 
@@ -278,6 +288,15 @@ export class DoctoraliaMetricsService {
             this.concurrencySkipCounts = emptyConcurrencySkipCounts();
             // WP-05
             this.dedupedGetCount = 0;
+            // WP-07
+            this.transientRetryStats = {
+                total: 0,
+                byClassification: {},
+                succeeded: 0,
+                exhausted: 0,
+                retryAfterWaits: 0,
+                retryAfterWaitMsTotal: 0,
+            };
             this.startedAt = Date.now();
         } catch (err: any) {
             this.logger.warn(`[METRICS] reset() error: ${err?.message}`);
@@ -319,6 +338,39 @@ export class DoctoraliaMetricsService {
 
     getDedupedGetCount(): number {
         return this.dedupedGetCount;
+    }
+
+    // ─────────── WP-07: retries transitórios (fail-safe, aditivo) ────────────
+
+    /** Registra UMA retentativa transitória; retryAfterMs presente quando o Retry-After foi honrado. */
+    recordTransientRetry(classification: string, retryAfterMs?: number): void {
+        try {
+            this.transientRetryStats.total++;
+            this.transientRetryStats.byClassification[classification] =
+                (this.transientRetryStats.byClassification[classification] ?? 0) + 1;
+            if (retryAfterMs !== undefined) {
+                this.transientRetryStats.retryAfterWaits++;
+                this.transientRetryStats.retryAfterWaitMsTotal += retryAfterMs;
+            }
+        } catch (err: any) {
+            this.logger.debug(`[METRICS] recordTransientRetry() error (non-fatal): ${err?.message}`);
+        }
+    }
+
+    /** Desfecho de uma sequência que teve retry: sucesso após retry ou orçamento esgotado. */
+    recordTransientRetryOutcome(outcome: 'succeeded' | 'exhausted'): void {
+        try {
+            this.transientRetryStats[outcome]++;
+        } catch (err: any) {
+            this.logger.debug(`[METRICS] recordTransientRetryOutcome() error (non-fatal): ${err?.message}`);
+        }
+    }
+
+    getTransientRetryStats() {
+        return {
+            ...this.transientRetryStats,
+            byClassification: { ...this.transientRetryStats.byClassification },
+        };
     }
 
     // ────────────────── Poll tracking ───────────────────────────────────────

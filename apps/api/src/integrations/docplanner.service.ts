@@ -5,6 +5,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { getDoctoraliaMetricsService } from '../metrics/doctoralia-metrics.service';
 import { getDoctoraliaContext } from '../metrics/doctoralia-call-context';
 import { randomUUID } from 'crypto';
+import { decideRetry, MAX_HTTP_ATTEMPTS } from './docplanner-retry.policy';
 
 interface CachedToken {
     token: string;
@@ -265,9 +266,13 @@ export class DocplannerClient {
         // WP-01: httpStatus default para NETWORK; será sobrescrito se fetch retornar
         let _oauthHttpStatus: number | 'TIMEOUT' | 'NETWORK' | 'OTHER' = 'NETWORK';
         let response: Awaited<ReturnType<typeof fetch>> | undefined;
+        // WP-07: timeout de 30s no OAuth, consistente com o timeout HTTP do client.
+        const oauthController = new AbortController();
+        const oauthTimeout = setTimeout(() => oauthController.abort(), 30000);
         try {
             response = await fetch(url, {
                 method: 'POST',
+                signal: oauthController.signal,
                 headers: {
                     'Content-Type': 'application/x-www-form-urlencoded',
                     'Authorization': `Basic ${basicAuth}`,
@@ -282,6 +287,7 @@ export class DocplannerClient {
             _oauthHttpStatus = fetchErr?.name === 'AbortError' ? 'TIMEOUT' : 'NETWORK';
             throw fetchErr;
         } finally {
+            clearTimeout(oauthTimeout);
             // WP-01: registra chamada OAuth em finally — cobre sucesso, HTTP error E network failure
             const _oauthRespondedAt = Date.now();
             try {
@@ -386,16 +392,81 @@ export class DocplannerClient {
                 } catch (_e) { /* fail-safe */ }
                 return DocplannerClient.cloneResult(await existing);
             }
-            const flight = this.executeRequest(method, path, data, isRetry).finally(() => {
+            // WP-07: o loop de retry roda DENTRO do voo único — awaiters compartilham
+            // uma única sequência de tentativas.
+            const flight = this.executeWithRetry(method, path, data).finally(() => {
                 DocplannerClient.inflightGets.delete(key);
             });
             DocplannerClient.inflightGets.set(key, flight);
             return DocplannerClient.cloneResult(await flight);
         }
-        return this.executeRequest(method, path, data, isRetry);
+        return this.executeWithRetry(method, path, data);
     }
 
-    private async executeRequest(method: string, path: string, data?: any, isRetry = false): Promise<any> {
+    /** Espera assíncrona (isolada em método estático para ser espiável em testes). */
+    private static sleep(ms: number): Promise<void> {
+        return new Promise(r => setTimeout(r, ms));
+    }
+
+    /**
+     * WP-07 — Loop de retry para falhas transitórias (5xx/408/429/timeout/rede).
+     * Envolve executeRequest DEPOIS da deduplicação (WP-05): cada tentativa
+     * readquire slot no rate limiter dentro de executeRequest. O ramo de 401
+     * permanece intocado dentro de executeRequest; sua repetição compartilha o
+     * MESMO orçamento de tentativas (attemptState), impedindo loop cruzado.
+     */
+    private async executeWithRetry(method: string, path: string, data?: any): Promise<any> {
+        const operation = this.inferOperation(method, path);
+        const retryEligible = this.isRetryableOperation(method, operation);
+        const attemptState = { attempts: 0 };
+        let retryIndex = 0;
+        let didRetry = false;
+        for (;;) {
+            try {
+                const result = await this.executeRequest(method, path, data, false, attemptState);
+                if (didRetry) {
+                    try { getDoctoraliaMetricsService()?.recordTransientRetryOutcome('succeeded'); } catch (_e) { /* fail-safe */ }
+                }
+                return result;
+            } catch (err: any) {
+                const decision = decideRetry({
+                    error: err,
+                    retryEligible,
+                    attemptsUsed: attemptState.attempts,
+                    retryIndex,
+                });
+                if (decision.retry === false) {
+                    if (decision.exhausted) {
+                        try { getDoctoraliaMetricsService()?.recordTransientRetryOutcome('exhausted'); } catch (_e) { /* fail-safe */ }
+                    }
+                    throw err;
+                }
+                didRetry = true;
+                try {
+                    getDoctoraliaMetricsService()?.recordTransientRetry(
+                        decision.classification,
+                        decision.usedRetryAfter ? decision.delayMs : undefined,
+                    );
+                } catch (_e) { /* fail-safe */ }
+                this.logger.warn(
+                    `[RETRY] ${method} ${path} (${operation}) falhou (${decision.classification}) — ` +
+                    `tentativa ${attemptState.attempts}/${MAX_HTTP_ATTEMPTS} consumida; aguardando ` +
+                    `${Math.round(decision.delayMs)}ms antes de repetir${decision.usedRetryAfter ? ' (Retry-After honrado)' : ''}.`,
+                );
+                await DocplannerClient.sleep(decision.delayMs);
+                retryIndex++;
+            }
+        }
+    }
+
+    private async executeRequest(
+        method: string,
+        path: string,
+        data?: any,
+        isRetry = false,
+        // WP-07: orçamento COMPARTILHADO de tentativas HTTP (inclui repetição de 401).
+        attemptState: { attempts: number } = { attempts: 0 },
+    ): Promise<any> {
         if (this.clientId) {
             // Sempre passa pelo cache: pega token válido, renova se expirado, e re-tenta
             // autenticar mesmo que a autenticação inicial (fire-and-forget do createClient)
@@ -415,6 +486,7 @@ export class DocplannerClient {
         // Adquire o slot ANTES de armar o timeout de 30s — a espera na fila de vazão
         // não pode consumir o tempo da requisição em si.
         await DocplannerClient.acquireRateSlot(this.logger);
+        attemptState.attempts++;
         const releasedAt = Date.now();
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 30000);
@@ -453,14 +525,18 @@ export class DocplannerClient {
                 if (response.status === 401 && this.clientId) {
                     await response.text().catch(() => undefined);
                     const operation401 = this.inferOperation(method, path);
-                    const canRetry = !isRetry && this.isRetryableOperation(method, operation401);
+                    // WP-07: o retry de 401 também respeita o orçamento total de
+                    // tentativas — impede loop entre retry transitório e retry de 401.
+                    const canRetry = !isRetry
+                        && this.isRetryableOperation(method, operation401)
+                        && attemptState.attempts < MAX_HTTP_ATTEMPTS;
                     // Renovação SEMPRE ocorre — independente de repetir ou não.
                     await this.getToken(true);
                     if (canRetry) {
                         this.logger.warn(`401 em ${method} ${path} (${operation401}) — token renovado, repetindo a chamada.`);
                         // WP-05: retry direto em executeRequest — permanece DENTRO do voo
                         // único do dedup (não cria nem se junta a outra entrada do mapa).
-                        return this.executeRequest(method, path, data, true);
+                        return this.executeRequest(method, path, data, true, attemptState);
                     }
                     const reason = isRetry
                         ? 'já é retry'
@@ -475,6 +551,8 @@ export class DocplannerClient {
                 const error = new Error(`Docplanner API Error: ${response.status} ${errorText}`);
                 (error as any).status = response.status;
                 (error as any).details = errorText;
+                // WP-07: preserva o Retry-After para a política de retry (429).
+                (error as any).retryAfter = response.headers.get('retry-after');
                 throw error;
             }
 
@@ -525,8 +603,8 @@ export class DocplannerClient {
                         resourceKey,
                         method,
                         httpStatus: httpStatus ?? 'OTHER',
-                        isRetry,
-                        retryNumber: isRetry ? 1 : 0,
+                        isRetry: isRetry || attemptState.attempts > 1,
+                        retryNumber: Math.max(0, attemptState.attempts - 1),
                         isOAuth: false,
                         enqueuedAt,
                         releasedAt,

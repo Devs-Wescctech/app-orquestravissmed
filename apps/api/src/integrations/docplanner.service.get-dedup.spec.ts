@@ -152,10 +152,12 @@ describe('DocplannerClient — dedup de GETs in-flight (WP-05)', () => {
         const p1 = (client as any).request('GET', BOOKINGS_PATH);
         const p2 = (client as any).request('GET', BOOKINGS_PATH);
         await new Promise(r => setImmediate(r));
-        d.resolve(makeResponse(500, 'boom'));
+        // WP-07: 500 agora é retryado (transitório); usamos 404 — não-retryável —
+        // para continuar testando a propagação de erro do dedup sem retry.
+        d.resolve(makeResponse(404, 'boom'));
 
-        await expect(p1).rejects.toThrow('Docplanner API Error: 500');
-        await expect(p2).rejects.toThrow('Docplanner API Error: 500');
+        await expect(p1).rejects.toThrow('Docplanner API Error: 404');
+        await expect(p2).rejects.toThrow('Docplanner API Error: 404');
         expect(fetchMock).toHaveBeenCalledTimes(1);
         expect(((DocplannerClient as any).inflightGets as Map<string, any>).size).toBe(0);
 
