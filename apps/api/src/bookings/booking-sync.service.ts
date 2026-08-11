@@ -8,6 +8,7 @@ import { MatchingEngineService } from '../mappings/matching-engine.service';
 import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 import { getDoctoraliaMetricsService, concurrencyActorOf } from '../metrics/doctoralia-metrics.service';
 import { ClinicConcurrencyGuard } from './clinic-concurrency-guard';
+import { isDoctoraliaCircuitOpenError } from '../integrations/doctoralia-circuit-breaker';
 import { randomUUID } from 'crypto';
 
 const POLL_BASE_INTERVAL_MS = 30 * 1000;
@@ -308,19 +309,25 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
 
             await runWithDoctoraliaContext({ origin: 'RECONCILIATION', clinicId: conn.clinicId, reconciliationSubtype: 'reconcileUnlinkedWithDoctoralia', pollExecutionId }, () =>
                 this.reconcileUnlinkedWithDoctoralia(conn.clinicId).catch(err =>
-                    this.logger.warn(`[RECONCILE] Error: ${err.message}`),
+                    isDoctoraliaCircuitOpenError(err)
+                        ? this.logger.debug(`[RECONCILE] Skip — circuito Doctoralia aberto (${err.message})`)
+                        : this.logger.warn(`[RECONCILE] Error: ${err.message}`),
                 ),
             );
 
             await runWithDoctoraliaContext({ origin: 'RECONCILIATION', clinicId: conn.clinicId, reconciliationSubtype: 'reconcileCancelledOnDoctoralia', pollExecutionId }, () =>
                 this.reconcileCancelledOnDoctoralia(conn.clinicId).catch(err =>
-                    this.logger.warn(`[RECONCILE-CANCEL] Error: ${err.message}`),
+                    isDoctoraliaCircuitOpenError(err)
+                        ? this.logger.debug(`[RECONCILE-CANCEL] Skip — circuito Doctoralia aberto (${err.message})`)
+                        : this.logger.warn(`[RECONCILE-CANCEL] Error: ${err.message}`),
                 ),
             );
 
             await runWithDoctoraliaContext({ origin: 'RECONCILIATION', clinicId: conn.clinicId, reconciliationSubtype: 'reconcileBookedWithoutVismedId', pollExecutionId }, () =>
                 this.reconcileBookedWithoutVismedId(conn.clinicId).catch(err =>
-                    this.logger.warn(`[RECONCILE-NO-VISMED-ID] Error: ${err.message}`),
+                    isDoctoraliaCircuitOpenError(err)
+                        ? this.logger.debug(`[RECONCILE-NO-VISMED-ID] Skip — circuito Doctoralia aberto (${err.message})`)
+                        : this.logger.warn(`[RECONCILE-NO-VISMED-ID] Error: ${err.message}`),
                 ),
             );
         } catch (err: any) {
@@ -2388,7 +2395,13 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 await this.queueService.enqueueBatch(jobs);
             }
         } catch (err: any) {
-            this.logger.warn(`[POLL] Error polling clinic ${conn.clinicId}: ${err.message}`);
+            // WP-08A: circuito Doctoralia aberto → skip controlado do ciclo, sem marcar
+            // a integração error/disconnected; alerta único na transição para OPEN.
+            if (isDoctoraliaCircuitOpenError(err)) {
+                this.logger.debug(`[POLL] Ciclo pulado — circuito Doctoralia aberto (${err.message})`);
+            } else {
+                this.logger.warn(`[POLL] Error polling clinic ${conn.clinicId}: ${err.message}`);
+            }
         }
         }); // end runWithDoctoraliaContext(POLLING)
         } finally {

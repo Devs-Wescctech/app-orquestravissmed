@@ -16,6 +16,8 @@ import { AppointmentsModule } from './appointments/appointments.module';
 import { BookingsModule } from './bookings/bookings.module';
 import { SettingsModule } from './settings/settings.module';
 import { MetricsModule } from './metrics/metrics.module';
+import { APP_FILTER } from '@nestjs/core';
+import { DoctoraliaCircuitOpenFilter } from './integrations/doctoralia-circuit-open.filter';
 
 @Module({
   imports: [
@@ -48,6 +50,10 @@ import { MetricsModule } from './metrics/metrics.module';
     MetricsModule,
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [
+    AppService,
+    // WP-08A: fast-fail do circuito Doctoralia vira 503 amigável na UI.
+    { provide: APP_FILTER, useClass: DoctoraliaCircuitOpenFilter },
+  ],
 })
 export class AppModule { }

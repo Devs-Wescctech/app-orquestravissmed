@@ -6,6 +6,7 @@ import { getDoctoraliaMetricsService } from '../metrics/doctoralia-metrics.servi
 import { getDoctoraliaContext } from '../metrics/doctoralia-call-context';
 import { randomUUID } from 'crypto';
 import { decideRetry, MAX_HTTP_ATTEMPTS } from './docplanner-retry.policy';
+import { DoctoraliaCircuitBreaker, isWafChallenge } from './doctoralia-circuit-breaker';
 
 interface CachedToken {
     token: string;
@@ -327,6 +328,11 @@ export class DocplannerClient {
     async authenticate(clientId: string, clientSecret: string): Promise<string> {
         this.clientId = clientId;
         this.clientSecret = clientSecret;
+        // WP-08A: registra esta conexão como executora da probe de recuperação
+        // (getFacilities — leitura pura, payload pequeno, sem efeito colateral).
+        // Se nenhuma conexão registrar, a primeira request real após o cooldown
+        // atua como probe (fallback).
+        this.getCircuitBreaker().setProbeRunner(() => this.getFacilities());
         this.authPromise = this.getToken(false);
         return this.authPromise;
     }
@@ -482,6 +488,13 @@ export class DocplannerClient {
             this.logger.error(
                 `[AUTH-DIAG] Falha OAuth ${response.status} em ${url} | ip_saida=${egressIp} | ${diag} | corpo(200c)=${errorText.slice(0, 200).replace(/\s+/g, ' ')}`,
             );
+            // WP-08A: challenge/WAF no fluxo OAuth (405 + página de captcha) abre o
+            // circuito do host IMEDIATAMENTE, sem esperar threshold.
+            if (isWafChallenge(response.status, errorText)) {
+                try {
+                    DoctoraliaCircuitBreaker.forDomain(domain).tripWafChallenge();
+                } catch (_e) { /* fail-safe */ }
+            }
             throw new Error(`Failed to authenticate with Docplanner: ${response.status} ${errorText}`);
         }
 
@@ -525,7 +538,35 @@ export class DocplannerClient {
         }
     }
 
+    /** WP-08A: breaker chaveado pelo host normalizado desta conexão. */
+    private getCircuitBreaker(): DoctoraliaCircuitBreaker {
+        return DoctoraliaCircuitBreaker.forDomain(this.getBaseUrl().replace(/^https?:\/\//, ''));
+    }
+
+    /**
+     * WP-08A: envolve a operação lógica (voo WP-05 completo, com retries WP-07
+     * dentro) na contabilidade do breaker: 1 sucesso ou 1 falha por operação —
+     * nunca por tentativa interna. Awaiters do dedup compartilham o resultado.
+     */
+    private async executeWithBreaker(
+        breaker: DoctoraliaCircuitBreaker,
+        gate: { isProbe: boolean },
+        method: string,
+        path: string,
+        data?: any,
+    ): Promise<any> {
+        try {
+            const result = await this.executeWithRetry(method, path, data);
+            breaker.recordSuccess(gate);
+            return result;
+        } catch (err: any) {
+            breaker.recordFailure(err, gate);
+            throw err;
+        }
+    }
+
     private async request(method: string, path: string, data?: any, isRetry = false): Promise<any> {
+        const breaker = this.getCircuitBreaker();
         // WP-05: dedup APENAS para GET, excluindo GET_NOTIFICATIONS (stream consumível).
         // Mutações (POST/PUT/PATCH/DELETE) e OAuth ficam explicitamente fora.
         // O join acontece AQUI, ANTES de acquireRateSlot — o segundo chamador não
@@ -535,21 +576,28 @@ export class DocplannerClient {
             const key = `${domain}|${this.clientId ?? ''}|${method}|${path}`;
             const existing = DocplannerClient.inflightGets.get(key);
             if (existing) {
+                // Voo iniciado ANTES de o circuito abrir completa normalmente; o join
+                // não cria voo novo nem consome slot — awaiters compartilham o mesmo
+                // resultado/erro e o único incremento do breaker feito pelo voo.
                 this.logger.debug(`[DEDUP] GET idêntico já em voo — juntando-se à requisição existente: ${path}`);
                 try {
                     getDoctoraliaMetricsService()?.recordDedupedGet();
                 } catch (_e) { /* fail-safe */ }
                 return DocplannerClient.cloneResult(await existing);
             }
+            // WP-08A: checagem do breaker ANTES de criar voo novo (fast-fail em OPEN).
+            const gate = breaker.beginRequest();
             // WP-07: o loop de retry roda DENTRO do voo único — awaiters compartilham
             // uma única sequência de tentativas.
-            const flight = this.executeWithRetry(method, path, data).finally(() => {
+            const flight = this.executeWithBreaker(breaker, gate, method, path, data).finally(() => {
                 DocplannerClient.inflightGets.delete(key);
             });
             DocplannerClient.inflightGets.set(key, flight);
             return DocplannerClient.cloneResult(await flight);
         }
-        return this.executeWithRetry(method, path, data);
+        // WP-08A: checagem também para WRITEs e GET_NOTIFICATIONS — antes do rate limiter.
+        const gate = breaker.beginRequest();
+        return this.executeWithBreaker(breaker, gate, method, path, data);
     }
 
     /** Espera assíncrona (isolada em método estático para ser espiável em testes). */

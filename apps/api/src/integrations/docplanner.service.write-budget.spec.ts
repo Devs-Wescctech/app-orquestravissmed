@@ -7,6 +7,7 @@
 
 import { ConfigService } from '@nestjs/config';
 import { DocplannerClient } from './docplanner.service';
+import { DoctoraliaCircuitBreaker } from './doctoralia-circuit-breaker';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -63,6 +64,7 @@ function resetStatics() {
     (DocplannerClient as any).pumping = false;
     (DocplannerClient as any).consecutiveHighGrants = 0;
     (DocplannerClient as any).lastThrottleLogAt = 0;
+    DoctoraliaCircuitBreaker.resetAll();
     (DocplannerClient as any).lastWriteThrottleLogAt = 0;
     // Garante que nenhum wakeupFn pendente de um teste anterior vaze para o próximo
     (DocplannerClient as any).wakeupFn = null;

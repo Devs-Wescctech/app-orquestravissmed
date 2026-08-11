@@ -6,6 +6,7 @@ import { RateLimiterService } from './rate-limiter.service';
 import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 import { getDoctoraliaMetricsService, concurrencyActorOf } from '../metrics/doctoralia-metrics.service';
 import { ClinicConcurrencyGuard } from './clinic-concurrency-guard';
+import { isDoctoraliaCircuitOpenError } from '../integrations/doctoralia-circuit-breaker';
 
 /**
  * Rede de segurança para agendamentos Doctoralia perdidos.
@@ -342,6 +343,14 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
                     });
                 }
             } catch (err: any) {
+                // WP-08A: circuito Doctoralia aberto → skip controlado do RESTANTE do ciclo
+                // (mesma semântica do SKIP do ClinicConcurrencyGuard). Não marca a
+                // integração como error/disconnected; o alerta único vive na transição
+                // para OPEN dentro do breaker — aqui apenas debug, não por par.
+                if (isDoctoraliaCircuitOpenError(err)) {
+                    this.logger.debug(`[SAFETY-SWEEP] Ciclo interrompido — circuito Doctoralia aberto (${err.message})`);
+                    break;
+                }
                 this.logger.warn(
                     `[SAFETY-SWEEP] Falha ao buscar bookings (facility=${pair.facilityId}, doctor=${pair.doctorId}, address=${pair.addressId}): ${err?.message}`,
                 );

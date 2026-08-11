@@ -7,6 +7,7 @@
 
 import { ConfigService } from '@nestjs/config';
 import { DocplannerClient } from './docplanner.service';
+import { DoctoraliaCircuitBreaker } from './doctoralia-circuit-breaker';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -61,6 +62,7 @@ beforeEach(() => {
     (DocplannerClient as any).pumping = false;
     (DocplannerClient as any).consecutiveHighGrants = 0;
     (DocplannerClient as any).lastThrottleLogAt = 0;
+    DoctoraliaCircuitBreaker.resetAll();
 
     acquireSpy = jest.spyOn(DocplannerClient as any, 'acquireRateSlot').mockResolvedValue(undefined);
 });

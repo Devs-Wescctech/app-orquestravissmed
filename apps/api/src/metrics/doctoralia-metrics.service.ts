@@ -322,6 +322,8 @@ export class DoctoraliaMetricsService {
                 retryAfterWaits: 0,
                 retryAfterWaitMsTotal: 0,
             };
+            // WP-08A
+            this.circuitStats.clear();
             this.startedAt = Date.now();
         } catch (err: any) {
             this.logger.warn(`[METRICS] reset() error: ${err?.message}`);
@@ -396,6 +398,85 @@ export class DoctoraliaMetricsService {
             ...this.transientRetryStats,
             byClassification: { ...this.transientRetryStats.byClassification },
         };
+    }
+
+    // ────────────────── WP-08A: Circuit breaker Doctoralia ──────────────────
+
+    private circuitStats = new Map<string, {
+        domain: string;
+        state: string;
+        openReason: string | null;
+        cooldownMs: number | null;
+        consecutiveFailures: number;
+        transitions: Record<string, number>;
+        fastFails: number;
+        probesStarted: number;
+        probesSucceeded: number;
+        probesFailed: number;
+        lastTransitionAt: string | null;
+        lastSnapshot: Record<string, any> | null;
+    }>();
+
+    private circuitEntry(domain: string) {
+        let e = this.circuitStats.get(domain);
+        if (!e) {
+            e = {
+                domain, state: 'CLOSED', openReason: null, cooldownMs: null,
+                consecutiveFailures: 0, transitions: {}, fastFails: 0,
+                probesStarted: 0, probesSucceeded: 0, probesFailed: 0,
+                lastTransitionAt: null, lastSnapshot: null,
+            };
+            this.circuitStats.set(domain, e);
+        }
+        return e;
+    }
+
+    /** Transição de estado do breaker (CLOSED→OPEN, OPEN→HALF_OPEN, ...). */
+    recordCircuitTransition(domain: string, from: string, to: string, reason: string, snapshot?: Record<string, any>): void {
+        try {
+            const e = this.circuitEntry(domain);
+            const key = `${from}->${to}`;
+            e.transitions[key] = (e.transitions[key] ?? 0) + 1;
+            e.state = to;
+            e.openReason = to === 'OPEN' ? reason : (to === 'CLOSED' ? null : e.openReason);
+            e.lastTransitionAt = new Date().toISOString();
+            if (snapshot) {
+                e.lastSnapshot = snapshot;
+                e.cooldownMs = snapshot.cooldownMs ?? e.cooldownMs;
+                e.consecutiveFailures = snapshot.consecutiveFailures ?? e.consecutiveFailures;
+            }
+        } catch (err: any) {
+            this.logger.debug(`[METRICS] recordCircuitTransition() error (non-fatal): ${err?.message}`);
+        }
+    }
+
+    /** Fast-fail por circuito aberto (nenhum slot/voo/retry consumido). */
+    recordCircuitFastFail(domain: string): void {
+        try {
+            this.circuitEntry(domain).fastFails++;
+        } catch (err: any) {
+            this.logger.debug(`[METRICS] recordCircuitFastFail() error (non-fatal): ${err?.message}`);
+        }
+    }
+
+    /** Probe HALF_OPEN: iniciada / sucesso / falha. */
+    recordCircuitProbe(domain: string, outcome: 'started' | 'success' | 'failure'): void {
+        try {
+            const e = this.circuitEntry(domain);
+            if (outcome === 'started') e.probesStarted++;
+            else if (outcome === 'success') e.probesSucceeded++;
+            else e.probesFailed++;
+        } catch (err: any) {
+            this.logger.debug(`[METRICS] recordCircuitProbe() error (non-fatal): ${err?.message}`);
+        }
+    }
+
+    getCircuitStats(): Record<string, any> {
+        const byDomain: Record<string, any> = {};
+        for (const [domain, e] of this.circuitStats) {
+            byDomain[domain] = { ...e, transitions: { ...e.transitions } };
+        }
+        return { byDomain };
     }
 
     // ────────────────── Poll tracking ───────────────────────────────────────
@@ -747,6 +828,9 @@ export class DoctoraliaMetricsService {
             dedup: {
                 DOCTORALIA_DEDUPED_GET_COUNT: this.dedupedGetCount,
             },
+            // WP-08A: circuit breaker Doctoralia (estado por domain, transições,
+            // fast-fails, probes). Seção aditiva.
+            circuitBreaker: this.getCircuitStats(),
             // Budget WRITE (PUT/POST/PATCH/DELETE): limites oficiais Doctoralia.
             // Seção aditiva — não altera campos existentes; só presente quando o client
             // tiver emitido ao menos um snapshot com dados de WRITE.

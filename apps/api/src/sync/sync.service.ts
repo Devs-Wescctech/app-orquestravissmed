@@ -10,6 +10,7 @@ import { PushSyncService } from './push-sync.service';
 import { getDoctoraliaContext, runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 import { ClinicConcurrencyGuard } from '../bookings/clinic-concurrency-guard';
 import { getDoctoraliaMetricsService, concurrencyActorOf } from '../metrics/doctoralia-metrics.service';
+import { isDoctoraliaCircuitOpenError } from '../integrations/doctoralia-circuit-breaker';
 
 @Injectable()
 export class SyncService {
@@ -754,6 +755,17 @@ export class SyncService {
             await this.completeSyncRun(syncRunId, totalProcessed);
             this.logger.log(`[DIRECT] Doctoralia sync completed: ${totalProcessed} records.`);
         } catch (e) {
+            // WP-08A: circuito Doctoralia aberto → finaliza o run como SKIPPED explícito
+            // (não é falha da clínica; a próxima janela do scheduler cobre). Nunca
+            // altera o status da integração.
+            if (isDoctoraliaCircuitOpenError(e)) {
+                this.logger.log(`[DIRECT] Doctoralia sync pulado — circuito aberto (${e.message})`);
+                await this.prisma.syncRun.update({
+                    where: { id: syncRunId },
+                    data: { status: 'skipped', endedAt: new Date(), metrics: { skipReason: 'DOCTORALIA_CIRCUIT_OPEN', error: e.message } }
+                });
+                return;
+            }
             this.logger.error(`[DIRECT] Doctoralia sync failed: ${e.message}`, e.stack);
             await this.prisma.syncRun.update({
                 where: { id: syncRunId },

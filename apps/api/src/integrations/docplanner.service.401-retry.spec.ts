@@ -16,6 +16,7 @@
 
 import { ConfigService } from '@nestjs/config';
 import { DocplannerClient } from './docplanner.service';
+import { DoctoraliaCircuitBreaker } from './doctoralia-circuit-breaker';
 
 // ---------------------------------------------------------------------------
 // Helpers de resposta mock
