@@ -65,3 +65,4 @@ _agent/
 # Misc
 temp/
 tmp/
+apps/api/load-test/.runtime/
