@@ -51,6 +51,12 @@ const PROFILES = {
 
 const SCENARIOS = {
     a: { name: 'a', clinics: 2, globalSyncWindows: 2, description: 'Baseline: 2 clínicas, ≥2 janelas de global sync + polling/sweep/slot' },
+    // WP-12B — mesma estrutura do Cenário A (janelas de global sync + polling/
+    // sweep/slot), apenas parametrizando a escala de clínicas. 50 é marco de
+    // teste, não limite arquitetural.
+    b: { name: 'b', clinics: 10, globalSyncWindows: 2, description: 'Escala B: 10 clínicas, mesma estrutura do baseline A' },
+    c: { name: 'c', clinics: 20, globalSyncWindows: 2, description: 'Escala C: 20 clínicas, mesma estrutura do baseline A' },
+    d: { name: 'd', clinics: 50, globalSyncWindows: 2, description: 'Escala D: 50 clínicas, mesma estrutura do baseline A (marco de teste, não limite)' },
 };
 
 module.exports = { PROFILES, SCENARIOS };

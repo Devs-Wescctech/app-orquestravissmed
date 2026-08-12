@@ -19,6 +19,7 @@
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
     "test:e2e": "jest --config ./test/jest-e2e.json",
     "load:test": "node load-test/runner.js",
+    "load:scale": "node load-test/run-scale.js",
     "load:test:spec": "node --test load-test/tests/"
   },
   "dependencies": {

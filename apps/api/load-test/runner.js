@@ -25,6 +25,7 @@ const { seedDatabase, readConnections, readSyncRuns } = require('./lib/seed');
 const { assertAllGuards, assertSafeDatabaseUrl } = require('./lib/guards');
 const { Collector } = require('./lib/collector');
 const { buildReport, renderMarkdown } = require('./lib/report');
+const { findBaselineReport, loadBaseline, compareWithBaseline } = require('./lib/baseline-compare');
 
 const API_DIR = path.join(__dirname, '..');
 const RUNTIME_DIR = path.join(__dirname, '.runtime');
@@ -36,7 +37,7 @@ const API_BASE = `http://127.0.0.1:${API_PORT}`;
 const TLS_APPROACH = 'NODE_EXTRA_CA_CERTS apontando para o cert de teste no env do processo filho (abordagem preferida do plano; validação TLS permanece ativa)';
 
 function parseArgs(argv) {
-    const args = { scenario: 'a', profile: 'medium', seed: 'wp12a-baseline', skipBuild: false };
+    const args = { scenario: 'a', profile: 'medium', seed: 'wp12a-baseline', skipBuild: false, baseline: null };
     for (const a of argv.slice(2)) {
         const m = a.match(/^--([a-z-]+)(?:=(.*))?$/);
         if (!m) continue;
@@ -44,6 +45,7 @@ function parseArgs(argv) {
         if (m[1] === 'profile') args.profile = m[2];
         if (m[1] === 'seed') args.seed = m[2];
         if (m[1] === 'skip-build') args.skipBuild = true;
+        if (m[1] === 'baseline') args.baseline = m[2]; // caminho do JSON do baseline A (12B)
     }
     if (!SCENARIOS[args.scenario]) throw new Error(`Cenário desconhecido: ${args.scenario} (disponíveis: ${Object.keys(SCENARIOS)})`);
     if (!PROFILES[args.profile]) throw new Error(`Perfil desconhecido: ${args.profile} (disponíveis: ${Object.keys(PROFILES)})`);
@@ -94,9 +96,34 @@ async function main() {
     let collector = null;
     let exitCode = 1;
 
+    let cleanExit = null; // WP-12B: resultado do shutdown gracioso (medido antes do relatório)
+
+    // Shutdown gracioso e MEDIDO da API: SIGTERM e espera; se não sair no prazo,
+    // há Promise/timer órfão segurando o processo → SIGKILL e cleanExit=false.
+    const shutdownApi = async (timeoutMs = 10_000) => {
+        if (!apiProc || apiProc.exitCode !== null) {
+            return { clean: false, exitCode: apiProc?.exitCode ?? null, signal: null, waitedMs: 0, note: 'API já estava morta antes do shutdown' };
+        }
+        const t0 = Date.now();
+        apiProc.kill('SIGTERM');
+        const exited = await Promise.race([
+            new Promise(r => apiProc.once('exit', (code, signal) => r({ code, signal }))),
+            sleep(timeoutMs).then(() => null),
+        ]);
+        const waitedMs = Date.now() - t0;
+        if (!exited) {
+            apiProc.kill('SIGKILL');
+            await Promise.race([new Promise(r => apiProc.once('exit', r)), sleep(5000)]);
+            return { clean: false, exitCode: null, signal: 'SIGKILL', waitedMs, note: 'não encerrou com SIGTERM no prazo — Promise/timer órfão provável' };
+        }
+        // Saída via SIGTERM (signal SIGTERM com code null) ou exit 0 = encerramento limpo.
+        const clean = exited.code === 0 || exited.signal === 'SIGTERM';
+        return { clean, exitCode: exited.code, signal: exited.signal, waitedMs };
+    };
+
     const teardown = async () => {
         try { if (collector) await collector.stop(); } catch { }
-        if (apiProc && !apiProc.killed) {
+        if (apiProc && !apiProc.killed && apiProc.exitCode === null) {
             apiProc.kill('SIGTERM');
             await Promise.race([new Promise(r => apiProc.once('exit', r)), sleep(8000)]);
             if (apiProc.exitCode === null) apiProc.kill('SIGKILL');
@@ -105,6 +132,56 @@ async function main() {
         try { if (visMock) await visMock.stop(); } catch { }
         db.destroy();
         log('Teardown concluído (API parada, mocks fechados, cluster Postgres destruído).');
+    };
+
+    // WP-12B: comparação com o baseline A (para cenários != a).
+    const buildBaselineComparison = (report) => {
+        if (args.scenario === 'a') return null;
+        const baselinePath = args.baseline || findBaselineReport(REPORT_DIR, { scenario: 'a', profile: args.profile });
+        if (!baselinePath || !fs.existsSync(baselinePath)) {
+            notes.push(`Baseline A (JSON) não encontrado em ${REPORT_DIR} — comparação com baseline omitida.`);
+            return null;
+        }
+        try {
+            return compareWithBaseline(report, loadBaseline(baselinePath), baselinePath);
+        } catch (e) {
+            notes.push(`Falha ao comparar com baseline A (${baselinePath}): ${e.message}`);
+            return null;
+        }
+    };
+
+    // Persistência imediata do relatório (completo ou parcial) — nunca sobrescreve
+    // anteriores (timestamp no nome) e grava assim que o cenário termina.
+    const persistReport = ({ syncRuns = [], partial = false, interruptionReason = null } = {}) => {
+        const endedAt = new Date().toISOString();
+        const emptyLog = (name) => ({
+            summary: () => ({ mock: name, totalCalls: 0, reads: 0, writes: 0, duplicateWrites: [], unmatchedPaths: [], byPathClass: {} }),
+            budgetAudit: () => ({ peakAgg5min: 0, limitAgg5min: 400, aggOk: true, peakWrites1min: 0, limitWrites1min: 40, writesMinOk: true, peakWrites1h: 0, limitWrites1h: 2400, writesHourOk: true }),
+        });
+        const { report, passed } = buildReport({
+            scenario: args.scenario, profile: args.profile, seed: args.seed,
+            startedAt, endedAt,
+            docLog: docMock?.log ?? emptyLog('doctoralia'),
+            visLog: visMock?.log ?? emptyLog('vismed'),
+            baselineSnapshots: collector?.baselineSnapshots ?? [],
+            processSamples: collector?.processSamples ?? [],
+            pgSamples: collector?.pgSamples ?? [],
+            lagSamples: collector?.readLagSamples?.() ?? [],
+            syncRuns, actions, notes, tlsApproach: TLS_APPROACH,
+            expected: { clinicIds: dataset.clinics.map(c => c.id), windows: scenario.globalSyncWindows },
+            statStatementsUnavailable: db.statStatementsUnavailable,
+            cleanExit, partial, interruptionReason,
+        });
+        report.baselineComparison = buildBaselineComparison(report);
+        const stamp = endedAt.replace(/[:.]/g, '-');
+        const suffix = partial ? '-PARTIAL' : '';
+        const jsonPath = path.join(REPORT_DIR, `scenario-${args.scenario}-${args.profile}-${stamp}${suffix}.json`);
+        const mdPath = path.join(REPORT_DIR, `scenario-${args.scenario}-${args.profile}-${stamp}${suffix}.md`);
+        fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2));
+        fs.writeFileSync(mdPath, renderMarkdown(report));
+        log(`Relatório${partial ? ' PARCIAL' : ''}: ${jsonPath}`);
+        log(`Resumo:    ${mdPath}`);
+        return { report, passed, jsonPath, mdPath };
     };
 
     try {
@@ -196,7 +273,9 @@ async function main() {
             return r;
         };
 
-        const waitForRuns = async (label, timeoutMs = 300_000) => {
+        // Timeouts escalam com o número de clínicas (D=50 leva mais tempo que A=2).
+        const runsTimeoutMs = 300_000 + scenario.clinics * 10_000;
+        const waitForRuns = async (label, timeoutMs = runsTimeoutMs) => {
             const t0 = Date.now();
             while (Date.now() - t0 < timeoutMs) {
                 const runs = await readSyncRuns(db.url);
@@ -218,24 +297,35 @@ async function main() {
                 await act(`poll VisMed ${c.id} (janela ${w})`, 'POST', `/booking-sync/poll-vismed?clinicId=${c.id}`);
             }
             await act(`safety-sweep (janela ${w})`, 'POST', '/booking-sync/safety-sweep');
-            for (const c of dataset.clinics) {
-                // slot sync pode colidir com o guard de concorrência → retry curto,
-                // mas TEM de suceder em alguma tentativa (senão o harness falha).
-                let slotOk = false;
-                for (let attempt = 1; attempt <= 3; attempt++) {
-                    const r = await act(`slot-sync ${c.id} (janela ${w}, tentativa ${attempt})`, 'POST', `/sync/${c.id}/slots`, undefined, { tolerate: true });
-                    if (r.status < 400) { slotOk = true; break; }
-                    await sleep(5000);
+            // slot sync pode colidir com o guard de concorrência (HTTP 409 é o
+            // guard funcionando, não erro): os pollers em background podem segurar
+            // o guard de uma clínica por minutos em escala. Round-robin: tenta
+            // TODAS as clínicas pendentes por rodada (uma clínica ocupada não
+            // serializa as demais), com deadline global que escala com a carga.
+            {
+                const pending = new Set(dataset.clinics.map(c => c.id));
+                const slotDeadlineMs = 300_000 + scenario.clinics * 20_000;
+                const slotT0 = Date.now();
+                let round = 0;
+                while (pending.size && Date.now() - slotT0 < slotDeadlineMs) {
+                    round++;
+                    for (const id of [...pending]) {
+                        const r = await act(`slot-sync ${id} (janela ${w}, rodada ${round})`, 'POST', `/sync/${id}/slots`, undefined, { tolerate: true });
+                        if (r.status < 400) pending.delete(id);
+                        else if (r.status !== 409) throw new Error(`slot-sync ${id} (janela ${w}) falhou com HTTP ${r.status} (não é colisão do guard)`);
+                    }
+                    if (pending.size) await sleep(5000);
                 }
-                if (!slotOk) throw new Error(`slot-sync ${c.id} (janela ${w}) falhou nas 3 tentativas`);
+                if (pending.size) throw new Error(`slot-sync não conseguiu executar para ${pending.size} clínica(s) em ${Math.round(slotDeadlineMs / 1000)}s (guard ocupado além do deadline): ${[...pending].join(', ')}`);
             }
             await waitForRuns(`pós-janela ${w}`);
         }
 
         // ── Drenagem final ───────────────────────────────────────────────────
-        log('Aguardando drenagem final das filas (até 120s)...');
+        const drainMaxMs = 120_000 + scenario.clinics * 5_000;
+        log(`Aguardando drenagem final das filas (até ${Math.round(drainMaxMs / 1000)}s)...`);
         const drainT0 = Date.now();
-        while (Date.now() - drainT0 < 120_000) {
+        while (Date.now() - drainT0 < drainMaxMs) {
             await sleep(5000);
             const snap = collector.baselineSnapshots[collector.baselineSnapshots.length - 1];
             const q = snap?.baseline?.queue ?? {};
@@ -246,30 +336,33 @@ async function main() {
         }
         await collector.stop();
 
-        // ── Relatório ────────────────────────────────────────────────────────
-        const endedAt = new Date().toISOString();
+        // ── Shutdown gracioso MEDIDO (check de Promise/timer órfão) ─────────
         const syncRuns = await readSyncRuns(db.url);
-        const { report, passed } = buildReport({
-            scenario: args.scenario, profile: args.profile, seed: args.seed,
-            startedAt, endedAt,
-            docLog: docMock.log, visLog: visMock.log,
-            baselineSnapshots: collector.baselineSnapshots,
-            processSamples: collector.processSamples,
-            pgSamples: collector.pgSamples,
-            lagSamples: collector.readLagSamples(),
-            syncRuns, actions, notes, tlsApproach: TLS_APPROACH,
-            expected: { clinicIds: dataset.clinics.map(c => c.id), windows: scenario.globalSyncWindows },
-            statStatementsUnavailable: db.statStatementsUnavailable,
-        });
-        const stamp = endedAt.replace(/[:.]/g, '-');
-        const jsonPath = path.join(REPORT_DIR, `scenario-${args.scenario}-${args.profile}-${stamp}.json`);
-        const mdPath = path.join(REPORT_DIR, `scenario-${args.scenario}-${args.profile}-${stamp}.md`);
-        fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2));
-        fs.writeFileSync(mdPath, renderMarkdown(report));
-        log(`Relatório: ${jsonPath}`);
-        log(`Resumo:    ${mdPath}`);
+        log('Encerrando a API com SIGTERM (medindo encerramento limpo)...');
+        cleanExit = await shutdownApi();
+        log(`Shutdown: clean=${cleanExit.clean} exit=${cleanExit.exitCode ?? cleanExit.signal} em ${cleanExit.waitedMs}ms`);
+
+        // ── Relatório (persistido imediatamente ao término do cenário) ──────
+        const { report, passed } = persistReport({ syncRuns });
         console.log('\n' + renderMarkdown(report));
         exitCode = passed ? 0 : 2;
+    } catch (err) {
+        // Falha/interrupção: gerar relatório PARCIAL se houver dados suficientes,
+        // registrando o motivo. Relatórios anteriores nunca são apagados.
+        console.error(`[RUNNER] FALHA: ${err.message}`);
+        try {
+            const hasData = actions.length > 0 || (collector?.baselineSnapshots?.length ?? 0) > 0;
+            if (hasData) {
+                let syncRuns = [];
+                try { syncRuns = await readSyncRuns(db.url); } catch { }
+                persistReport({ syncRuns, partial: true, interruptionReason: err.message });
+            } else {
+                log('Sem dados suficientes para relatório parcial — nenhum relatório gravado.');
+            }
+        } catch (e2) {
+            console.error(`[RUNNER] Falha ao gravar relatório parcial: ${e2.message}`);
+        }
+        exitCode = 1;
     } finally {
         await teardown();
     }

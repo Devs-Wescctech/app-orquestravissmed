@@ -33,6 +33,7 @@ function baseInput(overrides = {}) {
         ],
         actions: [], notes: [], tlsApproach: 'NODE_EXTRA_CA_CERTS',
         expected: { clinicIds: ['c1'], windows: 1 },
+        cleanExit: { clean: true, exitCode: null, signal: 'SIGTERM', waitedMs: 500 },
         ...overrides,
     };
 }
@@ -40,7 +41,7 @@ function baseInput(overrides = {}) {
 test('cenário limpo passa em todos os critérios', () => {
     const { report, passed } = buildReport(baseInput());
     assert.ok(passed, JSON.stringify(report.criteria.filter(c => !c.pass)));
-    assert.strictEqual(report.criteria.length, 10);
+    assert.strictEqual(report.criteria.length, 14);
     assert.ok(renderMarkdown(report).includes('✅ PASS'));
 });
 
@@ -136,4 +137,49 @@ test('comparação mock vs baseline aparece no relatório', () => {
     assert.strictEqual(report.counterComparison.mockApiCalls, 1);
     assert.strictEqual(report.counterComparison.baselineApiCalls, 1);
     assert.strictEqual(report.counterComparison.apiDelta, 0);
+});
+
+// ── WP-12B: novos checks ────────────────────────────────────────────────────
+test('memória crescendo monotonicamente sem estabilizar reprova', () => {
+    const processSamples = Array.from({ length: 20 }, (_, i) => ({ ts: i, rssBytes: (100 + i * 20) * 1048576 }));
+    const { report, passed } = buildReport(baseInput({ processSamples }));
+    assert.ok(!passed);
+    assert.ok(!report.criteria.find(c => c.name.includes('RSS estabiliza')).pass);
+});
+
+test('memória que cresce e estabiliza (platô) passa', () => {
+    const processSamples = Array.from({ length: 20 }, (_, i) => ({ ts: i, rssBytes: (i < 10 ? 100 + i * 20 : 300) * 1048576 }));
+    const { report } = buildReport(baseInput({ processSamples }));
+    assert.ok(report.criteria.find(c => c.name.includes('RSS estabiliza')).pass);
+});
+
+test('QueueFull != 0 reprova, exceto justificado no cenário D', () => {
+    const snap = (qf) => [{
+        ts: 1, baseline: {
+            volume: { DOCTORALIA_API_REQUEST_COUNT: 1, DOCTORALIA_OAUTH_REQUEST_COUNT: 0 },
+            queue: { waitMs: { p50: 1, p95: 2, max: 100 }, DOCTORALIA_QUEUE_SIZE_HIGH: 0, DOCTORALIA_QUEUE_SIZE_LOW: 0, queueFull: qf },
+        },
+    }];
+    let r = buildReport(baseInput({ baselineSnapshots: snap(3) }));
+    assert.ok(!r.report.criteria.find(c => c.name.startsWith('QueueFull')).pass);
+    r = buildReport(baseInput({ scenario: 'd', baselineSnapshots: snap(3), queueJustification: 'saturação esperada no D' }));
+    assert.ok(r.report.criteria.find(c => c.name.startsWith('QueueFull')).pass);
+    r = buildReport(baseInput({ scenario: 'd', baselineSnapshots: snap(3) }));
+    assert.ok(!r.report.criteria.find(c => c.name.startsWith('QueueFull')).pass);
+});
+
+test('shutdown sujo (SIGKILL) reprova; sem dado reprova', () => {
+    let r = buildReport(baseInput({ cleanExit: { clean: false, signal: 'SIGKILL', waitedMs: 10000 } }));
+    assert.ok(!r.passed);
+    r = buildReport(baseInput({ cleanExit: null }));
+    assert.ok(!r.passed);
+});
+
+test('relatório parcial nunca é PASS e registra o motivo', () => {
+    const { report, passed } = buildReport(baseInput({ partial: true, interruptionReason: 'teste interrompido' }));
+    assert.ok(!passed);
+    assert.ok(report.partial);
+    const md = renderMarkdown(report);
+    assert.ok(md.includes('PARCIAL'));
+    assert.ok(md.includes('teste interrompido'));
 });

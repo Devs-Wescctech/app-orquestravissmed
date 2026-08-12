@@ -11,6 +11,35 @@ function pct(arr, p) {
 }
 
 /**
+ * Estabilização de memória (WP-12B): a série não pode crescer monotonicamente
+ * sem estabilizar. Heurística documentada (sem threshold de valor absoluto):
+ * descartado o warmup (primeiros 25% das amostras), a série FALHA somente se
+ * (a) for essencialmente monotônica (≥90% dos deltas não-negativos) E
+ * (b) o último quartil continuar crescendo ≥10% sobre o quartil anterior.
+ * Crescer e estabilizar (platô) passa; oscilar passa; poucas amostras (<8) é
+ * registrado como inconclusivo-mas-pass (limitação anotada no detalhe).
+ */
+function checkMemoryStabilization(series) {
+    const vals = series.filter(v => typeof v === 'number' && v > 0);
+    if (vals.length < 8) return { pass: true, detail: `apenas ${vals.length} amostras — inconclusivo (registrado como limitação)` };
+    const body = vals.slice(Math.floor(vals.length * 0.25)); // descarta warmup
+    let nonNeg = 0;
+    for (let i = 1; i < body.length; i++) if (body[i] >= body[i - 1]) nonNeg++;
+    const monoRatio = nonNeg / (body.length - 1);
+    const q = Math.max(1, Math.floor(body.length / 4));
+    const mean = a => a.reduce((s, v) => s + v, 0) / a.length;
+    const lastQ = mean(body.slice(-q));
+    const prevQ = mean(body.slice(-2 * q, -q));
+    const tailGrowth = prevQ > 0 ? (lastQ - prevQ) / prevQ : 0;
+    const monotonicNoPlateau = monoRatio >= 0.9 && tailGrowth >= 0.10;
+    return {
+        pass: !monotonicNoPlateau,
+        detail: `deltas não-negativos=${(monoRatio * 100).toFixed(0)}%, crescimento do último quartil=${(tailGrowth * 100).toFixed(1)}% (falha se ≥90% e ≥10%)`,
+        monoRatio, tailGrowth,
+    };
+}
+
+/**
  * @param {object} input — ver runner.js. Retorna { report, passed }.
  */
 function buildReport(input) {
@@ -19,6 +48,11 @@ function buildReport(input) {
         docLog, visLog, baselineSnapshots, processSamples, pgSamples, lagSamples,
         syncRuns, actions, notes = [], tlsApproach, statStatementsUnavailable,
         expected, // { clinicIds: string[], windows: number } — obrigatório p/ o critério de global sync
+        baselineComparison = null,   // WP-12B: comparação com o baseline A (cenários b/c/d)
+        cleanExit = null,            // WP-12B: { clean, exitCode, waitedMs } do shutdown gracioso da API
+        queueJustification = null,   // WP-12B: justificativa explícita p/ QueueFull/Timeout ≠ 0 no cenário D
+        partial = false,             // WP-12B: relatório parcial (execução interrompida)
+        interruptionReason = null,
     } = input;
     if (!expected || !Array.isArray(expected.clinicIds) || !expected.clinicIds.length || !(expected.windows >= 1)) {
         throw new Error('buildReport: "expected" ({clinicIds, windows}) é obrigatório e não pode ser vazio');
@@ -92,6 +126,12 @@ function buildReport(input) {
         c.runs.filter(r => r.type === 'full' && r.status === 'completed').length >= expected.windows &&
         c.runs.filter(r => r.type === 'vismed-full' && r.status === 'completed').length >= expected.windows);
 
+    // WP-12B: novos checks
+    const memRss = checkMemoryStabilization(rssSeries);
+    const memHeap = checkMemoryStabilization(heapSeries);
+    const queueOverflowOk = queueFull === 0 && queueTimeouts === 0;
+    const queueOverflowJustified = scenario === 'd' && !queueOverflowOk && !!queueJustification;
+
     const criteria = [
         { name: 'Baseline de métricas coletado com sucesso (snapshots válidos, último válido)', pass: baselineHealthy && validSnapshots.length > 0, detail: `${validSnapshots.length}/${baselineSnapshots.length} snapshots válidos` },
         { name: 'Nenhuma rota não-mapeada nos mocks', pass: unmatchedTotal === 0, detail: `${unmatchedTotal} rota(s): ${[...docSummary.unmatchedPaths, ...visSummary.unmatchedPaths].slice(0, 5).join('; ') || '—'}` },
@@ -103,12 +143,18 @@ function buildReport(input) {
         { name: 'Oldest waiter dentro dos deadlines (≤60s; timeouts=0; dado ausente reprova)', pass: oldestWaiterOk && queueTimeouts === 0, detail: `waitMs.max=${queueWait.max ?? 'SEM DADO'}, QueueTimeout=${queueTimeouts}` },
         { name: `Toda clínica completa full+vismed-full em ${expected.windows} janela(s) (0 failed, 0 preso)`, pass: failedRuns.length === 0 && stuckRuns.length === 0 && globalSyncComplete, detail: `failed=${failedRuns.length}, running=${stuckRuns.length}, clínicas esperadas=${clinicIds.length}` },
         { name: 'Reservas expiradas = 0 (exige baseline válido)', pass: baselineHealthy && expiredReservations === 0, detail: `expiradas=${expiredReservations}${baselineHealthy ? '' : ' (baseline inválido)'}` },
+        // WP-12B — novos checks
+        { name: 'Memória RSS estabiliza (sem crescimento monotônico)', pass: memRss.pass, detail: memRss.detail },
+        { name: 'Heap usado estabiliza (sem crescimento monotônico)', pass: memHeap.pass, detail: memHeap.detail },
+        { name: `QueueFull/QueueTimeout = 0${scenario === 'd' ? ' (ou justificado explicitamente no cenário D)' : ''}`, pass: queueOverflowOk || queueOverflowJustified, detail: `QueueFull=${queueFull}, QueueTimeout=${queueTimeouts}${queueOverflowJustified ? ` — JUSTIFICADO: ${queueJustification}` : ''}` },
+        { name: 'API encerra limpa (SIGTERM, sem Promise/timer órfão segurando o processo)', pass: cleanExit ? cleanExit.clean === true : false, detail: cleanExit ? `exit=${cleanExit.exitCode ?? cleanExit.signal ?? '?'} em ${cleanExit.waitedMs}ms${cleanExit.clean ? '' : ' (precisou de SIGKILL ou não saiu no prazo)'}` : 'SEM DADO (shutdown não medido — reprova)' },
     ];
-    const passed = criteria.every(c => c.pass);
+    const passed = criteria.every(c => c.pass) && !partial;
 
     const report = {
-        harness: 'WP-12A',
+        harness: 'WP-12A/12B',
         scenario, profile, seed,
+        partial, interruptionReason,
         startedAt, endedAt,
         durationMs: new Date(endedAt) - new Date(startedAt),
         tlsApproach,
@@ -126,6 +172,9 @@ function buildReport(input) {
         concurrencyGuard: finalBaseline.concurrencyGuard ?? null,
         writeBudget: finalBaseline.writeBudget ?? null,
         duplicatesReportedByApp: finalBaseline.duplicates ?? null,
+        baselineComparison,
+        cleanExit,
+        memoryStabilization: { rss: memRss, heap: memHeap },
         syncRuns: { perClinic, all: globalRuns },
         actions,
         process: {
@@ -178,9 +227,10 @@ function buildCounterComparison(docSummary, baseline) {
 
 function renderMarkdown(report) {
     const lines = [];
-    lines.push(`# Relatório de carga — WP-12A (cenário ${report.scenario}, perfil ${report.profile})`);
+    lines.push(`# Relatório de carga — ${report.harness} (cenário ${report.scenario}, perfil ${report.profile})${report.partial ? ' — ⚠️ PARCIAL' : ''}`);
     lines.push('');
-    lines.push(`- **Resultado:** ${report.passed ? '✅ PASS' : '❌ FAIL'}`);
+    lines.push(`- **Resultado:** ${report.passed ? '✅ PASS' : '❌ FAIL'}${report.partial ? ' (relatório PARCIAL — execução interrompida)' : ''}`);
+    if (report.interruptionReason) lines.push(`- **Motivo da interrupção:** ${report.interruptionReason}`);
     lines.push(`- Seed: \`${report.seed}\` · Duração: ${(report.durationMs / 1000).toFixed(1)}s · ${report.startedAt} → ${report.endedAt}`);
     lines.push(`- TLS: ${report.tlsApproach}`);
     lines.push('');
@@ -204,6 +254,19 @@ function renderMarkdown(report) {
     lines.push(`- API: mock=${cc.mockApiCalls}, baseline=${cc.baselineApiCalls}, Δ=${cc.apiDelta}`);
     lines.push(`- OAuth: mock=${cc.mockOauthCalls}, baseline=${cc.baselineOauthCalls}`);
     lines.push('');
+    if (report.baselineComparison) {
+        const bc = report.baselineComparison;
+        lines.push('## Comparação com o baseline A');
+        lines.push(`- Baseline: \`${bc.baselinePath}\` (cenário ${bc.baselineScenario}, ${bc.baselineEndedAt}) · fator de clínicas: ×${bc.clinicFactor}`);
+        lines.push('');
+        lines.push('| Métrica | Baseline A | Este cenário | Fator |');
+        lines.push('|---|---|---|---|');
+        for (const m of bc.metrics) lines.push(`| ${m.name} | ${m.baseline ?? '—'} | ${m.current ?? '—'} | ${m.factor != null ? `×${m.factor}` : '—'} |`);
+        lines.push('');
+        const g = bc.growth;
+        lines.push(`- **Crescimento relativo** (esperado ~×${g.clinicFactor} se linear): duração ×${g.durationFactor ?? '—'}, chamadas ×${g.callsFactor ?? '—'}, memória ×${g.memoryFactor ?? '—'}, pico de fila ×${g.queuePeakFactor ?? '—'}, espera p95 ×${g.waitP95Factor ?? '—'}`);
+        lines.push('');
+    }
     lines.push('## Filas');
     lines.push(`- waitMs p50=${report.queues.waitMs.p50 ?? '?'} p95=${report.queues.waitMs.p95 ?? '?'} max=${report.queues.waitMs.max ?? '?'} · QueueFull=${report.queues.queueFull} QueueTimeout=${report.queues.queueTimeouts}`);
     lines.push('');

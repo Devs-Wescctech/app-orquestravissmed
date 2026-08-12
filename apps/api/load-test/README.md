@@ -1,4 +1,4 @@
-# Harness de carga do módulo de sincronização (WP-12A)
+# Harness de carga do módulo de sincronização (WP-12A/12B)
 
 Pista de testes de carga local para o orquestrador Doctoralia↔VisMed. **Nenhuma linha
 de código produtivo é alterada**: mocks HTTPS locais, Postgres de teste efêmero,
@@ -13,6 +13,10 @@ npm run load:test -- --scenario=a --profile=medium          # Cenário A (baseli
 npm run load:test -- --scenario=a --profile=medium --seed=x # seed customizada
 npm run load:test -- --scenario=a --profile=medium --skip-build # reusa dist/ existente
 npm run load:test:spec                                      # testes do próprio harness
+npm run load:test -- --scenario=b --profile=medium          # WP-12B: 10 clínicas
+npm run load:test -- --scenario=c --profile=medium          # WP-12B: 20 clínicas
+npm run load:test -- --scenario=d --profile=medium          # WP-12B: 50 clínicas
+npm run load:scale                                          # WP-12B: B→C→D com regra de parada + sumário
 ```
 
 Saída: `load-test/reports/scenario-<cenário>-<perfil>-<timestamp>.{json,md}`.
@@ -92,8 +96,36 @@ Exit code: `0` = todos os critérios passaram, `2` = algum critério falhou, `1`
 - Notificações Doctoralia retornam vazias no Cenário A (o fluxo de criação de
   bookings é exercitado pelo sweep e pelo poll VisMed).
 
+## WP-12B — Testes de escala (10/20/50 clínicas)
+
+- **Cenários**: `b`=10, `c`=20, `d`=50 clínicas — mesma estrutura do Cenário A
+  (janelas de global sync + polling/sweep/slot), só a escala muda. 50 é marco de
+  teste, não limite arquitetural.
+- **Comparação com baseline A** (`lib/baseline-compare.js`): cada relatório de
+  B/C/D inclui a comparação métrica-a-métrica com o JSON versionado do Cenário A
+  mais recente (ou `--baseline=<path>`) e fatores de crescimento relativos
+  (razões atual/baseline; sem thresholds absolutos de latência).
+- **Novos checks pass/fail** (além dos do 12A):
+  - memória RSS/heap estabiliza — falha só se a série for essencialmente
+    monotônica (≥90% dos deltas não-negativos) E o último quartil crescer ≥10%
+    sobre o anterior (warmup de 25% descartado; <8 amostras = inconclusivo);
+  - `QueueFull`/`QueueTimeout` = 0 (no cenário D, ≠0 exige justificativa
+    explícita registrada no relatório);
+  - encerramento limpo: a API precisa sair com SIGTERM dentro do prazo — se
+    precisar de SIGKILL há Promise/timer órfão segurando o processo.
+- **Progressão B→C→D** (`run-scale.js` / `npm run load:scale`): executa em ordem,
+  cada relatório é persistido pelo runner assim que o cenário termina; regra de
+  parada — se um cenário falhar (exit ≠ 0), os seguintes NÃO executam; relatórios
+  anteriores nunca são apagados; falha/interrupção gera relatório PARCIAL com o
+  motivo; ao final grava `reports/scale-summary-*.{md,json}` (cenário mais alto
+  saudável, primeiro gargalo, fatores de crescimento).
+- **slot-sync em escala**: HTTP 409 é o concurrency guard funcionando; o runner
+  tenta em round-robin (uma clínica ocupada não serializa as demais) até um
+  deadline que escala com o nº de clínicas.
+- Timeouts de espera de SyncRuns e drenagem final também escalam com o nº de
+  clínicas.
+
 ## Roadmap
 
-- **WP-12B**: cenários de 10/20/50 clínicas + comparação automática com baseline.
 - **WP-12C**: soak 30min/1h/2h e bursts (restart/cache frio).
 - **WP-13**: injeção de falhas (429, 503, timeout, WAF) nos mocks.
