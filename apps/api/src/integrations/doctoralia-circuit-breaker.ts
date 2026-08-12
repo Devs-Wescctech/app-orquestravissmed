@@ -19,6 +19,7 @@
  */
 import { Logger } from '@nestjs/common';
 import { classifyFailure } from './docplanner-retry.policy';
+import { isDoctoraliaQueueError } from './doctoralia-queue.errors';
 import { getDoctoraliaMetricsService } from '../metrics/doctoralia-metrics.service';
 
 export type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
@@ -215,6 +216,14 @@ export class DoctoraliaCircuitBreaker {
      * - Não-transitória (400/401/403/404/409/422/negócio): NÃO alimenta o breaker.
      */
     recordFailure(err: any, gate: CircuitGate): void {
+        // WP-08B (CRÍTICO): saturação interna de fila (QueueFull/QueueTimeout)
+        // NUNCA alimenta o breaker — não incrementa falhas, não abre, não muda
+        // estado. Se era a probe, apenas libera o probeInFlight (o host nem foi
+        // consultado): a próxima request elegível volta a atuar como probe.
+        if (isDoctoraliaQueueError(err)) {
+            if (gate.isProbe) this.probeInFlight = false;
+            return;
+        }
         const waf = isWafChallenge(err?.status, err?.details ?? err?.message);
         if (waf) {
             this.settleProbe(gate, 'failure');

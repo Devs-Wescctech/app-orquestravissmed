@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { DocplannerService } from '../integrations/docplanner.service';
 import { VismedService } from '../integrations/vismed/vismed.service';
 import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
+import { isDoctoraliaQueueError } from '../integrations/doctoralia-queue.errors';
 
 @Injectable()
 export class ClinicsService {
@@ -153,7 +154,9 @@ export class ClinicsService {
         } catch (e: any) {
             // Não rebaixa uma conexão 'connected' em uso: uma falha momentânea no teste
             // (ex.: WAF da Doctoralia) não pode tirar a clínica do polling/varredura.
-            const demote = conn.status !== 'connected';
+            // WP-08B: erros de backpressure da fila (QueueFull/QueueTimeout) são
+            // saturação INTERNA — jamais rebaixam o status da integração.
+            const demote = conn.status !== 'connected' && !isDoctoraliaQueueError(e);
             await this.prisma.integrationConnection.update({
                 where: { id: conn.id },
                 data: { ...(demote ? { status: 'error' } : {}), lastTestAt: new Date() },

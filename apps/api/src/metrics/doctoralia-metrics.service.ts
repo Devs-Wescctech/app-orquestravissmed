@@ -153,6 +153,22 @@ export function concurrencyActorOf(subsystem: 'POLLING' | 'SAFETY_SWEEP' | 'GLOB
     return subsystem;
 }
 
+// ─────────── WP-08B: backpressure da fila HIGH/LOW do DocplannerClient ──────
+
+const MAX_QUEUE_WAIT_SAMPLES = 500;
+
+function emptyQueueBackpressureStats() {
+    const wait = () => ({ count: 0, totalMs: 0, samples: [] as number[] });
+    return {
+        rejectedFull: { HIGH: 0, LOW: 0 },
+        expired: { HIGH: 0, LOW: 0 },
+        current: { HIGH: 0, LOW: 0 },
+        peak: { HIGH: 0, LOW: 0 },
+        oldestWaiterAgeMs: { HIGH: 0, LOW: 0 },
+        waits: { HIGH: wait(), LOW: wait() },
+    };
+}
+
 // ──────────────────────────── Serviço ────────────────────────────────────────
 
 /** Singleton global acessível por DocplannerClient (não-NestJS) de forma fail-safe. */
@@ -191,6 +207,9 @@ export class DoctoraliaMetricsService {
 
     // WP-05: GETs que se juntaram a um voo idêntico já em andamento (dedup in-flight)
     private dedupedGetCount = 0;
+
+    // WP-08B: backpressure da fila HIGH/LOW do DocplannerClient
+    private queueBackpressureStats = emptyQueueBackpressureStats();
 
     // WP-07: contadores aditivos de retries transitórios do DocplannerClient
     private transientRetryStats = {
@@ -324,6 +343,8 @@ export class DoctoraliaMetricsService {
             };
             // WP-08A
             this.circuitStats.clear();
+            // WP-08B
+            this.queueBackpressureStats = emptyQueueBackpressureStats();
             this.startedAt = Date.now();
         } catch (err: any) {
             this.logger.warn(`[METRICS] reset() error: ${err?.message}`);
@@ -397,6 +418,83 @@ export class DoctoraliaMetricsService {
         return {
             ...this.transientRetryStats,
             byClassification: { ...this.transientRetryStats.byClassification },
+        };
+    }
+
+    // ─────────── WP-08B: backpressure da fila HIGH/LOW (fail-safe) ───────────
+
+    /** Rejeição imediata por fila cheia (nenhum waiter criado, nenhum slot). */
+    recordQueueRejectedFull(priority: 'HIGH' | 'LOW', queueSize: number): void {
+        try {
+            this.queueBackpressureStats.rejectedFull[priority]++;
+            this.logger.debug(`[METRICS] QUEUE_REJECTED_FULL priority=${priority} queueSize=${queueSize}`);
+        } catch (err: any) {
+            this.logger.debug(`[METRICS] recordQueueRejectedFull() error (non-fatal): ${err?.message}`);
+        }
+    }
+
+    /** Waiter expirou o deadline de espera na fila (removido sem consumir slot). */
+    recordQueueExpired(priority: 'HIGH' | 'LOW', waitMs: number): void {
+        try {
+            this.queueBackpressureStats.expired[priority]++;
+            this.logger.debug(`[METRICS] QUEUE_EXPIRED priority=${priority} waitMs=${waitMs}`);
+        } catch (err: any) {
+            this.logger.debug(`[METRICS] recordQueueExpired() error (non-fatal): ${err?.message}`);
+        }
+    }
+
+    /** Espera efetiva na fila até o grant (base para média/p95 por prioridade). */
+    recordQueueWait(priority: 'HIGH' | 'LOW', waitMs: number): void {
+        try {
+            const w = this.queueBackpressureStats.waits[priority];
+            w.count++;
+            w.totalMs += waitMs;
+            if (w.samples.length >= MAX_QUEUE_WAIT_SAMPLES) w.samples.shift();
+            w.samples.push(waitMs);
+        } catch (err: any) {
+            this.logger.debug(`[METRICS] recordQueueWait() error (non-fatal): ${err?.message}`);
+        }
+    }
+
+    /** Profundidade atual + idade do waiter mais antigo (gauges + picos desde restart). */
+    recordQueueDepth(high: number, low: number, oldestHighAgeMs: number, oldestLowAgeMs: number): void {
+        try {
+            const s = this.queueBackpressureStats;
+            s.current.HIGH = high;
+            s.current.LOW = low;
+            s.oldestWaiterAgeMs.HIGH = oldestHighAgeMs;
+            s.oldestWaiterAgeMs.LOW = oldestLowAgeMs;
+            if (high > s.peak.HIGH) s.peak.HIGH = high;
+            if (low > s.peak.LOW) s.peak.LOW = low;
+        } catch (err: any) {
+            this.logger.debug(`[METRICS] recordQueueDepth() error (non-fatal): ${err?.message}`);
+        }
+    }
+
+    getQueueBackpressureStats() {
+        const s = this.queueBackpressureStats;
+        const summarize = (p: 'HIGH' | 'LOW') => {
+            const w = s.waits[p];
+            const sorted = [...w.samples].sort((a, b) => a - b);
+            return {
+                grantedCount: w.count,
+                avgWaitMs: w.count > 0 ? Math.round(w.totalMs / w.count) : 0,
+                p95WaitMs: percentile(sorted, 95),
+            };
+        };
+        return {
+            queueHighCurrent: s.current.HIGH,
+            queueLowCurrent: s.current.LOW,
+            queueHighRejectedFull: s.rejectedFull.HIGH,
+            queueLowRejectedFull: s.rejectedFull.LOW,
+            queueHighExpired: s.expired.HIGH,
+            queueLowExpired: s.expired.LOW,
+            oldestWaiterAgeMsHigh: s.oldestWaiterAgeMs.HIGH,
+            oldestWaiterAgeMsLow: s.oldestWaiterAgeMs.LOW,
+            peakHigh: s.peak.HIGH,
+            peakLow: s.peak.LOW,
+            waitHigh: summarize('HIGH'),
+            waitLow: summarize('LOW'),
         };
     }
 

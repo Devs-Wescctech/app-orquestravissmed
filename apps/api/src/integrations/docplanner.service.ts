@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { AsyncLocalStorage } from 'async_hooks';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
@@ -7,6 +7,22 @@ import { getDoctoraliaContext } from '../metrics/doctoralia-call-context';
 import { randomUUID } from 'crypto';
 import { decideRetry, MAX_HTTP_ATTEMPTS } from './docplanner-retry.policy';
 import { DoctoraliaCircuitBreaker, isWafChallenge } from './doctoralia-circuit-breaker';
+import { DoctoraliaQueueFullError, DoctoraliaQueueTimeoutError } from './doctoralia-queue.errors';
+
+/**
+ * WP-08B — Waiter enriquecido da fila de vazão: além da classe do método e do
+ * resolve, carrega reject (rejeição tipada), enqueuedAt (idade/espera), o timer
+ * de deadline e a flag `settled` que resolve deterministicamente a corrida
+ * grant × timeout (o primeiro vence; o outro é no-op).
+ */
+interface RateWaiter {
+    methodClass: 'GET' | 'WRITE';
+    resolve: () => void;
+    reject: (err: any) => void;
+    enqueuedAt: number;
+    deadlineTimer: ReturnType<typeof setTimeout> | null;
+    settled: boolean;
+}
 
 interface CachedToken {
     token: string;
@@ -15,7 +31,7 @@ interface CachedToken {
 }
 
 @Injectable()
-export class DocplannerClient {
+export class DocplannerClient implements OnModuleDestroy {
     private readonly logger = new Logger(DocplannerClient.name);
 
     /**
@@ -66,9 +82,26 @@ export class DocplannerClient {
      * Cada item carrega a classe do método (GET ou WRITE) para que o pump possa
      * conceder slots a GETs enquanto a janela WRITE estiver cheia.
      */
-    private static waitingHigh: Array<{ methodClass: 'GET' | 'WRITE'; resolve: () => void }> = [];
-    private static waitingLow: Array<{ methodClass: 'GET' | 'WRITE'; resolve: () => void }> = [];
+    private static waitingHigh: RateWaiter[] = [];
+    private static waitingLow: RateWaiter[] = [];
     private static pumping = false;
+
+    /**
+     * WP-08B — Backpressure explícito: caps de tamanho + deadlines de ESPERA NA
+     * FILA (não substitui o timeout HTTP de 30s). Cap atingido ou deadline
+     * expirado rejeitam com erro tipado, sem consumir rate slot e sem HTTP.
+     */
+    private static readonly QUEUE_CAP_HIGH = 50;
+    private static readonly QUEUE_CAP_LOW =
+        (Number.parseInt(process.env.DOCTORALIA_QUEUE_CAP_LOW ?? '', 10) > 0
+            ? Number.parseInt(process.env.DOCTORALIA_QUEUE_CAP_LOW!, 10)
+            : 100);
+    private static readonly QUEUE_DEADLINE_HIGH_MS = 15_000;
+    private static readonly QUEUE_DEADLINE_LOW_MS = 60_000;
+    /** Logs de rejeição rate-limited (fila saturada gera muitos eventos). */
+    private static lastQueueRejectLogAt = 0;
+    /** WP-08B — Shutdown: recusa novos waiters e impede callbacks pós-shutdown. */
+    private static shuttingDown = false;
     /** Grants prioritários consecutivos (para a cota anti-inanição da fila normal). */
     private static consecutiveHighGrants = 0;
 
@@ -120,12 +153,13 @@ export class DocplannerClient {
      * Retorna -1 se nenhum item elegível existe.
      */
     private static findEligible(
-        queue: Array<{ methodClass: 'GET' | 'WRITE'; resolve: () => void }>,
+        queue: RateWaiter[],
         writeFull: boolean,
     ): number {
-        if (!writeFull) return queue.length > 0 ? 0 : -1;
         for (let i = 0; i < queue.length; i++) {
-            if (queue[i].methodClass === 'GET') return i;
+            // WP-08B: waiters expirados (settled) nunca são elegíveis nem concedidos.
+            if (queue[i].settled) continue;
+            if (!writeFull || queue[i].methodClass === 'GET') return i;
         }
         return -1;
     }
@@ -136,6 +170,9 @@ export class DocplannerClient {
         try {
             while (DocplannerClient.waitingHigh.length || DocplannerClient.waitingLow.length) {
                 for (;;) {
+                    // WP-08B: shutdown drena as filas e acorda o pump — nenhum
+                    // grant nem timer novo pode acontecer depois disso.
+                    if (DocplannerClient.shuttingDown) return;
                     const now = Date.now();
 
                     // ── Janela agregada ─────────────────────────────────────
@@ -163,7 +200,18 @@ export class DocplannerClient {
                                 `(fila: ${DocplannerClient.waitingHigh.length} prioritária(s), ${DocplannerClient.waitingLow.length} normal(is)).`,
                             );
                         }
-                        await new Promise(r => setTimeout(r, waitMs));
+                        // WP-08B: espera cancelável — o shutdown aciona o wakeup
+                        // para que o pump não fique dormindo até 5min com o
+                        // processo encerrando; o timer perdedor é sempre cancelado.
+                        let aggTimerId: ReturnType<typeof setTimeout> | undefined;
+                        const aggTimer = new Promise<void>(r => {
+                            aggTimerId = setTimeout(r, waitMs);
+                            (aggTimerId as any)?.unref?.();
+                        });
+                        const aggWakeup = new Promise<void>(r => { DocplannerClient.wakeupFn = r; });
+                        await Promise.race([aggTimer, aggWakeup]);
+                        clearTimeout(aggTimerId);
+                        DocplannerClient.wakeupFn = null;
                         continue;
                     }
 
@@ -197,7 +245,10 @@ export class DocplannerClient {
                         // 1h (budget/hora), causando leak de recursos e open handles no Jest.
                         const sleepMs = naturalWaitMs === Infinity ? 250 : naturalWaitMs;
                         let timerId: ReturnType<typeof setTimeout> | undefined;
-                        const timerPromise = new Promise<void>(r => { timerId = setTimeout(r, sleepMs); });
+                        const timerPromise = new Promise<void>(r => {
+                            timerId = setTimeout(r, sleepMs);
+                            (timerId as any)?.unref?.();
+                        });
                         const wakeup = new Promise<void>(r => { DocplannerClient.wakeupFn = r; });
                         await Promise.race([timerPromise, wakeup]);
                         clearTimeout(timerId); // cancela o timer se o wakeup venceu (e vice-versa — no-op se timer venceu)
@@ -217,7 +268,7 @@ export class DocplannerClient {
                 const eligHighIdx2 = DocplannerClient.findEligible(DocplannerClient.waitingHigh, wSnap2.writeFull);
                 const eligLowIdx2 = DocplannerClient.findEligible(DocplannerClient.waitingLow, wSnap2.writeFull);
 
-                let next: { methodClass: 'GET' | 'WRITE'; resolve: () => void } | undefined;
+                let next: RateWaiter | undefined;
                 if (
                     eligLowIdx2 >= 0 &&
                     (DocplannerClient.consecutiveHighGrants >= 4 || eligHighIdx2 < 0)
@@ -229,12 +280,20 @@ export class DocplannerClient {
                     DocplannerClient.consecutiveHighGrants++;
                 }
 
-                if (next) {
+                // WP-08B: corrida grant × timeout — se o waiter expirou entre a
+                // seleção e o grant, ele NÃO é concedido e o slot é devolvido.
+                if (next && !next.settled) {
+                    next.settled = true;
+                    if (next.deadlineTimer) {
+                        clearTimeout(next.deadlineTimer);
+                        next.deadlineTimer = null;
+                    }
                     // Registra no budget WRITE se for uma mutação
                     if (next.methodClass === 'WRITE') {
                         DocplannerClient.writeTimestamps.push(now2);
                     }
                     next.resolve();
+                    DocplannerClient.reportQueueDepth();
                 } else {
                     // Slot reservado sem candidato elegível (corrida rara): devolve
                     DocplannerClient.rateTimestamps.pop();
@@ -245,12 +304,95 @@ export class DocplannerClient {
         }
     }
 
-    /** Aguarda (se necessário) até haver espaço nas janelas de vazão e registra a requisição. */
+    /** WP-08B: publica profundidade/idade das filas nas métricas (fail-safe). */
+    private static reportQueueDepth(): void {
+        try {
+            const metrics = getDoctoraliaMetricsService();
+            if (!metrics) return;
+            const now = Date.now();
+            const oldest = (q: RateWaiter[]) => (q.length ? Math.max(0, now - q[0].enqueuedAt) : 0);
+            metrics.recordQueueDepth(
+                DocplannerClient.waitingHigh.length,
+                DocplannerClient.waitingLow.length,
+                oldest(DocplannerClient.waitingHigh),
+                oldest(DocplannerClient.waitingLow),
+            );
+        } catch (_e) { /* fail-safe */ }
+    }
+
+    /**
+     * WP-08B — Shutdown limpo do coordinator: recusa novos waiters, cancela
+     * todos os timers de deadline, rejeita waiters pendentes e limpa o wakeupFn.
+     * Nenhuma Promise fica pendurada e nenhum callback roda pós-shutdown.
+     */
+    static shutdownRateQueue(): void {
+        DocplannerClient.shuttingDown = true;
+        const drain = (queue: RateWaiter[], priority: 'HIGH' | 'LOW') => {
+            for (const w of queue.splice(0, queue.length)) {
+                if (w.settled) continue;
+                w.settled = true;
+                if (w.deadlineTimer) {
+                    clearTimeout(w.deadlineTimer);
+                    w.deadlineTimer = null;
+                }
+                try {
+                    w.reject(new DoctoraliaQueueTimeoutError(
+                        priority, 0, Date.now() - w.enqueuedAt, 0,
+                    ));
+                } catch (_e) { /* fail-safe */ }
+            }
+        };
+        drain(DocplannerClient.waitingHigh, 'HIGH');
+        drain(DocplannerClient.waitingLow, 'LOW');
+        // Acorda o pump (se dormindo) para que ele veja as filas vazias e encerre.
+        const wake = DocplannerClient.wakeupFn;
+        DocplannerClient.wakeupFn = null;
+        wake?.();
+    }
+
+    onModuleDestroy(): void {
+        DocplannerClient.shutdownRateQueue();
+    }
+
+    /**
+     * Aguarda (se necessário) até haver espaço nas janelas de vazão e registra a requisição.
+     * WP-08B: aplica cap por fila (rejeição ANTES do push) e deadline de espera
+     * por waiter — ambos rejeitam com erro tipado sem consumir rate slot.
+     */
     private static acquireRateSlot(logger: Logger, methodClass: 'GET' | 'WRITE'): Promise<void> {
         const priority = DocplannerClient.priorityAls.getStore() === true;
-        return new Promise<void>(resolve => {
-            (priority ? DocplannerClient.waitingHigh : DocplannerClient.waitingLow).push({
+        const prLabel: 'HIGH' | 'LOW' = priority ? 'HIGH' : 'LOW';
+        const queue = priority ? DocplannerClient.waitingHigh : DocplannerClient.waitingLow;
+
+        if (DocplannerClient.shuttingDown) {
+            return Promise.reject(new DoctoraliaQueueTimeoutError(prLabel, queue.length, 0, 0));
+        }
+
+        const cap = priority ? DocplannerClient.QUEUE_CAP_HIGH : DocplannerClient.QUEUE_CAP_LOW;
+        if (queue.length >= cap) {
+            try { getDoctoraliaMetricsService()?.recordQueueRejectedFull(prLabel, queue.length); } catch (_e) { /* fail-safe */ }
+            const now = Date.now();
+            if (now - DocplannerClient.lastQueueRejectLogAt > 30_000) {
+                DocplannerClient.lastQueueRejectLogAt = now;
+                logger.warn(
+                    `[QUEUE-FULL] Fila ${prLabel} da Doctoralia cheia (${queue.length}/${cap}) — ` +
+                    `rejeitando novas requisições sem consumir rate slot (log limitado a 1/30s).`,
+                );
+            }
+            return Promise.reject(new DoctoraliaQueueFullError(prLabel, queue.length));
+        }
+
+        const deadlineMs = priority
+            ? DocplannerClient.QUEUE_DEADLINE_HIGH_MS
+            : DocplannerClient.QUEUE_DEADLINE_LOW_MS;
+
+        return new Promise<void>((resolve, reject) => {
+            const waiter: RateWaiter = {
                 methodClass,
+                enqueuedAt: Date.now(),
+                deadlineTimer: null,
+                settled: false,
+                reject,
                 resolve: () => {
                     // Emite snapshot de fila sem alterar o algoritmo
                     try {
@@ -272,11 +414,40 @@ export class DocplannerClient {
                                 writeUsedInHour: wSnap.writeUsedHour,
                                 writeRemainingInHour: wSnap.writeRemainingHour,
                             });
+                            // WP-08B: espera efetiva na fila (média/p95 por prioridade)
+                            metrics.recordQueueWait(prLabel, now - waiter.enqueuedAt);
                         }
                     } catch (_e) { /* fail-safe */ }
                     resolve();
                 },
-            });
+            };
+
+            // Deadline de ESPERA NA FILA: ao expirar, remove o waiter, rejeita a
+            // Promise com erro tipado e NÃO consome rate slot nem executa HTTP.
+            waiter.deadlineTimer = setTimeout(() => {
+                if (waiter.settled) return; // grant venceu a corrida — no-op
+                waiter.settled = true;
+                waiter.deadlineTimer = null;
+                const q = priority ? DocplannerClient.waitingHigh : DocplannerClient.waitingLow;
+                const idx = q.indexOf(waiter);
+                if (idx >= 0) q.splice(idx, 1);
+                const waitMs = Date.now() - waiter.enqueuedAt;
+                try { getDoctoraliaMetricsService()?.recordQueueExpired(prLabel, waitMs); } catch (_e) { /* fail-safe */ }
+                const now = Date.now();
+                if (now - DocplannerClient.lastQueueRejectLogAt > 30_000) {
+                    DocplannerClient.lastQueueRejectLogAt = now;
+                    logger.warn(
+                        `[QUEUE-TIMEOUT] Waiter ${prLabel} expirou após ${Math.round(waitMs / 1000)}s na fila ` +
+                        `(deadline ${Math.round(deadlineMs / 1000)}s) — rejeitando sem consumir rate slot (log limitado a 1/30s).`,
+                    );
+                }
+                DocplannerClient.reportQueueDepth();
+                reject(new DoctoraliaQueueTimeoutError(prLabel, q.length, waitMs, deadlineMs));
+            }, deadlineMs);
+            (waiter.deadlineTimer as any)?.unref?.();
+
+            queue.push(waiter);
+            DocplannerClient.reportQueueDepth();
             // Acorda o pump se ele estiver dormindo na espera do budget WRITE
             // (ex.: pump bloqueado por write-full mas acabou de chegar um GET elegível).
             DocplannerClient.wakeupFn?.();
@@ -1094,7 +1265,16 @@ export class DocplannerClient {
 }
 
 @Injectable()
-export class DocplannerService {
+export class DocplannerService implements OnModuleDestroy {
+    /**
+     * WP-08B: os DocplannerClient são criados manualmente (createClient), então
+     * o Nest não invoca o onModuleDestroy deles. Este provider gerenciado é o
+     * dono do lifecycle: encerra o coordinator estático compartilhado.
+     */
+    onModuleDestroy(): void {
+        DocplannerClient.shutdownRateQueue();
+    }
+
     constructor(
         private configService: ConfigService,
         private prisma: PrismaService,

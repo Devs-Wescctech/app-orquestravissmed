@@ -48,6 +48,15 @@ function networkCode(err: any): string | undefined {
 
 /** Classifica uma falha do DocplannerClient (erro lançado por executeRequest). */
 export function classifyFailure(err: any): FailureClassification {
+    // WP-08B (CRÍTICO): erros de backpressure da fila são NON-RETRYABLE —
+    // jamais `timeout da fila → retry → fila → timeout → retry`. Checagem por
+    // code/name (sem import) para manter esta política pura e acíclica.
+    if (err?.code === 'DOCTORALIA_QUEUE_FULL' || err?.name === 'DoctoraliaQueueFullError') {
+        return { transient: false, classification: 'DOCTORALIA_QUEUE_FULL' };
+    }
+    if (err?.code === 'DOCTORALIA_QUEUE_TIMEOUT' || err?.name === 'DoctoraliaQueueTimeoutError') {
+        return { transient: false, classification: 'DOCTORALIA_QUEUE_TIMEOUT' };
+    }
     if (err?.name === 'AbortError') {
         return { transient: true, classification: 'TIMEOUT' };
     }
