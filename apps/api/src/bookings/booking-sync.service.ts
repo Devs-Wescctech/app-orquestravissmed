@@ -9,6 +9,7 @@ import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 import { getDoctoraliaMetricsService, concurrencyActorOf } from '../metrics/doctoralia-metrics.service';
 import { ClinicConcurrencyGuard } from './clinic-concurrency-guard';
 import { isDoctoraliaCircuitOpenError } from '../integrations/doctoralia-circuit-breaker';
+import { isDoctoraliaQueueError } from '../integrations/doctoralia-queue.errors';
 import { randomUUID } from 'crypto';
 
 const POLL_BASE_INTERVAL_MS = 30 * 1000;
@@ -2072,6 +2073,40 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         return { resolved: res.count };
     }
 
+    /**
+     * WP-10: reconciliação pós-ambiguidade do move/PATCH de break.
+     * Consulta o break remoto por ID (1 GET, só no caminho excepcional) e retorna
+     * true APENAS se `since` e `till` remotos refletem EXATAMENTE o alvo do move
+     * (comparação por epoch, determinística — sem tolerância). Qualquer falha do
+     * GET, retorno sem since/till ou divergência retorna false (nunca assume
+     * sucesso, nunca cria break novo aqui).
+     */
+    private async confirmMoveApplied(
+        client: any,
+        facilityId: string,
+        doctorId: string,
+        addressId: string,
+        breakId: string,
+        sinceSent: string,
+        tillSent: string,
+    ): Promise<boolean> {
+        try {
+            await this.rateLimiter.acquire('doctoralia');
+            const remote = await client.getCalendarBreak(facilityId, doctorId, addressId, breakId);
+            const item = remote?._items?.[0] ?? remote;
+            if (!item?.since || !item?.till) return false;
+            const remoteSince = new Date(item.since).getTime();
+            const remoteTill = new Date(item.till).getTime();
+            const targetSince = new Date(sinceSent).getTime();
+            const targetTill = new Date(tillSent).getTime();
+            if ([remoteSince, remoteTill, targetSince, targetTill].some(Number.isNaN)) return false;
+            return remoteSince === targetSince && remoteTill === targetTill;
+        } catch (err: any) {
+            this.logger.warn(`[VISMED-POLL] break_move_reconcile_get_failed: GET break ${breakId} falhou (${err?.message || err}) — não assumindo sucesso`);
+            return false;
+        }
+    }
+
     private async syncDoctoraliaBreak(bookingSyncId: string): Promise<void> {
         const rec = await this.prisma.bookingSync.findUnique({ where: { id: bookingSyncId } });
         if (!rec || rec.origin !== 'VISMED' || !rec.vismedDoctorId) return;
@@ -2131,6 +2166,13 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         /** True for network-level failures (no HTTP status code) that are not 409 */
         const isNetworkFailure = (err: any) =>
             !isTimeout(err) && !isConflict(err) && typeof (err as any)?.status !== 'number';
+        /**
+         * WP-10: falhas ANTES do envio HTTP — QueueFull, QueueTimeout e CircuitOpen.
+         * Nunca são ambíguas (o PATCH garantidamente não chegou), então nunca
+         * disparam reconciliação por GET.
+         */
+        const isPreSendFailure = (err: any) =>
+            isDoctoraliaQueueError(err) || isDoctoraliaCircuitOpenError(err);
 
         // Tolerances for matching a remote break to the operation we sent.
         // Named constants so test code can reference the same values without magic numbers.
@@ -2215,7 +2257,36 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                     });
                     return;
                 }
-                if (!isNotFound(err)) throw err;
+                if (!isNotFound(err)) {
+                    // WP-10: resultado AMBÍGUO do PATCH (timeout/AbortError ou falha de rede
+                    // pós-envio) — a Doctoralia pode ter aplicado o move antes da queda da
+                    // conexão. Reconciliar por GET do próprio breakId antes de relançar:
+                    //   - remoto já reflete since/till alvo → sucesso (marca synced, sem 2º PATCH)
+                    //   - remoto no estado antigo, GET falhou ou retorno inconsistente → relança
+                    // Erros pré-envio (QueueFull/QueueTimeout/CircuitOpen), 4xx conhecidos e o
+                    // 422 "Same Date Range" NUNCA disparam reconciliação (nunca são ambíguos).
+                    if ((isTimeout(err) || isNetworkFailure(err)) && !isPreSendFailure(err)) {
+                        const confirmed = await this.confirmMoveApplied(
+                            client, facilityId, mapping.externalId, addressId, rec.doctoraliaBreakId, since, till,
+                        );
+                        if (confirmed) {
+                            await this.prisma.bookingSync.update({
+                                where: { id: rec.id },
+                                data: { syncedToDoctoralia: true },
+                            });
+                            this.logger.log(
+                                `[VISMED-POLL] break_move_confirmed_after_timeout: break ${rec.doctoraliaBreakId} ` +
+                                `já reflete o horário alvo — move tratado como concluído sem novo PATCH`,
+                            );
+                            return;
+                        }
+                        this.logger.warn(
+                            `[VISMED-POLL] break_move_unconfirmed_after_timeout: break ${rec.doctoraliaBreakId} ` +
+                            `não confirmado no horário alvo — relançando para retry seguro no próximo ciclo`,
+                        );
+                    }
+                    throw err;
+                }
                 this.logger.warn(`[VISMED-POLL] Break ${rec.doctoraliaBreakId} not found on move, will recreate`);
                 await this.prisma.bookingSync.update({
                     where: { id: rec.id },

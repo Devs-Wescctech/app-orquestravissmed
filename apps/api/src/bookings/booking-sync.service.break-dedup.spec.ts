@@ -48,8 +48,11 @@ function buildService(overrides: {
     bookingSync?: Partial<Record<string, jest.Mock>>;
     mapping?: any;
     conn?: any;
+    rec?: any;
     addCalendarBreak?: jest.Mock;
     getCalendarBreaks?: jest.Mock;
+    getCalendarBreak?: jest.Mock;
+    moveCalendarBreak?: jest.Mock;
     updateResult?: any;
 }) {
     const rec = {
@@ -62,6 +65,7 @@ function buildService(overrides: {
         endAt:   new Date(TILL),
         doctoraliaBreakId: null,
         syncedToDoctoralia: false,
+        ...(overrides.rec || {}),
     };
 
     const mapping = overrides.mapping ?? {
@@ -84,10 +88,13 @@ function buildService(overrides: {
 
     const addCalendarBreak  = overrides.addCalendarBreak  ?? jest.fn().mockResolvedValue({ id: 'new-break-id' });
     const getCalendarBreaks = overrides.getCalendarBreaks ?? jest.fn().mockResolvedValue([]);
+    const getCalendarBreak  = overrides.getCalendarBreak  ?? jest.fn().mockResolvedValue(null);
+    const moveCalendarBreak = overrides.moveCalendarBreak ?? jest.fn().mockResolvedValue({});
     const client = {
         addCalendarBreak,
         getCalendarBreaks,
-        moveCalendarBreak: jest.fn(),
+        getCalendarBreak,
+        moveCalendarBreak,
         deleteCalendarBreak: jest.fn(),
     };
 
@@ -116,7 +123,7 @@ function buildService(overrides: {
         null as any, // matchingEngine
     );
 
-    return { service, prisma, client, addCalendarBreak, getCalendarBreaks };
+    return { service, prisma, client, addCalendarBreak, getCalendarBreaks, getCalendarBreak, moveCalendarBreak };
 }
 
 // ---------------------------------------------------------------------------
@@ -257,5 +264,178 @@ describe('syncDoctoraliaBreak — break deduplication', () => {
 
         await expect(callSync(service)).rejects.toBe(networkErr);
         expect(client.getCalendarBreaks).toHaveBeenCalledTimes(1);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// WP-10 — move/PATCH idempotency: reconcile ambiguous move via GET-by-ID
+// ---------------------------------------------------------------------------
+
+describe('syncDoctoraliaBreak — WP-10 move idempotency', () => {
+    const callSync = (service: BookingSyncService, id = 'bs-1') =>
+        (service as any).syncDoctoraliaBreak(id);
+
+    const MOVE_REC = { doctoraliaBreakId: 'brk-1' };
+
+    /** Remote break exactly at the move target (as returned by GET-by-ID) */
+    const remoteAtTarget = () => ({ id: 'brk-1', since: SINCE, till: TILL });
+    /** Remote break still at the OLD position */
+    const remoteOld = () => ({
+        id: 'brk-1',
+        since: '2026-08-09T10:00:00-03:00',
+        till:  '2026-08-09T10:30:00-03:00',
+    });
+
+    const sameRangeError = () =>
+        Object.assign(new Error('Docplanner API Error: 422 — Same Date Range'), { status: 422 });
+    const notFoundError = () =>
+        Object.assign(new Error('Docplanner API Error: 404 Not Found'), { status: 404 });
+    const queueFullError = () =>
+        Object.assign(new Error('fila cheia'), { name: 'DoctoraliaQueueFullError', code: 'DOCTORALIA_QUEUE_FULL' });
+    const queueTimeoutError = () =>
+        Object.assign(new Error('espera esgotada'), { name: 'DoctoraliaQueueTimeoutError', code: 'DOCTORALIA_QUEUE_TIMEOUT' });
+    const circuitOpenError = () =>
+        Object.assign(new Error('circuito aberto'), { name: 'DoctoraliaCircuitOpenError' });
+    const businessError = () =>
+        Object.assign(new Error('Docplanner API Error: 400 Bad Request'), { status: 400 });
+
+    it('(m-a) move succeeds — marks synced, no GET, no second PATCH', async () => {
+        const { service, client, prisma } = buildService({
+            rec: MOVE_REC,
+            moveCalendarBreak: jest.fn().mockResolvedValue({}),
+        });
+
+        await expect(callSync(service)).resolves.toBeUndefined();
+
+        expect(client.moveCalendarBreak).toHaveBeenCalledTimes(1);
+        expect(client.getCalendarBreak).not.toHaveBeenCalled();
+        expect(client.addCalendarBreak).not.toHaveBeenCalled();
+        expect(prisma.bookingSync.update).toHaveBeenCalledWith(
+            expect.objectContaining({ data: expect.objectContaining({ syncedToDoctoralia: true }) }),
+        );
+    });
+
+    it('(m-b) timeout + remote already at target — success, no second PATCH, keeps breakId', async () => {
+        const { service, client, prisma } = buildService({
+            rec: MOVE_REC,
+            moveCalendarBreak: jest.fn().mockRejectedValue(abortError()),
+            getCalendarBreak:  jest.fn().mockResolvedValue(remoteAtTarget()),
+        });
+
+        await expect(callSync(service)).resolves.toBeUndefined();
+
+        expect(client.moveCalendarBreak).toHaveBeenCalledTimes(1); // no second PATCH
+        expect(client.getCalendarBreak).toHaveBeenCalledTimes(1);
+        expect(client.getCalendarBreak).toHaveBeenCalledWith('fac-1', 'doc-ext-1', 'addr-1', 'brk-1');
+        expect(client.addCalendarBreak).not.toHaveBeenCalled();
+        expect(prisma.bookingSync.update).toHaveBeenCalledWith(
+            expect.objectContaining({ data: expect.objectContaining({ syncedToDoctoralia: true }) }),
+        );
+        // doctoraliaBreakId must NOT be cleared or replaced
+        const clearedCall = prisma.bookingSync.update.mock.calls.find(
+            ([arg]: any[]) => arg?.data && 'doctoraliaBreakId' in arg.data,
+        );
+        expect(clearedCall).toBeUndefined();
+    });
+
+    it('(m-c) timeout + remote still at OLD position — rethrows, no persist', async () => {
+        const { service, client, prisma } = buildService({
+            rec: MOVE_REC,
+            moveCalendarBreak: jest.fn().mockRejectedValue(abortError()),
+            getCalendarBreak:  jest.fn().mockResolvedValue(remoteOld()),
+        });
+
+        await expect(callSync(service)).rejects.toMatchObject({ name: 'AbortError' });
+
+        expect(client.moveCalendarBreak).toHaveBeenCalledTimes(1);
+        expect(client.getCalendarBreak).toHaveBeenCalledTimes(1);
+        expect(client.addCalendarBreak).not.toHaveBeenCalled();
+        expect(prisma.bookingSync.update).not.toHaveBeenCalled();
+    });
+
+    it('(m-d) timeout + reconcile GET fails — rethrows, never assumes success', async () => {
+        const { service, client, prisma } = buildService({
+            rec: MOVE_REC,
+            moveCalendarBreak: jest.fn().mockRejectedValue(abortError()),
+            getCalendarBreak:  jest.fn().mockRejectedValue(new Error('GET failed')),
+        });
+
+        await expect(callSync(service)).rejects.toMatchObject({ name: 'AbortError' });
+        expect(client.addCalendarBreak).not.toHaveBeenCalled();
+        expect(prisma.bookingSync.update).not.toHaveBeenCalled();
+    });
+
+    it('(m-e) timeout + inconsistent GET payload (missing till) — rethrows', async () => {
+        const { service, client, prisma } = buildService({
+            rec: MOVE_REC,
+            moveCalendarBreak: jest.fn().mockRejectedValue(abortError()),
+            getCalendarBreak:  jest.fn().mockResolvedValue({ id: 'brk-1', since: SINCE }),
+        });
+
+        await expect(callSync(service)).rejects.toMatchObject({ name: 'AbortError' });
+        expect(client.addCalendarBreak).not.toHaveBeenCalled();
+        expect(prisma.bookingSync.update).not.toHaveBeenCalled();
+    });
+
+    it('(m-f) network error (post-send, no status) + remote at target — success', async () => {
+        const { service, client, prisma } = buildService({
+            rec: MOVE_REC,
+            moveCalendarBreak: jest.fn().mockRejectedValue(new Error('read ECONNRESET')),
+            getCalendarBreak:  jest.fn().mockResolvedValue(remoteAtTarget()),
+        });
+
+        await expect(callSync(service)).resolves.toBeUndefined();
+        expect(client.moveCalendarBreak).toHaveBeenCalledTimes(1);
+        expect(prisma.bookingSync.update).toHaveBeenCalledWith(
+            expect.objectContaining({ data: expect.objectContaining({ syncedToDoctoralia: true }) }),
+        );
+    });
+
+    it('(m-g) 422 Same Date Range — still success, no reconcile GET', async () => {
+        const { service, client, prisma } = buildService({
+            rec: MOVE_REC,
+            moveCalendarBreak: jest.fn().mockRejectedValue(sameRangeError()),
+        });
+
+        await expect(callSync(service)).resolves.toBeUndefined();
+        expect(client.getCalendarBreak).not.toHaveBeenCalled();
+        expect(prisma.bookingSync.update).toHaveBeenCalledWith(
+            expect.objectContaining({ data: expect.objectContaining({ syncedToDoctoralia: true }) }),
+        );
+    });
+
+    it('(m-h) 404 on move — still recreates (existing behaviour), no reconcile GET', async () => {
+        const { service, client, prisma } = buildService({
+            rec: MOVE_REC,
+            moveCalendarBreak: jest.fn().mockRejectedValue(notFoundError()),
+            addCalendarBreak:  jest.fn().mockResolvedValue({ id: 'recreated-id' }),
+        });
+
+        await expect(callSync(service)).resolves.toBeUndefined();
+
+        expect(client.getCalendarBreak).not.toHaveBeenCalled();
+        expect(client.addCalendarBreak).toHaveBeenCalledTimes(1);
+        const adoptCall = prisma.bookingSync.update.mock.calls.find(
+            ([arg]: any[]) => arg?.data?.doctoraliaBreakId === 'recreated-id',
+        );
+        expect(adoptCall).toBeDefined();
+    });
+
+    it.each([
+        ['QueueFull', queueFullError()],
+        ['QueueTimeout', queueTimeoutError()],
+        ['CircuitOpen', circuitOpenError()],
+        ['business 4xx', businessError()],
+    ])('(m-i) %s — rethrows without reconcile GET', async (_label, err) => {
+        const { service, client, prisma } = buildService({
+            rec: MOVE_REC,
+            moveCalendarBreak: jest.fn().mockRejectedValue(err),
+        });
+
+        await expect(callSync(service)).rejects.toBe(err);
+        expect(client.getCalendarBreak).not.toHaveBeenCalled();
+        expect(client.moveCalendarBreak).toHaveBeenCalledTimes(1);
+        expect(client.addCalendarBreak).not.toHaveBeenCalled();
+        expect(prisma.bookingSync.update).not.toHaveBeenCalled();
     });
 });
