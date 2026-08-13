@@ -16,20 +16,22 @@ class CallLog {
         this.unmatched = [];
     }
 
-    record({ method, path, body, matched, status, authHeader }) {
+    record({ method, path, body, matched, status, authHeader, correlationId, arrivedAt }) {
         // authHeader entra no hash: escritas idênticas de CREDENCIAIS diferentes
         // (ex.: OAuth de duas clínicas) não são duplicatas.
         const hashInput = `${body ?? ''}|auth:${authHeader ?? ''}`;
         const bodyHash = (body && body.length) || authHeader
             ? crypto.createHash('sha1').update(hashInput).digest('hex') : null;
         const entry = {
-            ts: Date.now(),
+            // WP-12C: ts = CHEGADA no mock (arrival), não o momento da resposta.
+            ts: arrivedAt ?? Date.now(),
             method,
             path,
             isWrite: WRITE_METHODS.has(method),
             bodyHash,
             matched: matched !== false,
             status,
+            correlationId: correlationId ?? null,
         };
         this.calls.push(entry);
         if (matched === false) this.unmatched.push({ method, path });

@@ -53,6 +53,7 @@ function buildReport(input) {
         queueJustification = null,   // WP-12B: justificativa explícita p/ QueueFull/Timeout ≠ 0 no cenário D
         partial = false,             // WP-12B: relatório parcial (execução interrompida)
         interruptionReason = null,
+        grantDispatchArrival = null, // WP-12C: análise grant × dispatch × arrival (aditivo/informativo)
     } = input;
     if (!expected || !Array.isArray(expected.clinicIds) || !expected.clinicIds.length || !(expected.windows >= 1)) {
         throw new Error('buildReport: "expected" ({clinicIds, windows}) é obrigatório e não pode ser vazio');
@@ -173,6 +174,7 @@ function buildReport(input) {
         writeBudget: finalBaseline.writeBudget ?? null,
         duplicatesReportedByApp: finalBaseline.duplicates ?? null,
         baselineComparison,
+        grantDispatchArrival,
         cleanExit,
         memoryStabilization: { rss: memRss, heap: memHeap },
         syncRuns: { perClinic, all: globalRuns },
@@ -265,6 +267,23 @@ function renderMarkdown(report) {
         lines.push('');
         const g = bc.growth;
         lines.push(`- **Crescimento relativo** (esperado ~×${g.clinicFactor} se linear): duração ×${g.durationFactor ?? '—'}, chamadas ×${g.callsFactor ?? '—'}, memória ×${g.memoryFactor ?? '—'}, pico de fila ×${g.queuePeakFactor ?? '—'}, espera p95 ×${g.waitP95Factor ?? '—'}`);
+        lines.push('');
+    }
+    if (report.grantDispatchArrival) {
+        const g = report.grantDispatchArrival;
+        lines.push('## WP-12C — Grant × Dispatch × Arrival');
+        lines.push(`- Correlação: ${g.correlation.correlated}/${g.correlation.internalEvents} eventos internos casados com ${g.correlation.mockArrivals} chegadas do mock (sem chegada: ${g.correlation.internalWithoutArrival}, chegadas sem evento interno: ${g.correlation.arrivalsWithoutInternal})`);
+        const wm = g.writeMinute, ag = g.aggregate5Min;
+        lines.push(`- WRITE/60s (semântica da auditoria do mock, fronteira inclusiva): grants **${wm.maxGrantsInRollingMinute.max}**, dispatches **${wm.maxDispatchesInRollingMinute.max}**, arrivals **${wm.maxArrivalsInRollingMinute.max}** (limite ${wm.limit})`);
+        lines.push(`- WRITE/60s (semântica do limiter, fronteira estrita): grants **${wm.maxGrantsInRollingMinute.maxStrict}**, dispatches **${wm.maxDispatchesInRollingMinute.maxStrict}**, arrivals **${wm.maxArrivalsInRollingMinute.maxStrict}** (limite ${wm.limit})`);
+        lines.push(`- Agregado/5min (inclusiva): grants **${ag.maxGrantsInRolling5Min.max}**, dispatches **${ag.maxDispatchesInRolling5Min.max}**, arrivals **${ag.maxArrivalsInRolling5Min.max}** (limite ${ag.limit})`);
+        lines.push(`- Agregado/5min (estrita): grants **${ag.maxGrantsInRolling5Min.maxStrict}**, dispatches **${ag.maxDispatchesInRolling5Min.maxStrict}**, arrivals **${ag.maxArrivalsInRolling5Min.maxStrict}** (limite ${ag.limit})`);
+        const d = (x) => `min=${x.min}ms p50=${x.p50}ms p95=${x.p95}ms p99=${x.p99}ms max=${x.max}ms (n=${x.count})`;
+        lines.push(`- Δ grant→dispatch: ${d(g.deltas.grantToDispatchMs)}`);
+        lines.push(`- Δ dispatch→arrival: ${d(g.deltas.dispatchToArrivalMs)}`);
+        lines.push(`- Δ (só WRITE) grant→dispatch: ${d(g.deltas.writeOnly.grantToDispatchMs)} · dispatch→arrival: ${d(g.deltas.writeOnly.dispatchToArrivalMs)}`);
+        lines.push(`- Hipótese de compressão temporal — semântica inclusiva (auditoria): WRITE/min **${g.hypothesis.compressionConfirmedWrite ? 'CONFIRMADA' : 'NÃO confirmada'}** · agregado/5min **${g.hypothesis.compressionConfirmedAggregate ? 'CONFIRMADA' : 'NÃO confirmada'}**`);
+        lines.push(`- Hipótese de compressão temporal — semântica estrita (limiter): WRITE/min **${g.hypothesis.compressionConfirmedWriteStrict ? 'CONFIRMADA' : 'NÃO confirmada'}** · agregado/5min **${g.hypothesis.compressionConfirmedAggregateStrict ? 'CONFIRMADA' : 'NÃO confirmada'}**`);
         lines.push('');
     }
     lines.push('## Filas');

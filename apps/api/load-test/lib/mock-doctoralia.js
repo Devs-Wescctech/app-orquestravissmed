@@ -28,12 +28,13 @@ class MockDoctoralia {
 
     async start() {
         this.server = https.createServer({ key: this.tls.key, cert: this.tls.cert }, (req, res) => {
+            const arrivedAt = Date.now(); // WP-12C: timestamp de CHEGADA da requisição
             let body = '';
             req.on('data', c => { body += c; });
             req.on('end', () => {
-                try { this.handle(req, res, body); }
+                try { this.handle(req, res, body, arrivedAt); }
                 catch (err) {
-                    this.log.record({ method: req.method, path: req.url, body, matched: false, status: 500 });
+                    this.log.record({ method: req.method, path: req.url, body, matched: false, status: 500, arrivedAt, correlationId: req.headers['x-loadtest-correlation-id'] });
                     res.writeHead(500, { 'content-type': 'application/json' });
                     res.end(JSON.stringify({ error: String(err.message) }));
                 }
@@ -55,11 +56,14 @@ class MockDoctoralia {
         res.end(payload === null ? '' : JSON.stringify(payload));
     }
 
-    handle(req, res, body) {
+    handle(req, res, body, arrivedAt) {
         const method = req.method;
         const url = new URL(req.url, 'https://mock');
         const p = url.pathname;
-        const meta = { method, path: req.url, body, authHeader: req.headers.authorization };
+        const meta = {
+            method, path: req.url, body, authHeader: req.headers.authorization,
+            arrivedAt, correlationId: req.headers['x-loadtest-correlation-id'],
+        };
         const send = (status, payload, matched = true) => this.reply(res, status, payload, { ...meta, matched });
 
         // ── OAuth ────────────────────────────────────────────────────────────

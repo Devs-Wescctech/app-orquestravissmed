@@ -585,6 +585,9 @@ export class DocplannerClient implements OnModuleDestroy {
         const url = `https://${domain}/oauth/v2/token`;
         const basicAuth = Buffer.from(`${this.clientId}:${this.clientSecret}`).toString('base64');
 
+        // WP-12C: correlação API↔mock no harness (inerte fora do harness).
+        const _oauthCorrelationId = randomUUID();
+        const _oauthSendCorrelation = process.env.LOADTEST_CORRELATION_HEADER === 'true';
         const _oauthEnqueuedAt = Date.now();
         await DocplannerClient.acquireRateSlot(this.logger, 'WRITE');
         const _oauthReleasedAt = Date.now();
@@ -605,6 +608,7 @@ export class DocplannerClient implements OnModuleDestroy {
                     // O fetch do Node não envia User-Agent; o WAF da Doctoralia pontua
                     // requisições sem identificação como robô suspeito.
                     'User-Agent': 'Orquestrador/1.0 (VisMed integration)',
+                    ...(_oauthSendCorrelation ? { 'x-loadtest-correlation-id': _oauthCorrelationId } : {}),
                 },
                 body: 'grant_type=client_credentials&scope=integration',
             });
@@ -620,7 +624,7 @@ export class DocplannerClient implements OnModuleDestroy {
                 const metrics = getDoctoraliaMetricsService();
                 if (metrics) {
                     metrics.record({
-                        doctoraliaRequestId: randomUUID(),
+                        doctoraliaRequestId: _oauthCorrelationId,
                         origin: 'AUTHENTICATION',
                         operation: 'OAUTH_TOKEN',
                         endpoint: '/oauth/v2/token',
@@ -849,6 +853,9 @@ export class DocplannerClient implements OnModuleDestroy {
         // WP-01: captura contexto e prepara instrumentação
         const ctx = getDoctoraliaContext();
         const doctoraliaRequestId = randomUUID();
+        // WP-12C: correlação API↔mock no harness de carga. Inerte fora do harness
+        // (header só é enviado quando o env do harness habilita explicitamente).
+        const sendCorrelationHeader = process.env.LOADTEST_CORRELATION_HEADER === 'true';
         const enqueuedAt = Date.now();
 
         // Adquire o slot ANTES de armar o timeout de 30s — a espera na fila de vazão
@@ -868,6 +875,8 @@ export class DocplannerClient implements OnModuleDestroy {
                 'Authorization': `Bearer ${this.accessToken}`,
                 'User-Agent': 'Orquestrador/1.0 (VisMed integration)',
             };
+            // WP-12C: header custom só no harness (env LOADTEST_CORRELATION_HEADER=true).
+            if (sendCorrelationHeader) headers['x-loadtest-correlation-id'] = doctoraliaRequestId;
 
             const options: RequestInit = {
                 method,

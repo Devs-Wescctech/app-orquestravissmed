@@ -25,6 +25,7 @@ const { seedDatabase, readConnections, readSyncRuns } = require('./lib/seed');
 const { assertAllGuards, assertSafeDatabaseUrl } = require('./lib/guards');
 const { Collector } = require('./lib/collector');
 const { buildReport, renderMarkdown } = require('./lib/report');
+const { analyzeGrantDispatchArrival } = require('./lib/grant-dispatch');
 const { findBaselineReport, loadBaseline, compareWithBaseline } = require('./lib/baseline-compare');
 
 const API_DIR = path.join(__dirname, '..');
@@ -97,6 +98,24 @@ async function main() {
     let exitCode = 1;
 
     let cleanExit = null; // WP-12B: resultado do shutdown gracioso (medido antes do relatório)
+    let rawInternalEvents = []; // WP-12C: eventos brutos da API (grant/dispatch), coletados antes do shutdown
+    let authToken = null;
+
+    // WP-12C: coleta os eventos brutos (enqueuedAt/releasedAt/sentAt) da API viva.
+    const fetchRawEvents = async () => {
+        if (!authToken || !apiProc || apiProc.exitCode !== null) return;
+        try {
+            const r = await api(API_BASE, authToken, 'GET', '/metrics/doctoralia-baseline/raw-events');
+            if (r.ok && Array.isArray(r.json?.events)) {
+                rawInternalEvents = r.json.events;
+                log(`WP-12C: ${rawInternalEvents.length} eventos internos coletados (grant/dispatch).`);
+            } else {
+                notes.push(`WP-12C: raw-events HTTP ${r.status} — eventos internos não coletados.`);
+            }
+        } catch (e) {
+            notes.push(`WP-12C: falha ao coletar raw-events: ${e.message}`);
+        }
+    };
 
     // Shutdown gracioso e MEDIDO da API: SIGTERM e espera; se não sair no prazo,
     // há Promise/timer órfão segurando o processo → SIGKILL e cleanExit=false.
@@ -158,6 +177,24 @@ async function main() {
             summary: () => ({ mock: name, totalCalls: 0, reads: 0, writes: 0, duplicateWrites: [], unmatchedPaths: [], byPathClass: {} }),
             budgetAudit: () => ({ peakAgg5min: 0, limitAgg5min: 400, aggOk: true, peakWrites1min: 0, limitWrites1min: 40, writesMinOk: true, peakWrites1h: 0, limitWrites1h: 2400, writesHourOk: true }),
         });
+        // WP-12C: análise grant × dispatch × arrival (aditivo/informativo)
+        let grantDispatchArrival = null;
+        let gdaCorrelated = [];
+        try {
+            if (rawInternalEvents.length && docMock?.log) {
+                const gda = analyzeGrantDispatchArrival({
+                    internalEvents: rawInternalEvents,
+                    mockCalls: docMock.log.calls,
+                });
+                gdaCorrelated = gda.correlatedRequests;
+                const { correlatedRequests, ...summary } = gda;
+                grantDispatchArrival = summary;
+            } else {
+                notes.push('WP-12C: eventos internos não coletados — análise grant×dispatch×arrival omitida.');
+            }
+        } catch (e) {
+            notes.push(`WP-12C: falha na análise grant×dispatch×arrival: ${e.message}`);
+        }
         const { report, passed } = buildReport({
             scenario: args.scenario, profile: args.profile, seed: args.seed,
             startedAt, endedAt,
@@ -171,6 +208,7 @@ async function main() {
             expected: { clinicIds: dataset.clinics.map(c => c.id), windows: scenario.globalSyncWindows },
             statStatementsUnavailable: db.statStatementsUnavailable,
             cleanExit, partial, interruptionReason,
+            grantDispatchArrival,
         });
         report.baselineComparison = buildBaselineComparison(report);
         const stamp = endedAt.replace(/[:.]/g, '-');
@@ -179,6 +217,17 @@ async function main() {
         const mdPath = path.join(REPORT_DIR, `scenario-${args.scenario}-${args.profile}-${stamp}${suffix}.md`);
         fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2));
         fs.writeFileSync(mdPath, renderMarkdown(report));
+        // WP-12C: dumps brutos (NDJSON) — eventos internos, chegadas do mock e requisições correlacionadas
+        const ndjson = (arr) => arr.map(x => JSON.stringify(x)).join('\n') + (arr.length ? '\n' : '');
+        if (rawInternalEvents.length) {
+            fs.writeFileSync(path.join(REPORT_DIR, `scenario-${args.scenario}-${args.profile}-${stamp}${suffix}-internal-events.ndjson`), ndjson(rawInternalEvents));
+        }
+        if (docMock?.log?.calls?.length) {
+            fs.writeFileSync(path.join(REPORT_DIR, `scenario-${args.scenario}-${args.profile}-${stamp}${suffix}-mock-arrivals.ndjson`), ndjson(docMock.log.calls));
+        }
+        if (gdaCorrelated.length) {
+            fs.writeFileSync(path.join(REPORT_DIR, `scenario-${args.scenario}-${args.profile}-${stamp}${suffix}-correlated.ndjson`), ndjson(gdaCorrelated));
+        }
         log(`Relatório${partial ? ' PARCIAL' : ''}: ${jsonPath}`);
         log(`Resumo:    ${mdPath}`);
         return { report, passed, jsonPath, mdPath };
@@ -214,6 +263,8 @@ async function main() {
             NODE_OPTIONS: `--require ${path.join(__dirname, 'lib', 'preload-lag.js')}`,
             LOADTEST_LAG_FILE: lagFile,
             LOADTEST_LAG_INTERVAL_MS: '5000',
+            // WP-12C: habilita o header de correlação API↔mock (inerte fora do harness)
+            LOADTEST_CORRELATION_HEADER: 'true',
         };
         const connections = await readConnections(db.url);
         assertAllGuards({ databaseUrl: db.url, childEnv, connections });
@@ -251,6 +302,7 @@ async function main() {
             } catch { /* ainda subindo */ }
         }
         if (!token) throw new Error('Não foi possível autenticar SUPER_ADMIN na API sob teste (timeout).');
+        authToken = token;
         log('Login SUPER_ADMIN OK.');
 
         // ── Coleta + reset do baseline ───────────────────────────────────────
@@ -336,6 +388,9 @@ async function main() {
         }
         await collector.stop();
 
+        // WP-12C: eventos brutos ANTES do shutdown (o buffer vive em memória da API)
+        await fetchRawEvents();
+
         // ── Shutdown gracioso MEDIDO (check de Promise/timer órfão) ─────────
         const syncRuns = await readSyncRuns(db.url);
         log('Encerrando a API com SIGTERM (medindo encerramento limpo)...');
@@ -353,6 +408,7 @@ async function main() {
         try {
             const hasData = actions.length > 0 || (collector?.baselineSnapshots?.length ?? 0) > 0;
             if (hasData) {
+                await fetchRawEvents().catch(() => { }); // WP-12C: melhor esforço no parcial
                 let syncRuns = [];
                 try { syncRuns = await readSyncRuns(db.url); } catch { }
                 persistReport({ syncRuns, partial: true, interruptionReason: err.message });

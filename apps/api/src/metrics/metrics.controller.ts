@@ -36,6 +36,25 @@ export class MetricsController {
     }
 
     /**
+     * GET /metrics/doctoralia-baseline/raw-events
+     *
+     * WP-12C: exporta os eventos brutos de requisição já coletados em memória
+     * (enqueuedAt/releasedAt/sentAt/respondedAt por requisição), para o harness
+     * de carga correlacionar grant × dispatch × arrival. Estritamente aditivo:
+     * apenas leitura do buffer existente, sem tocar no rate limiter.
+     *
+     * **Restrito a SUPER_ADMIN**.
+     */
+    @Get('doctoralia-baseline/raw-events')
+    getDoctoraliaRawEvents(@Req() req: any) {
+        const isSuperAdmin = req.user?.roles?.some((r: any) => r.role === 'SUPER_ADMIN');
+        if (!isSuperAdmin) {
+            throw new ForbiddenException('Acesso restrito a administradores globais (SUPER_ADMIN).');
+        }
+        return { events: this.metricsService.getEvents() };
+    }
+
+    /**
      * POST /metrics/doctoralia-baseline/reset
      *
      * Reinicia todos os contadores em memória para iniciar uma nova janela de coleta.
