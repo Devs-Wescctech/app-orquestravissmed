@@ -1178,7 +1178,9 @@ export class DocplannerClient implements OnModuleDestroy {
     }
 
     async getDoctors(facilityId: string): Promise<any> {
-        return this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors`);
+        // Task 141: extensão doctor.license_numbers traz o registro profissional
+        // (ex.: "CRM/SP 12345") na MESMA requisição, sem custo extra de rate limit.
+        return this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors?with[]=doctor.license_numbers`);
     }
 
     async getAddresses(facilityId: string, doctorId: string): Promise<any> {

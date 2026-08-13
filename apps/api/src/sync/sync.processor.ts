@@ -11,6 +11,7 @@ import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 import { ClinicConcurrencyGuard } from '../bookings/clinic-concurrency-guard';
 import { getDoctoraliaMetricsService, concurrencyActorOf } from '../metrics/doctoralia-metrics.service';
 import { SyncService } from './sync.service';
+import { buildDoctoraliaDoctorUpsertData } from '../mappings/license.util';
 
 @Processor('sync-queue')
 export class SyncProcessor extends WorkerHost {
@@ -150,18 +151,11 @@ export class SyncProcessor extends WorkerHost {
                 totalProcessed++; // Increment totalProcessed for each doctor
 
                 // Save typed table
+                const doctorUpsert = buildDoctoraliaDoctorUpsertData(doc, facilityId);
                 const doctoraliaDoctor = await this.prisma.doctoraliaDoctor.upsert({
                     where: { doctoraliaDoctorId: docId },
-                    create: {
-                        doctoraliaDoctorId: docId,
-                        doctoraliaFacilityId: facilityId,
-                        name: doc.surname ? `${doc.name} ${doc.surname}` : (doc.name || doc.title || `Doctor #${docId}`),
-                        syncedAt: new Date()
-                    },
-                    update: {
-                        name: doc.surname ? `${doc.name} ${doc.surname}` : (doc.name || doc.title || `Doctor #${docId}`),
-                        syncedAt: new Date()
-                    }
+                    create: doctorUpsert.create,
+                    update: doctorUpsert.update,
                 });
 
                 // Fetch Addresses for this doctor

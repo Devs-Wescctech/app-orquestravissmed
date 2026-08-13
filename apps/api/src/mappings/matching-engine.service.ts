@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import * as stringSimilarity from 'string-similarity';
 import { MatchType } from '@prisma/client';
+import { parseLicenseString, councilsCompatible, ParsedLicense } from './license.util';
 
 @Injectable()
 export class MatchingEngineService {
@@ -667,6 +668,15 @@ export class MatchingEngineService {
         const dDoctors = await this.prisma.doctoraliaDoctor.findMany();
         if (dDoctors.length === 0) return false;
 
+        // Layer 0 (Task 141): match por CRM (registro profissional), alta confiança.
+        // - LINKED: vínculo criado por CRM (mesmo com nomes bem diferentes).
+        // - REVIEW: colisão/ambiguidade de CRM → fila de revisão manual; NÃO cai
+        //   para as camadas por nome (evidência conflitante bloqueia auto-link).
+        // - NONE: sem CRM utilizável ou sem candidato → fluxo por nome intacto.
+        const crmOutcome = await this.runCrmMatchLayer(doc, dDoctors);
+        if (crmOutcome === 'LINKED') return true;
+        if (crmOutcome === 'REVIEW') return false;
+
         // Layer 1: Exact Match
         const exactMatch = dDoctors.find(d => this.normalizeString(d.name) === normDoc);
         if (exactMatch) {
@@ -739,6 +749,106 @@ export class MatchingEngineService {
     }
 
     /**
+     * Task 141 — Camada 0: match por CRM (registro profissional).
+     *
+     * Garantias:
+     *  - Conselho faz parte da identidade (CRM × CRP nunca casam);
+     *  - UFs divergentes nunca casam;
+     *  - Com UF nos dois lados, a chave é conselho+UF+número;
+     *  - Sem UF confiável, auto-link somente quando o número normalizado é
+     *    único e inequívoco nos DOIS lados;
+     *  - Qualquer colisão/duplicata vai para a fila DoctorMatchReview.
+     */
+    async runCrmMatchLayer(
+        doc: { id: string; name: string; documentNumber?: string | null; documentType?: string | null },
+        dDoctors: Array<{ id: string; doctoraliaDoctorId: string; name: string; licenseNumbers?: string[] | null }>,
+    ): Promise<'LINKED' | 'REVIEW' | 'NONE'> {
+        const vLic = parseLicenseString(doc.documentNumber, doc.documentType);
+        // Sem conselho identificável no lado VisMed, não há identidade confiável.
+        if (!vLic || !vLic.council) return 'NONE';
+
+        type Entry = { d: (typeof dDoctors)[number]; p: ParsedLicense; raw: string };
+        const entries: Entry[] = [];
+        for (const d of dDoctors) {
+            for (const raw of (d.licenseNumbers || [])) {
+                const p = parseLicenseString(raw);
+                if (p) entries.push({ d, p, raw });
+            }
+        }
+        if (entries.length === 0) return 'NONE';
+
+        // Mesmo número + conselho compatível + UF não-contraditória
+        const compat = entries.filter(e =>
+            e.p.digits === vLic.digits &&
+            councilsCompatible(vLic.council, e.p.council) &&
+            !(vLic.uf && e.p.uf && e.p.uf !== vLic.uf)
+        );
+        if (compat.length === 0) return 'NONE';
+
+        // Chave preferencial CRM+UF quando os DOIS lados têm UF
+        let selected = compat;
+        let keyed = false; // true = match ancorado em conselho+UF+número
+        if (vLic.uf) {
+            const ufExact = compat.filter(e => e.p.uf === vLic.uf);
+            if (ufExact.length > 0) { selected = ufExact; keyed = true; }
+        }
+
+        const fmtKey = `${vLic.council}${vLic.uf ? '/' + vLic.uf : ''} ${vLic.digits}`;
+        const candidateDoctors = Array.from(new Map(selected.map(e => [e.d.id, e.d])).values());
+
+        // Colisão no lado Doctoralia: mesmo registro em 2+ médicos → revisão manual
+        if (candidateDoctors.length > 1) {
+            const reason = `Conflito de CRM: ${candidateDoctors.length} médicos Doctoralia possuem o registro ${fmtKey} (${candidateDoctors.map(c => `"${c.name}"`).join(', ')}) — auto-vínculo bloqueado.`;
+            this.logger.warn(`[CRM-MATCH] ${reason} (VisMed: "${doc.name}")`);
+            await this.upsertDoctorMatchReview(doc.id, candidateDoctors, reason, null, 0, 'CRM_CONFLICT');
+            return 'REVIEW';
+        }
+
+        // Regra conservadora sem chave UF: o número precisa ser único no lado
+        // Doctoralia considerando TODAS as entradas de conselho compatível
+        // (inclusive UFs que contradiriam — sem UF confiável não dá para separar).
+        if (!keyed) {
+            const sameNumberDoctors = new Set(
+                entries
+                    .filter(e => e.p.digits === vLic.digits && councilsCompatible(vLic.council, e.p.council))
+                    .map(e => e.d.id)
+            );
+            if (sameNumberDoctors.size > 1) {
+                const others = dDoctors.filter(d => sameNumberDoctors.has(d.id));
+                const reason = `Conflito de CRM sem UF confiável: o número ${vLic.digits} (${vLic.council}) aparece em ${others.length} médicos Doctoralia (${others.map(c => `"${c.name}"`).join(', ')}) — auto-vínculo bloqueado.`;
+                this.logger.warn(`[CRM-MATCH] ${reason} (VisMed: "${doc.name}")`);
+                await this.upsertDoctorMatchReview(doc.id, others, reason, null, 0, 'CRM_CONFLICT');
+                return 'REVIEW';
+            }
+        }
+
+        const candidate = candidateDoctors[0];
+
+        // Colisão no lado VisMed: outro médico com o mesmo registro → revisão manual
+        const otherVismed = await this.prisma.vismedDoctor.findMany({
+            where: { id: { not: doc.id }, documentNumber: { not: null } },
+            select: { id: true, name: true, documentNumber: true, documentType: true },
+        });
+        const vClashes = otherVismed.filter(o => {
+            const p = parseLicenseString(o.documentNumber, o.documentType);
+            if (!p || p.digits !== vLic.digits) return false;
+            if (!councilsCompatible(vLic.council, p.council)) return false;
+            if (keyed && p.uf && p.uf !== vLic.uf) return false; // chave com UF: UF divergente é outro registro
+            return true;
+        });
+        if (vClashes.length > 0) {
+            const reason = `Conflito de CRM: o registro ${fmtKey} também está cadastrado para outro(s) médico(s) VisMed: ${vClashes.map(c => `"${c.name}"`).join(', ')} — auto-vínculo bloqueado.`;
+            this.logger.warn(`[CRM-MATCH] ${reason} (VisMed: "${doc.name}")`);
+            await this.upsertDoctorMatchReview(doc.id, [candidate], reason, null, 0, 'CRM_CONFLICT');
+            return 'REVIEW';
+        }
+
+        await this.createDoctorMapping(doc.id, candidate.id);
+        this.logger.log(`[CRM-MATCH] Registro ${fmtKey}${keyed ? '' : ' (sem UF, número único nos dois lados)'}: "${doc.name}" → "${candidate.name}" — AUTO-LINKED`);
+        return 'LINKED';
+    }
+
+    /**
      * Cria/atualiza a fila de revisão manual para um médico com match ambíguo.
      * - Se já existe review PENDING, apenas atualiza candidatos/motivo.
      * - Se a última decisão foi DISMISSED com o MESMO conjunto de candidatos, não recria
@@ -750,13 +860,14 @@ export class MatchingEngineService {
         reason: string | null,
         fuzzyBest: { id: string; doctoraliaDoctorId: string; name: string } | null,
         fuzzyScore: number,
+        source: string = 'NAME_SUBSET',
     ): Promise<void> {
         try {
             const candidates: any[] = subsetMatches.map(m => ({
                 doctoraliaDoctorUuid: m.id,
                 doctoraliaDoctorId: m.doctoraliaDoctorId,
                 name: m.name,
-                source: 'NAME_SUBSET',
+                source,
                 score: fuzzyBest && fuzzyBest.id === m.id ? Math.round(fuzzyScore * 100) / 100 : undefined,
             }));
             if (fuzzyBest && fuzzyScore >= 0.75 && !candidates.some(c => c.doctoraliaDoctorUuid === fuzzyBest.id)) {

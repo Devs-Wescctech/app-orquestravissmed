@@ -308,6 +308,9 @@ model DoctoraliaDoctor {
   doctoraliaDoctorId   String   @unique
   doctoraliaFacilityId String
   name                 String
+  // Task 141: registros profissionais (ex.: "CRM/SP 12345") vindos da extensão
+  // ?with[]=doctor.license_numbers da API Doctoralia. Lista pode ser vazia.
+  licenseNumbers       String[] @default([])
   syncedAt             DateTime @default(now())
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt

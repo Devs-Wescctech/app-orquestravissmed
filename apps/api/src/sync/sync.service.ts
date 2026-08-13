@@ -11,6 +11,7 @@ import { getDoctoraliaContext, runWithDoctoraliaContext } from '../metrics/docto
 import { ClinicConcurrencyGuard } from '../bookings/clinic-concurrency-guard';
 import { getDoctoraliaMetricsService, concurrencyActorOf } from '../metrics/doctoralia-metrics.service';
 import { isDoctoraliaCircuitOpenError } from '../integrations/doctoralia-circuit-breaker';
+import { buildDoctoraliaDoctorUpsertData } from '../mappings/license.util';
 
 @Injectable()
 export class SyncService {
@@ -545,17 +546,11 @@ export class SyncService {
                 await this.saveGenericMapping(clinicId, 'DOCTOR', docId, doc, syncRunId);
                 totalProcessed++;
 
+                const doctorUpsert = buildDoctoraliaDoctorUpsertData(doc, facilityId);
                 const doctoraliaDoctor = await this.prisma.doctoraliaDoctor.upsert({
                     where: { doctoraliaDoctorId: docId },
-                    create: {
-                        doctoraliaDoctorId: docId, doctoraliaFacilityId: facilityId,
-                        name: doc.surname ? `${doc.name} ${doc.surname}` : (doc.name || doc.title || `Doctor #${docId}`),
-                        syncedAt: new Date()
-                    },
-                    update: {
-                        name: doc.surname ? `${doc.name} ${doc.surname}` : (doc.name || doc.title || `Doctor #${docId}`),
-                        syncedAt: new Date()
-                    }
+                    create: doctorUpsert.create,
+                    update: doctorUpsert.update,
                 });
 
                 try {
