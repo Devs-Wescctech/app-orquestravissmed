@@ -42,7 +42,15 @@ export class DocplannerClient implements OnModuleDestroy {
      * (405 + captcha). Um token vale ~1h; reutilizá-lo reduz a ~24 autenticações/dia.
      */
     private static tokenCache = new Map<string, CachedToken>();
-    private static inflightAuth = new Map<string, Promise<string>>();
+    /**
+     * Single-flight de autenticação por credencial (`domain|clientId`).
+     * `fresh=true` indica que a promessa fará (ou já está fazendo) um POST OAuth
+     * novo — só essas podem ser compartilhadas por forceRefresh/pós-401. Entradas
+     * `fresh=false` ainda podem resolver via token persistido no banco.
+     * A entrada é registrada SINCRONAMENTE no miss do cache (sem await entre o
+     * miss e o set), fechando a janela de corrida que gerava POSTs duplicados.
+     */
+    private static inflightAuth = new Map<string, { promise: Promise<string>; fresh: boolean }>();
 
     /**
      * Limitador GLOBAL de vazão (todas as instâncias/conexões): o AWS WAF da Doctoralia
@@ -576,36 +584,74 @@ export class DocplannerClient implements OnModuleDestroy {
                 this.accessToken = cached.token;
                 return cached.token;
             }
-            // Memória vazia (ex.: restart do container): tenta o token persistido no banco.
-            if (this.persistLoad) {
-                try {
-                    const persisted = await this.persistLoad();
-                    if (persisted && persisted.expiresAt > Date.now()) {
-                        DocplannerClient.tokenCache.set(cacheKey, persisted);
-                        this.accessToken = persisted.token;
-                        this.logger.log(`Token OAuth recuperado do banco para ${cacheKey.split('|')[0]} (válido por ~${Math.round((persisted.expiresAt - Date.now()) / 60000)}min).`);
-                        return persisted.token;
-                    }
-                } catch (err: any) {
-                    this.logger.warn(`Falha ao ler token persistido: ${err?.message}`);
-                }
+            // Dedupe: se já há autenticação em andamento para esta credencial,
+            // aguarda-a — verificado ANTES de qualquer await (sem janela de corrida).
+            const existing = DocplannerClient.inflightAuth.get(cacheKey);
+            if (existing) {
+                const token = await existing.promise;
+                this.accessToken = token;
+                return token;
             }
-        } else {
-            DocplannerClient.tokenCache.delete(cacheKey);
-        }
-
-        // Dedupe: se outra instância já está autenticando este mesmo clientId, aguarda-a
-        // em vez de disparar outro POST /oauth/v2/token.
-        let inflight = DocplannerClient.inflightAuth.get(cacheKey);
-        if (!inflight) {
-            inflight = this.fetchNewToken(domain, cacheKey).finally(() => {
+            // Registro SÍNCRONO do single-flight: nenhum await entre o miss do cache
+            // e o set da promessa compartilhada. O carregamento do token persistido
+            // (banco) acontece DENTRO da promessa — quem chegar durante esse await
+            // adere à mesma promessa em vez de disparar outro POST OAuth.
+            const entry: { promise: Promise<string>; fresh: boolean } = { promise: null as any, fresh: false };
+            entry.promise = (async () => {
+                // Memória vazia (ex.: restart do container): tenta o token persistido no banco.
+                if (this.persistLoad) {
+                    try {
+                        const persisted = await this.persistLoad();
+                        if (persisted && persisted.expiresAt > Date.now()) {
+                            DocplannerClient.tokenCache.set(cacheKey, persisted);
+                            this.logger.log(`Token OAuth recuperado do banco para ${cacheKey.split('|')[0]} (válido por ~${Math.round((persisted.expiresAt - Date.now()) / 60000)}min).`);
+                            return persisted.token;
+                        }
+                    } catch (err: any) {
+                        this.logger.warn(`Falha ao ler token persistido: ${err?.message}`);
+                    }
+                }
+                entry.fresh = true; // a partir daqui é um POST OAuth de verdade
+                return this.fetchNewToken(domain, cacheKey);
+            })().finally(() => {
                 DocplannerClient.inflightAuth.delete(cacheKey);
             });
-            DocplannerClient.inflightAuth.set(cacheKey, inflight);
+            DocplannerClient.inflightAuth.set(cacheKey, entry);
+            const token = await entry.promise;
+            this.accessToken = token;
+            return token;
         }
-        const token = await inflight;
-        this.accessToken = token;
-        return token;
+
+        // forceRefresh: precisa de um token NOVO. Compartilha um in-flight existente
+        // apenas se ele for "fresh" (já vai fazer POST OAuth); se for um carregamento
+        // do token persistido (potencialmente o token velho que causou o 401), espera
+        // terminar e tenta de novo — sem nunca disparar dois POSTs em paralelo.
+        DocplannerClient.tokenCache.delete(cacheKey);
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+            const existing = DocplannerClient.inflightAuth.get(cacheKey);
+            if (!existing) {
+                const entry: { promise: Promise<string>; fresh: boolean } = { promise: null as any, fresh: true };
+                entry.promise = this.fetchNewToken(domain, cacheKey).finally(() => {
+                    DocplannerClient.inflightAuth.delete(cacheKey);
+                });
+                DocplannerClient.inflightAuth.set(cacheKey, entry);
+                const token = await entry.promise;
+                this.accessToken = token;
+                return token;
+            }
+            if (existing.fresh) {
+                // Dois forceRefresh/401 simultâneos compartilham o MESMO refresh.
+                const token = await existing.promise;
+                this.accessToken = token;
+                return token;
+            }
+            // In-flight não-fresh (pode resolver com token persistido/stale): espera
+            // terminar (sucesso ou erro) e reavalia. Cada iteração consome um in-flight
+            // concluído, então o laço termina — sem deadlock.
+            await existing.promise.catch(() => { /* erro tratado pelo dono da promessa */ });
+            DocplannerClient.tokenCache.delete(cacheKey);
+        }
     }
 
     /** IP público de saída no instante da chamada (cache de 5min; falha vira "desconhecido"). */
