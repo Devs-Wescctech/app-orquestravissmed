@@ -102,7 +102,7 @@ async function readConnections(databaseUrl) {
     const prisma = new PrismaClient({ datasourceUrl: databaseUrl });
     try {
         return await prisma.integrationConnection.findMany({
-            select: { clinicId: true, provider: true, domain: true },
+            select: { clinicId: true, provider: true, domain: true, status: true },
         });
     } finally {
         await prisma.$disconnect();

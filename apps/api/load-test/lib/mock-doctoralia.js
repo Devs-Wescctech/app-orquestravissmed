@@ -7,14 +7,16 @@
  */
 const https = require('node:https');
 const { CallLog } = require('./call-log');
+const { WAF_BODY } = require('./fault-injector');
 
 function items(arr) { return { _items: arr }; }
 
 class MockDoctoralia {
-    constructor({ dataset, tls, port }) {
+    constructor({ dataset, tls, port, faultInjector = null }) {
         this.dataset = dataset;
         this.tls = tls;
         this.port = port;
+        this.faults = faultInjector; // WP-13: plano de falhas opcional (avaliado antes dos handlers)
         this.log = new CallLog('doctoralia');
         this.oauthCount = 0;
         // Índices por facility
@@ -47,12 +49,13 @@ class MockDoctoralia {
     }
 
     async stop() {
+        if (this.faults) this.faults.stop(); // destrói sockets pendurados do timeout
         if (this.server) await new Promise(r => this.server.close(r));
     }
 
-    reply(res, status, payload, meta) {
+    reply(res, status, payload, meta, headers = {}) {
         this.log.record({ ...meta, status });
-        res.writeHead(status, { 'content-type': 'application/json' });
+        res.writeHead(status, { 'content-type': 'application/json', ...headers });
         res.end(payload === null ? '' : JSON.stringify(payload));
     }
 
@@ -66,10 +69,58 @@ class MockDoctoralia {
         };
         const send = (status, payload, matched = true) => this.reply(res, status, payload, { ...meta, matched });
 
+        // ── WP-13: fault injection (avaliado ANTES dos handlers) ────────────
+        let oauthExpiresIn = 3600;
+        if (this.faults) {
+            const rule = this.faults.evaluate(method, p, arrivedAt);
+            if (rule) {
+                meta.faultTag = rule.tag;
+                switch (rule.action) {
+                    case 'http429':
+                        return this.reply(res, 429, { error: 'rate limited (injected)' }, { ...meta, matched: true },
+                            rule.params.retryAfterSec != null ? { 'retry-after': String(rule.params.retryAfterSec) } : {});
+                    case 'http503':
+                        return this.reply(res, 503, { error: 'service unavailable (injected)' }, { ...meta, matched: true });
+                    case 'waf': {
+                        // Contrato EXATO do classificador produtivo: 405 + body WAF.
+                        this.log.record({ ...meta, matched: true, status: 405 });
+                        res.writeHead(405, { 'content-type': 'text/html' });
+                        return res.end(WAF_BODY);
+                    }
+                    case 'timeout':
+                        // Nunca responde: cliente aborta em 30s; socket é rastreado
+                        // e destruído no stop() se ainda estiver pendurado.
+                        this.log.record({ ...meta, matched: true, status: 0 });
+                        return this.faults.holdSocket(res);
+                    case 'reset':
+                        this.log.record({ ...meta, matched: true, status: 0 });
+                        return res.socket.destroy();
+                    case 'delay': {
+                        const ms = rule.params.delayMs ?? 1000;
+                        setTimeout(() => {
+                            try { this.route(req, res, body, meta, p, method, oauthExpiresIn); }
+                            catch (err) {
+                                this.reply(res, 500, { error: String(err.message) }, { ...meta, matched: false });
+                            }
+                        }, ms);
+                        return;
+                    }
+                    case 'shortToken':
+                        oauthExpiresIn = rule.params.expiresInSec ?? 180;
+                        break; // segue para o handler normal do OAuth
+                }
+            }
+        }
+        return this.route(req, res, body, meta, p, method, oauthExpiresIn);
+    }
+
+    route(req, res, body, meta, p, method, oauthExpiresIn = 3600) {
+        const send = (status, payload, matched = true) => this.reply(res, status, payload, { ...meta, matched });
+
         // ── OAuth ────────────────────────────────────────────────────────────
         if (p === '/oauth/v2/token' && method === 'POST') {
             this.oauthCount++;
-            return send(200, { access_token: `lt-token-${this.oauthCount}`, expires_in: 3600, token_type: 'bearer' });
+            return send(200, { access_token: `lt-token-${this.oauthCount}`, expires_in: oauthExpiresIn, token_type: 'bearer' });
         }
 
         const api = p.startsWith('/api/v3/integration/') ? p.slice('/api/v3/integration/'.length) : null;

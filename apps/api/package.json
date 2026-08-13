@@ -20,7 +20,8 @@
     "test:e2e": "jest --config ./test/jest-e2e.json",
     "load:test": "node load-test/runner.js",
     "load:scale": "node load-test/run-scale.js",
-    "load:test:spec": "node --test load-test/tests/"
+    "load:test:spec": "node --test load-test/tests/",
+    "load:faults": "node load-test/run-faults.js"
   },
   "dependencies": {
     "@nestjs/bullmq": "^11.0.4",

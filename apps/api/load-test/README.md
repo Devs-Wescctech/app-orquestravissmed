@@ -125,7 +125,87 @@ Exit code: `0` = todos os critérios passaram, `2` = algum critério falhou, `1`
 - Timeouts de espera de SyncRuns e drenagem final também escalam com o nº de
   clínicas.
 
+## WP-13 — Fault injection e resiliência (F1–F5)
+
+Injeção determinística de falhas **só no mock/harness** (código produtivo
+`apps/api/src/**` intocado) para provar degradação controlada e auto-recuperação.
+
+### Como rodar
+
+```bash
+# Bateria completa: Baseline (cenário b, controle saudável) → F1 → F2 → F3 → F4 → F5
+npm run load:faults                      # seed padrão wp13
+node load-test/run-faults.js --seed=wp13 --skip-build
+node load-test/run-faults.js --only=f2   # um cenário isolado
+
+# Ou direto pelo runner:
+node load-test/runner.js --scenario=f1 --profile=medium --seed=wp13 --skip-build
+```
+
+Todos os cenários de falha usam **10 clínicas / medium / seed fixa** e seguem a
+estrutura: janela saudável estrita (T0) → `arm()` do injector → bomba de carga
+contínua durante a janela de falha → espera de recuperação (breaker CLOSED +
+filas 0 + sem runs ativos) → **janela final de sync saudável** (obrigatória).
+Durante fault injection o collector amostra a cada **1,5s** (timeline fina).
+
+### Fault injector (`lib/fault-injector.js`)
+
+Plano = lista de regras `{tag, method, pathRe, startMs, endMs, action, params,
+modulo}` com janelas temporais **relativas ao `arm()`** e parâmetros derivados
+da seed (determinístico). Primeira regra que casa vence. Ações: `http429` (com/
+sem `Retry-After`), `http503`, `delay` (latência <30s), `timeout` (segura o
+socket sem responder; destruído no `stop()`), `reset` (destrói a conexão),
+`waf` (**contrato exato do classificador produtivo**: HTTP 405 + body casando
+`/captcha|challenge|awswaf|human|verifica/i`) e `shortToken` (OAuth com
+`expires_in` curto p/ forçar refresh). Cada injeção é registrada no CallLog com
+a `faultTag` da regra.
+
+### Planos (`lib/fault-plans.js`)
+
+- **F1 — 429**: F1-A intermitente (~1/3 das reqs, 0–60s; WP-07 absorve, breaker
+  fica CLOSED) + gap saudável + F1-B sustentado (90–210s; 5 operações lógicas
+  exauridas → breaker abre, cooldown, HALF_OPEN, probe, CLOSED).
+- **F2 — 503** sustentado (0–150s): OPEN → 1ª probe (~+60s) ainda na janela →
+  FALHA → reabre com cooldown **dobrado** (120s) → 2ª probe fecha.
+- **F3 — timeout >30s** (0–180s): AbortController aborta a 30s, retries e
+  breaker reagem, sockets pendurados não sobrevivem, filas drenam depois.
+- **F4 — WAF** em duas janelas no mesmo cenário: GET comum (0–20s) e OAuth
+  (480–660s, com `shortToken` forçando refresh na janela). Abertura em **1**
+  resposta, zero retry do request WAFado, cooldown ≥5min, recuperação por probe.
+- **F5 — API lenta sem erro**: delay 11–13s (<30s, sem abort) por 120s — valida
+  WP-08B: filas crescem, deadlines (HIGH 15s / LOW ~61s) geram QueueFull/
+  QueueTimeout que **não** alimentam o breaker nem marcam a integração como
+  error; backlog drena após a janela.
+
+### Relatório e critérios (`lib/fault-report.js`)
+
+Timeline obrigatória **T0→T6** (HEALTHY → falha → proteção reage → mock volta a
+200 → recuperação detectada → filas drenadas → HEALTHY) com os deltas entre
+etapas. Critérios PASS/FAIL automáticos: budgets nunca excedidos (400/5min,
+40 WRITE/min, 2.400/h); zero writes duplicados; zero corrida de OAuth (<5s);
+breaker abre **somente** quando deveria (F1-A e F5 exigem CLOSED); durante OPEN
+zero arrivals no mock (fast-fail via CallLog, com graça p/ retries in-flight
+admitidos antes do OPEN); HALF_OPEN com exatamente 1 probe; volta a CLOSED;
+filas 0 ao final; nenhum SyncRun preso; toda clínica completa full+vismed-full
+**pós-recuperação**; F2 exige razão ~2× entre durações OPEN; F4 exige abertura
+imediata, zero retry WAFado e OPEN ≥5min; F5 exige QueueFull/Timeout > 0 com
+breaker sempre CLOSED; nenhuma conexão pode terminar com status persistido
+'error' no banco (QueueFull/QueueTimeout não podem desconectar a integração); memória estável; encerramento limpo; nenhum host real.
+
+### Regra de parada
+
+`run-faults.js` executa Baseline → F1 → … → F5 **um por vez**; no primeiro FAIL
+estrutural a bateria **PARA**: o relatório do cenário é mantido, o consolidado
+(`reports/wp13-consolidado-*.{md,json}`) registra a primeira limitação
+estrutural e **nada é corrigido, repetido ou relaxado** para passar. Relatórios
+individuais: `reports/scenario-f?-medium-*.{md,json}` + NDJSON de arrivals.
+
+### Testes do injector
+
+`tests/fault-injector.test.js`: janela aberta/fechada/desarmado, `modulo`
+determinístico, cada ação de falha contra o MockDoctoralia real (HTTPS
+loopback) e o corpo WAF exato validado contra o regex do classificador.
+
 ## Roadmap
 
 - **WP-12C**: soak 30min/1h/2h e bursts (restart/cache frio).
-- **WP-13**: injeção de falhas (429, 503, timeout, WAF) nos mocks.

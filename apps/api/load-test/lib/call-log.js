@@ -16,7 +16,7 @@ class CallLog {
         this.unmatched = [];
     }
 
-    record({ method, path, body, matched, status, authHeader, correlationId, arrivedAt }) {
+    record({ method, path, body, matched, status, authHeader, correlationId, arrivedAt, faultTag }) {
         // authHeader entra no hash: escritas idênticas de CREDENCIAIS diferentes
         // (ex.: OAuth de duas clínicas) não são duplicatas.
         const hashInput = `${body ?? ''}|auth:${authHeader ?? ''}`;
@@ -32,6 +32,7 @@ class CallLog {
             matched: matched !== false,
             status,
             correlationId: correlationId ?? null,
+            faultTag: faultTag ?? null, // WP-13: tag da regra de falha injetada (null = resposta normal)
         };
         this.calls.push(entry);
         if (matched === false) this.unmatched.push({ method, path });

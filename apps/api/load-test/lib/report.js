@@ -313,4 +313,4 @@ function renderMarkdown(report) {
     return lines.join('\n') + '\n';
 }
 
-module.exports = { buildReport, renderMarkdown, sumBaselineCounter, buildCounterComparison };
+module.exports = { buildReport, renderMarkdown, sumBaselineCounter, buildCounterComparison, checkMemoryStabilization };

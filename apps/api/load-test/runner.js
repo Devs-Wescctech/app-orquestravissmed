@@ -24,7 +24,10 @@ const { TestDb } = require('./lib/testdb');
 const { seedDatabase, readConnections, readSyncRuns } = require('./lib/seed');
 const { assertAllGuards, assertSafeDatabaseUrl } = require('./lib/guards');
 const { Collector } = require('./lib/collector');
-const { buildReport, renderMarkdown } = require('./lib/report');
+const { buildReport, renderMarkdown, checkMemoryStabilization } = require('./lib/report');
+const { FaultInjector } = require('./lib/fault-injector');
+const { buildFaultPlan } = require('./lib/fault-plans');
+const { buildFaultReport, renderFaultMarkdown, breakerOf } = require('./lib/fault-report');
 const { analyzeGrantDispatchArrival } = require('./lib/grant-dispatch');
 const { findBaselineReport, loadBaseline, compareWithBaseline } = require('./lib/baseline-compare');
 
@@ -101,6 +104,11 @@ async function main() {
     let rawInternalEvents = []; // WP-12C: eventos brutos da API (grant/dispatch), coletados antes do shutdown
     let authToken = null;
 
+    // WP-13: plano de falhas + marcos da timeline (só em cenários f1–f5)
+    const faultPlan = scenario.fault ? buildFaultPlan(scenario.fault, args.seed) : null;
+    let faultArmAt = null;
+    const faultMarks = {};
+
     // WP-12C: coleta os eventos brutos (enqueuedAt/releasedAt/sentAt) da API viva.
     const fetchRawEvents = async () => {
         if (!authToken || !apiProc || apiProc.exitCode !== null) return;
@@ -171,8 +179,41 @@ async function main() {
 
     // Persistência imediata do relatório (completo ou parcial) — nunca sobrescreve
     // anteriores (timestamp no nome) e grava assim que o cenário termina.
+    let finalConnections = null; // WP-13: status persistido das conexões ao final
     const persistReport = ({ syncRuns = [], partial = false, interruptionReason = null } = {}) => {
         const endedAt = new Date().toISOString();
+        // WP-13: cenários de falha usam o relatório próprio (timeline T0–T6 +
+        // critérios de resiliência). Se a falha ocorreu ANTES do arm, cai no
+        // relatório padrão (não houve injeção ainda).
+        if (faultPlan && faultArmAt !== null && docMock?.log) {
+            const { report, passed } = buildFaultReport({
+                plan: faultPlan, armAt: faultArmAt, marks: faultMarks,
+                docLog: docMock.log, visLog: visMock.log,
+                baselineSnapshots: collector?.baselineSnapshots ?? [],
+                syncRuns, connections: finalConnections,
+                expected: { clinicIds: dataset.clinics.map(c => c.id) },
+                actions, notes, cleanExit,
+                processSamples: collector?.processSamples ?? [],
+                lagSamples: collector?.readLagSamples?.() ?? [],
+                scenario: args.scenario, profile: args.profile, seed: args.seed,
+                startedAt, endedAt, tlsApproach: TLS_APPROACH,
+                partial, interruptionReason,
+                memoryCheck: checkMemoryStabilization, sampleIntervalMs: 1500,
+            });
+            const stamp = endedAt.replace(/[:.]/g, '-');
+            const suffix = partial ? '-PARTIAL' : '';
+            const jsonPath = path.join(REPORT_DIR, `scenario-${args.scenario}-${args.profile}-${stamp}${suffix}.json`);
+            const mdPath = path.join(REPORT_DIR, `scenario-${args.scenario}-${args.profile}-${stamp}${suffix}.md`);
+            fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2));
+            fs.writeFileSync(mdPath, renderFaultMarkdown(report));
+            if (docMock.log.calls.length) {
+                const ndjson = (arr) => arr.map(x => JSON.stringify(x)).join('\n') + '\n';
+                fs.writeFileSync(path.join(REPORT_DIR, `scenario-${args.scenario}-${args.profile}-${stamp}${suffix}-mock-arrivals.ndjson`), ndjson(docMock.log.calls));
+            }
+            log(`Relatório WP-13${partial ? ' PARCIAL' : ''}: ${jsonPath}`);
+            log(`Resumo:          ${mdPath}`);
+            return { report, passed, jsonPath, mdPath, renderer: 'fault' };
+        }
         const emptyLog = (name) => ({
             summary: () => ({ mock: name, totalCalls: 0, reads: 0, writes: 0, duplicateWrites: [], unmatchedPaths: [], byPathClass: {} }),
             budgetAudit: () => ({ peakAgg5min: 0, limitAgg5min: 400, aggOk: true, peakWrites1min: 0, limitWrites1min: 40, writesMinOk: true, peakWrites1h: 0, limitWrites1h: 2400, writesHourOk: true }),
@@ -271,7 +312,7 @@ async function main() {
         log(`Guards anti-produção OK (${connections.length} conexões, todas loopback).`);
 
         // ── Mocks ────────────────────────────────────────────────────────────
-        docMock = new MockDoctoralia({ dataset, tls, port: DOC_PORT });
+        docMock = new MockDoctoralia({ dataset, tls, port: DOC_PORT, faultInjector: faultPlan ? new FaultInjector(faultPlan) : null });
         visMock = new MockVismed({ dataset, tls, port: VIS_PORT });
         await docMock.start();
         await visMock.start();
@@ -308,7 +349,8 @@ async function main() {
         // ── Coleta + reset do baseline ───────────────────────────────────────
         const reset = await api(API_BASE, token, 'POST', '/metrics/doctoralia-baseline/reset');
         if (!reset.ok) throw new Error(`Reset do baseline falhou: HTTP ${reset.status}`);
-        collector = new Collector({ apiBase: API_BASE, token, apiPid: apiProc.pid, dbUrl: db.url, lagFile, intervalMs: 5000 });
+        // WP-13: durante fault injection a amostragem cai p/ 1,5s (timeline T0–T6)
+        collector = new Collector({ apiBase: API_BASE, token, apiPid: apiProc.pid, dbUrl: db.url, lagFile, intervalMs: faultPlan ? 1500 : 5000 });
         collector.start();
 
         // ── Cenário A ────────────────────────────────────────────────────────
@@ -338,17 +380,21 @@ async function main() {
             notes.push(`${label}: timeout aguardando SyncRuns terminarem (${timeoutMs}ms).`);
         };
 
-        for (let w = 1; w <= scenario.globalSyncWindows; w++) {
-            log(`— Janela de global sync ${w}/${scenario.globalSyncWindows} —`);
+        // Uma janela completa de sync (global + polls + sweep + slot-sync).
+        // strict=false (WP-13): tolera HTTP >=400 (a falha é o objeto do teste;
+        // os critérios do relatório julgam a semântica, não o status pontual).
+        const runWindow = async (w, { strict = true } = {}) => {
+            const tolerate = !strict;
+            log(`— Janela de global sync ${w} (${strict ? 'estrita' : 'tolerante'}) —`);
             for (const c of dataset.clinics) {
-                await act(`global-sync ${c.id} (janela ${w})`, 'POST', `/sync/${c.id}/global`);
+                await act(`global-sync ${c.id} (janela ${w})`, 'POST', `/sync/${c.id}/global`, undefined, { tolerate });
             }
             await waitForRuns(`janela ${w}`);
-            await act(`poll Doctoralia (janela ${w})`, 'POST', '/booking-sync/poll');
+            await act(`poll Doctoralia (janela ${w})`, 'POST', '/booking-sync/poll', undefined, { tolerate });
             for (const c of dataset.clinics) {
-                await act(`poll VisMed ${c.id} (janela ${w})`, 'POST', `/booking-sync/poll-vismed?clinicId=${c.id}`);
+                await act(`poll VisMed ${c.id} (janela ${w})`, 'POST', `/booking-sync/poll-vismed?clinicId=${c.id}`, undefined, { tolerate });
             }
-            await act(`safety-sweep (janela ${w})`, 'POST', '/booking-sync/safety-sweep');
+            await act(`safety-sweep (janela ${w})`, 'POST', '/booking-sync/safety-sweep', undefined, { tolerate });
             // slot sync pode colidir com o guard de concorrência (HTTP 409 é o
             // guard funcionando, não erro): os pollers em background podem segurar
             // o guard de uma clínica por minutos em escala. Round-robin: tenta
@@ -364,13 +410,62 @@ async function main() {
                     for (const id of [...pending]) {
                         const r = await act(`slot-sync ${id} (janela ${w}, rodada ${round})`, 'POST', `/sync/${id}/slots`, undefined, { tolerate: true });
                         if (r.status < 400) pending.delete(id);
-                        else if (r.status !== 409) throw new Error(`slot-sync ${id} (janela ${w}) falhou com HTTP ${r.status} (não é colisão do guard)`);
+                        else if (r.status !== 409 && strict) throw new Error(`slot-sync ${id} (janela ${w}) falhou com HTTP ${r.status} (não é colisão do guard)`);
+                        else if (r.status !== 409) pending.delete(id); // tolerante: erro contabilizado nas actions
                     }
                     if (pending.size) await sleep(5000);
                 }
-                if (pending.size) throw new Error(`slot-sync não conseguiu executar para ${pending.size} clínica(s) em ${Math.round(slotDeadlineMs / 1000)}s (guard ocupado além do deadline): ${[...pending].join(', ')}`);
+                if (pending.size && strict) throw new Error(`slot-sync não conseguiu executar para ${pending.size} clínica(s) em ${Math.round(slotDeadlineMs / 1000)}s (guard ocupado além do deadline): ${[...pending].join(', ')}`);
+                if (pending.size) notes.push(`Janela ${w}: slot-sync não executou para ${[...pending].join(', ')} (tolerado no modo fault).`);
             }
             await waitForRuns(`pós-janela ${w}`);
+        };
+
+        if (!faultPlan) {
+            for (let w = 1; w <= scenario.globalSyncWindows; w++) await runWindow(w);
+        } else {
+            // ── WP-13: cenário de falha F1–F5 ────────────────────────────────
+            log(`WP-13: plano ${faultPlan.key} — ${faultPlan.title}`);
+            // T0: janela saudável ESTRITA antes da falha (HEALTHY comprovado)
+            await runWindow('T0-healthy', { strict: true });
+            faultMarks.healthyDoneAt = Date.now();
+
+            faultArmAt = docMock.faults.arm();
+            log(`Injector ARMADO em ${new Date(faultArmAt).toISOString()} — janelas de falha relativas a este instante.`);
+
+            // Bomba de carga contínua durante driveMs: demanda constante expõe
+            // retries, abertura do breaker, fast-fail e backpressure.
+            const pumpEnd = faultArmAt + faultPlan.driveMs;
+            let i = 0;
+            while (Date.now() < pumpEnd) {
+                const c = dataset.clinics[i % dataset.clinics.length];
+                await act(`pump global-sync ${c.id} (#${i})`, 'POST', `/sync/${c.id}/global`, undefined, { tolerate: true });
+                if (i % 2 === 0) await act(`pump poll Doctoralia (#${i})`, 'POST', '/booking-sync/poll', undefined, { tolerate: true });
+                if (i % 5 === 3) await act(`pump safety-sweep (#${i})`, 'POST', '/booking-sync/safety-sweep', undefined, { tolerate: true });
+                i++;
+                await sleep(8000);
+            }
+            faultMarks.driveDoneAt = Date.now();
+            log(`Fase de falha encerrada (${i} iterações de pump). Aguardando recuperação (até ${Math.round(faultPlan.recoveryTimeoutMs / 60000)}min)...`);
+
+            // Recuperação: breaker CLOSED (quando aplicável) + filas 0 + sem runs ativos.
+            const recDeadline = Date.now() + faultPlan.recoveryTimeoutMs;
+            while (Date.now() < recDeadline) {
+                await sleep(3000);
+                const snap = collector.baselineSnapshots[collector.baselineSnapshots.length - 1];
+                const st = breakerOf(snap)?.state ?? 'CLOSED';
+                const q = snap?.baseline?.queue ?? {};
+                const high = q.DOCTORALIA_QUEUE_SIZE_HIGH ?? 0;
+                const low = q.DOCTORALIA_QUEUE_SIZE_LOW ?? 0;
+                const runs = await readSyncRuns(db.url);
+                if (st === 'CLOSED' && high === 0 && low === 0 && !runs.some(r => r.status === 'running')) break;
+            }
+            faultMarks.recoveryAt = Date.now();
+            log(`Recuperação detectada/deadline em ${new Date(faultMarks.recoveryAt).toISOString()}. Janela final de sync saudável...`);
+
+            // Janela final de sync saudável (tolerante: critérios julgam via SyncRuns)
+            await runWindow('T6-final', { strict: false });
+            faultMarks.finalWindowDoneAt = Date.now();
         }
 
         // ── Drenagem final ───────────────────────────────────────────────────
@@ -393,13 +488,14 @@ async function main() {
 
         // ── Shutdown gracioso MEDIDO (check de Promise/timer órfão) ─────────
         const syncRuns = await readSyncRuns(db.url);
+        try { finalConnections = await readConnections(db.url); } catch { /* SEM DADO reprova no relatório */ }
         log('Encerrando a API com SIGTERM (medindo encerramento limpo)...');
         cleanExit = await shutdownApi();
         log(`Shutdown: clean=${cleanExit.clean} exit=${cleanExit.exitCode ?? cleanExit.signal} em ${cleanExit.waitedMs}ms`);
 
         // ── Relatório (persistido imediatamente ao término do cenário) ──────
         const { report, passed } = persistReport({ syncRuns });
-        console.log('\n' + renderMarkdown(report));
+        console.log('\n' + (faultPlan && faultArmAt !== null ? renderFaultMarkdown(report) : renderMarkdown(report)));
         exitCode = passed ? 0 : 2;
     } catch (err) {
         // Falha/interrupção: gerar relatório PARCIAL se houver dados suficientes,
@@ -411,6 +507,7 @@ async function main() {
                 await fetchRawEvents().catch(() => { }); // WP-12C: melhor esforço no parcial
                 let syncRuns = [];
                 try { syncRuns = await readSyncRuns(db.url); } catch { }
+                if (!finalConnections) { try { finalConnections = await readConnections(db.url); } catch { } }
                 persistReport({ syncRuns, partial: true, interruptionReason: err.message });
             } else {
                 log('Sem dados suficientes para relatório parcial — nenhum relatório gravado.');
