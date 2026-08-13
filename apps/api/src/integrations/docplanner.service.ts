@@ -53,6 +53,38 @@ export class DocplannerClient implements OnModuleDestroy {
      */
     private static readonly RATE_LIMIT = 400;
     private static readonly RATE_WINDOW_MS = 5 * 60 * 1000;
+
+    /**
+     * Task 155 (WP-12C, correção mínima) — Headroom temporal ε no refill das
+     * janelas deslizantes. A prova do WP-12C mostrou que, com a janela cheia,
+     * o próximo grant era liberado no instante em que o evento mais antigo
+     * completava EXATAMENTE a janela (zero headroom); o jitter de transporte
+     * (p99=16ms, máx=44ms medido) comprimia a fronteira e as CHEGADAS no
+     * destino caíam dentro de uma janela real <60s (42 WRITEs/59.995ms;
+     * 401/299.961ms), mesmo com grants ≤ limite na semântica estrita.
+     *
+     * ε = 300ms: ~7× o jitter máximo medido (44ms), dentro do intervalo
+     * recomendado pelo parecer (250–500ms); cobre também a divergência de
+     * semântica inclusiva/estrita na fronteira e custa <1% de throughput.
+     * Aplicado a TODAS as janelas (WRITE/min, WRITE/h, agregado/5min): cada
+     * evento "ocupa" seu slot por janela+ε, então, com janela cheia, o próximo
+     * grant só ocorre após `janela + ε` do evento mais antigo. Os BUDGETS
+     * permanecem INTACTOS (40/min, 2.400/h, 400/5min).
+     */
+    private static readonly REFILL_HEADROOM_MS =
+        DocplannerClient.resolveRefillHeadroom(process.env.DOCTORALIA_REFILL_HEADROOM_MS);
+
+    /**
+     * Resolve o ε a partir do override opcional, com CLAMP no intervalo seguro
+     * [250, 500]ms do parecer WP-12C: valor inválido/ausente → 300ms (default);
+     * 0/negativo nunca desabilita a proteção (mínimo 250ms); acima de 500ms
+     * degradaria throughput sem ganho (máx 500ms).
+     */
+    private static resolveRefillHeadroom(raw: string | undefined): number {
+        const parsed = Number.parseInt(raw ?? '', 10);
+        if (!Number.isFinite(parsed)) return 300;
+        return Math.min(500, Math.max(250, parsed));
+    }
     /** Timestamps (epoch ms) das requisições feitas dentro da janela corrente. */
     private static rateTimestamps: number[] = [];
     private static lastThrottleLogAt = 0;
@@ -97,7 +129,16 @@ export class DocplannerClient implements OnModuleDestroy {
             ? Number.parseInt(process.env.DOCTORALIA_QUEUE_CAP_LOW!, 10)
             : 100);
     private static readonly QUEUE_DEADLINE_HIGH_MS = 15_000;
-    private static readonly QUEUE_DEADLINE_LOW_MS = 60_000;
+    /**
+     * Task 155: o deadline LOW precisa acomodar o refill com headroom ε — um
+     * WRITE enfileirado logo após a janela/min encher só recebe slot após
+     * `60s + ε` (60.300ms); com o deadline anterior de exatamente 60.000ms ele
+     * expiraria e seria rejeitado ANTES do refill. Ajuste técnico indispensável
+     * para o ε funcionar sem descartar writes legítimos: 60s + ε + 700ms de
+     * margem de scheduling (≈61s). A semântica do deadline permanece a mesma.
+     */
+    private static readonly QUEUE_DEADLINE_LOW_MS =
+        60_000 + DocplannerClient.REFILL_HEADROOM_MS + 700;
     /** Logs de rejeição rate-limited (fila saturada gera muitos eventos). */
     private static lastQueueRejectLogAt = 0;
     /** WP-08B — Shutdown: recusa novos waiters e impede callbacks pós-shutdown. */
@@ -135,9 +176,10 @@ export class DocplannerClient implements OnModuleDestroy {
         writeFull: boolean;
     } {
         const wts = DocplannerClient.writeTimestamps;
-        const cutoffHour = now - DocplannerClient.WRITE_WINDOW_HOUR_MS;
+        // Headroom ε: cada write ocupa a janela por janela+ε (ver REFILL_HEADROOM_MS).
+        const cutoffHour = now - DocplannerClient.WRITE_WINDOW_HOUR_MS - DocplannerClient.REFILL_HEADROOM_MS;
         while (wts.length && wts[0] <= cutoffHour) wts.shift();
-        const cutoffMin = now - DocplannerClient.WRITE_WINDOW_MIN_MS;
+        const cutoffMin = now - DocplannerClient.WRITE_WINDOW_MIN_MS - DocplannerClient.REFILL_HEADROOM_MS;
         const writeUsedHour = wts.length;
         const writeUsedMin = wts.filter(t => t > cutoffMin).length;
         const writeRemainingMin = Math.max(0, DocplannerClient.WRITE_LIMIT_MIN - writeUsedMin);
@@ -176,7 +218,8 @@ export class DocplannerClient implements OnModuleDestroy {
                     const now = Date.now();
 
                     // ── Janela agregada ─────────────────────────────────────
-                    const cutoff = now - DocplannerClient.RATE_WINDOW_MS;
+                    // Headroom ε: eviction só após janela+ε (ver REFILL_HEADROOM_MS).
+                    const cutoff = now - DocplannerClient.RATE_WINDOW_MS - DocplannerClient.REFILL_HEADROOM_MS;
                     const ts = DocplannerClient.rateTimestamps;
                     while (ts.length && ts[0] <= cutoff) ts.shift();
                     const aggFull = ts.length >= DocplannerClient.RATE_LIMIT;
@@ -191,7 +234,7 @@ export class DocplannerClient implements OnModuleDestroy {
 
                     if (aggFull) {
                         // Todos aguardam a janela agregada
-                        const waitMs = Math.max(ts[0] + DocplannerClient.RATE_WINDOW_MS - now, 250);
+                        const waitMs = Math.max(ts[0] + DocplannerClient.RATE_WINDOW_MS + DocplannerClient.REFILL_HEADROOM_MS - now, 250);
                         if (now - DocplannerClient.lastThrottleLogAt > 30_000) {
                             DocplannerClient.lastThrottleLogAt = now;
                             logger.warn(
@@ -221,13 +264,15 @@ export class DocplannerClient implements OnModuleDestroy {
                         // acorde o pump imediatamente — sem isso, o GET ficaria preso na fila enquanto
                         // o pump dorme esperando o budget WRITE liberar (potencialmente por 1h).
                         const wts = DocplannerClient.writeTimestamps;
-                        const cutoffMin = now - DocplannerClient.WRITE_WINDOW_MIN_MS;
+                        // Headroom ε: o refill só ocorre janela+ε após o evento mais antigo.
+                        const eps = DocplannerClient.REFILL_HEADROOM_MS;
+                        const cutoffMin = now - DocplannerClient.WRITE_WINDOW_MIN_MS - eps;
                         const firstInMin = wts.find(t => t > cutoffMin);
                         const waitMin = wSnap.writeUsedMin >= DocplannerClient.WRITE_LIMIT_MIN && firstInMin !== undefined
-                            ? Math.max(firstInMin + DocplannerClient.WRITE_WINDOW_MIN_MS - now, 50)
+                            ? Math.max(firstInMin + DocplannerClient.WRITE_WINDOW_MIN_MS + eps - now, 50)
                             : Infinity;
                         const waitHour = wSnap.writeUsedHour >= DocplannerClient.WRITE_LIMIT_HOUR && wts.length > 0
-                            ? Math.max(wts[0] + DocplannerClient.WRITE_WINDOW_HOUR_MS - now, 50)
+                            ? Math.max(wts[0] + DocplannerClient.WRITE_WINDOW_HOUR_MS + eps - now, 50)
                             : Infinity;
                         const naturalWaitMs = Math.min(waitMin, waitHour);
                         if (now - DocplannerClient.lastWriteThrottleLogAt > 30_000) {
@@ -399,7 +444,7 @@ export class DocplannerClient implements OnModuleDestroy {
                         const metrics = getDoctoraliaMetricsService();
                         if (metrics) {
                             const now = Date.now();
-                            const cutoffAgg = now - DocplannerClient.RATE_WINDOW_MS;
+                            const cutoffAgg = now - DocplannerClient.RATE_WINDOW_MS - DocplannerClient.REFILL_HEADROOM_MS;
                             const ts = DocplannerClient.rateTimestamps;
                             const used = ts.filter(t => t > cutoffAgg).length;
                             const remaining = DocplannerClient.RATE_LIMIT - used;

@@ -117,7 +117,11 @@ function buildReport(input) {
     // Dados de fila AUSENTES (null) reprovam — ausência não é zero.
     const queueDrained = lastQueue.high === 0 && lastQueue.low === 0;
     const queueWait = finalBaseline?.queue?.waitMs ?? {};
-    const oldestWaiterOk = typeof queueWait.max === 'number' && queueWait.max <= 60_000; // deadline LOW = 60s (HIGH 15s coberto por timeouts abaixo)
+    // Task 155: o deadline LOW passou a 60s + ε(300ms) + 700ms de margem (=61s)
+    // para acomodar o refill com headroom ε — o critério continua o MESMO
+    // ("oldest waiter dentro do deadline LOW"), apenas acompanha o valor vigente.
+    const LOW_DEADLINE_MS = 61_000;
+    const oldestWaiterOk = typeof queueWait.max === 'number' && queueWait.max <= LOW_DEADLINE_MS; // deadline LOW (HIGH 15s coberto por timeouts abaixo)
     const queueTimeouts = sumBaselineCounter(finalBaseline, ['QueueTimeout', 'queueTimeouts', 'timeouts']);
     const queueFull = sumBaselineCounter(finalBaseline, ['QueueFull', 'queueFull', 'rejectedQueueFull']);
     const expiredReservations = sumBaselineCounter(finalBaseline, ['expiredReservations', 'reservationExpired']);
@@ -141,7 +145,7 @@ function buildReport(input) {
         { name: 'Budget WRITE 2.400/h nunca excedido', pass: docBudget.writesHourOk, detail: `pico ${docBudget.peakWrites1h}/${docBudget.limitWrites1h}` },
         { name: 'Zero escrita duplicada nos mocks (janela 120s)', pass: dupWrites.length === 0, detail: `${dupWrites.length} duplicata(s)` },
         { name: 'Filas HIGH/LOW retornam a 0 ao final (dado ausente reprova)', pass: queueDrained, detail: `final high=${lastQueue.high ?? 'SEM DADO'} low=${lastQueue.low ?? 'SEM DADO'}` },
-        { name: 'Oldest waiter dentro dos deadlines (≤60s; timeouts=0; dado ausente reprova)', pass: oldestWaiterOk && queueTimeouts === 0, detail: `waitMs.max=${queueWait.max ?? 'SEM DADO'}, QueueTimeout=${queueTimeouts}` },
+        { name: 'Oldest waiter dentro dos deadlines (≤61s = 60s+ε+margem; timeouts=0; dado ausente reprova)', pass: oldestWaiterOk && queueTimeouts === 0, detail: `waitMs.max=${queueWait.max ?? 'SEM DADO'}, QueueTimeout=${queueTimeouts}` },
         { name: `Toda clínica completa full+vismed-full em ${expected.windows} janela(s) (0 failed, 0 preso)`, pass: failedRuns.length === 0 && stuckRuns.length === 0 && globalSyncComplete, detail: `failed=${failedRuns.length}, running=${stuckRuns.length}, clínicas esperadas=${clinicIds.length}` },
         { name: 'Reservas expiradas = 0 (exige baseline válido)', pass: baselineHealthy && expiredReservations === 0, detail: `expiradas=${expiredReservations}${baselineHealthy ? '' : ' (baseline inválido)'}` },
         // WP-12B — novos checks
