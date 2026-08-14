@@ -86,6 +86,7 @@ export interface CircuitSnapshot {
     cooldownMs: number;
     cooldownRemainingMs: number;
     fastFails: number;
+    retriesBlocked: number;
     probesExecuted: number;
     probesSucceeded: number;
     probesFailed: number;
@@ -131,6 +132,7 @@ export class DoctoraliaCircuitBreaker {
 
     // Contadores de observabilidade
     private fastFails = 0;
+    private retriesBlocked = 0;
     private probesExecuted = 0;
     private probesSucceeded = 0;
     private probesFailed = 0;
@@ -194,6 +196,34 @@ export class DoctoraliaCircuitBreaker {
         return { isProbe: false };
     }
 
+    /**
+     * Task 162 — Checagem NÃO-ADMISSIONAL para o loop de retry WP-07.
+     *
+     * Diferente de beginRequest(): NÃO transiciona estado, NÃO vira probe,
+     * NÃO consome admissão. Usada imediatamente antes de cada nova tentativa
+     * HTTP de uma operação JÁ admitida:
+     * - CLOSED    → permite (retries normais intactos);
+     * - OPEN      → bloqueia com DoctoraliaCircuitOpenError (mesmo com cooldown
+     *               expirado: um retry antigo NUNCA converte OPEN→HALF_OPEN nem
+     *               vira probe — a probe autorizada vem só de beginRequest());
+     * - HALF_OPEN → bloqueia o retry antigo (a probe em andamento não passa por
+     *               aqui: o caller isenta gate.isProbe).
+     *
+     * O erro lançado é ignorado por recordFailure (não alimenta o breaker).
+     */
+    assertRetryAllowed(): void {
+        if (this.state === 'CLOSED') return;
+        this.retriesBlocked++;
+        try { getDoctoraliaMetricsService()?.recordCircuitFastFail(this.domain); } catch (_e) { /* fail-safe */ }
+        const now = this.now();
+        const remaining = this.state === 'OPEN' ? Math.max(0, this.openedUntil - now) : 0;
+        throw new DoctoraliaCircuitOpenError(
+            this.domain,
+            `retry bloqueado com circuito ${this.state}`,
+            remaining,
+        );
+    }
+
     /** Sucesso da operação lógica: zera o contador; probe com sucesso fecha o circuito. */
     recordSuccess(gate: CircuitGate): void {
         this.consecutiveFailures = 0;
@@ -221,6 +251,13 @@ export class DoctoraliaCircuitBreaker {
         // estado. Se era a probe, apenas libera o probeInFlight (o host nem foi
         // consultado): a próxima request elegível volta a atuar como probe.
         if (isDoctoraliaQueueError(err)) {
+            if (gate.isProbe) this.probeInFlight = false;
+            return;
+        }
+        // Task 162: retry bloqueado pelo próprio breaker (assertRetryAllowed)
+        // NUNCA realimenta o breaker — não incrementa falhas, não abre, não
+        // muda estado (o host nem foi consultado nesta tentativa).
+        if (isDoctoraliaCircuitOpenError(err)) {
             if (gate.isProbe) this.probeInFlight = false;
             return;
         }
@@ -344,6 +381,7 @@ export class DoctoraliaCircuitBreaker {
             cooldownMs: this.cooldownMs,
             cooldownRemainingMs: this.state === 'OPEN' ? Math.max(0, this.openedUntil - now) : 0,
             fastFails: this.fastFails,
+            retriesBlocked: this.retriesBlocked,
             probesExecuted: this.probesExecuted,
             probesSucceeded: this.probesSucceeded,
             probesFailed: this.probesFailed,

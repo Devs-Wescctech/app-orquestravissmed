@@ -199,6 +199,7 @@ async function main() {
                 startedAt, endedAt, tlsApproach: TLS_APPROACH,
                 partial, interruptionReason,
                 memoryCheck: checkMemoryStabilization, sampleIntervalMs: 1500,
+                internalEvents: rawInternalEvents,
             });
             const stamp = endedAt.replace(/[:.]/g, '-');
             const suffix = partial ? '-PARTIAL' : '';

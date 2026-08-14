@@ -15,13 +15,34 @@ import { DoctoraliaQueueFullError, DoctoraliaQueueTimeoutError } from './doctora
  * de deadline e a flag `settled` que resolve deterministicamente a corrida
  * grant × timeout (o primeiro vence; o outro é no-op).
  */
+/**
+ * Task 162 — Handle do grant de slot: identifica as reservas EXATAS gravadas
+ * nas janelas (agregada e WRITE) para permitir devolução por identidade caso a
+ * tentativa seja bloqueada pelo gate de retry antes do fetch.
+ */
+interface RateSlotGrant {
+    aggTs: number;
+    writeTs?: number;
+}
+
 interface RateWaiter {
     methodClass: 'GET' | 'WRITE';
-    resolve: () => void;
+    resolve: (grant: RateSlotGrant) => void;
     reject: (err: any) => void;
     enqueuedAt: number;
     deadlineTimer: ReturnType<typeof setTimeout> | null;
     settled: boolean;
+}
+
+/**
+ * Task 162 — Estado compartilhado das tentativas HTTP de UMA operação lógica.
+ * `breaker`/`gate` carregam o contexto de admissão até o ponto de dispatch para
+ * o gate não-admissional de retry (WP-07 e repetição pós-401).
+ */
+interface RetryAttemptState {
+    attempts: number;
+    breaker?: DoctoraliaCircuitBreaker;
+    gate?: { isProbe: boolean };
 }
 
 interface CachedToken {
@@ -219,6 +240,7 @@ export class DocplannerClient implements OnModuleDestroy {
         DocplannerClient.pumping = true;
         try {
             while (DocplannerClient.waitingHigh.length || DocplannerClient.waitingLow.length) {
+                let reservedAggTs = 0;
                 for (;;) {
                     // WP-08B: shutdown drena as filas e acorda o pump — nenhum
                     // grant nem timer novo pode acontecer depois disso.
@@ -309,7 +331,8 @@ export class DocplannerClient implements OnModuleDestroy {
                         continue;
                     }
 
-                    // Reserva slot agregado
+                    // Reserva slot agregado (timestamp exato guardado para o grant)
+                    reservedAggTs = now;
                     ts.push(now);
                     break;
                 }
@@ -342,14 +365,18 @@ export class DocplannerClient implements OnModuleDestroy {
                         next.deadlineTimer = null;
                     }
                     // Registra no budget WRITE se for uma mutação
+                    const grant: RateSlotGrant = { aggTs: reservedAggTs };
                     if (next.methodClass === 'WRITE') {
                         DocplannerClient.writeTimestamps.push(now2);
+                        grant.writeTs = now2;
                     }
-                    next.resolve();
+                    next.resolve(grant);
                     DocplannerClient.reportQueueDepth();
                 } else {
                     // Slot reservado sem candidato elegível (corrida rara): devolve
-                    DocplannerClient.rateTimestamps.pop();
+                    // a reserva EXATA feita acima (identidade, não posição).
+                    const i = DocplannerClient.rateTimestamps.indexOf(reservedAggTs);
+                    if (i >= 0) DocplannerClient.rateTimestamps.splice(i, 1);
                 }
             }
         } finally {
@@ -412,7 +439,7 @@ export class DocplannerClient implements OnModuleDestroy {
      * WP-08B: aplica cap por fila (rejeição ANTES do push) e deadline de espera
      * por waiter — ambos rejeitam com erro tipado sem consumir rate slot.
      */
-    private static acquireRateSlot(logger: Logger, methodClass: 'GET' | 'WRITE'): Promise<void> {
+    private static acquireRateSlot(logger: Logger, methodClass: 'GET' | 'WRITE'): Promise<RateSlotGrant> {
         const priority = DocplannerClient.priorityAls.getStore() === true;
         const prLabel: 'HIGH' | 'LOW' = priority ? 'HIGH' : 'LOW';
         const queue = priority ? DocplannerClient.waitingHigh : DocplannerClient.waitingLow;
@@ -439,14 +466,14 @@ export class DocplannerClient implements OnModuleDestroy {
             ? DocplannerClient.QUEUE_DEADLINE_HIGH_MS
             : DocplannerClient.QUEUE_DEADLINE_LOW_MS;
 
-        return new Promise<void>((resolve, reject) => {
+        return new Promise<RateSlotGrant>((resolve, reject) => {
             const waiter: RateWaiter = {
                 methodClass,
                 enqueuedAt: Date.now(),
                 deadlineTimer: null,
                 settled: false,
                 reject,
-                resolve: () => {
+                resolve: (grant: RateSlotGrant) => {
                     // Emite snapshot de fila sem alterar o algoritmo
                     try {
                         const metrics = getDoctoraliaMetricsService();
@@ -471,7 +498,7 @@ export class DocplannerClient implements OnModuleDestroy {
                             metrics.recordQueueWait(prLabel, now - waiter.enqueuedAt);
                         }
                     } catch (_e) { /* fail-safe */ }
-                    resolve();
+                    resolve(grant);
                 },
             };
 
@@ -822,7 +849,7 @@ export class DocplannerClient implements OnModuleDestroy {
         data?: any,
     ): Promise<any> {
         try {
-            const result = await this.executeWithRetry(method, path, data);
+            const result = await this.executeWithRetry(method, path, data, breaker, gate);
             breaker.recordSuccess(gate);
             return result;
         } catch (err: any) {
@@ -878,10 +905,19 @@ export class DocplannerClient implements OnModuleDestroy {
      * permanece intocado dentro de executeRequest; sua repetição compartilha o
      * MESMO orçamento de tentativas (attemptState), impedindo loop cruzado.
      */
-    private async executeWithRetry(method: string, path: string, data?: any): Promise<any> {
+    private async executeWithRetry(
+        method: string,
+        path: string,
+        data?: any,
+        // Task 162: breaker+gate para o gate não-admissional de retry (WP-08A).
+        breaker?: DoctoraliaCircuitBreaker,
+        gate?: { isProbe: boolean },
+    ): Promise<any> {
         const operation = this.inferOperation(method, path);
         const retryEligible = this.isRetryableOperation(method, operation);
-        const attemptState = { attempts: 0 };
+        // Task 162: breaker+gate viajam no attemptState até o ponto de dispatch —
+        // o gate é reforçado DENTRO de executeRequest (inclusive no retry de 401).
+        const attemptState: RetryAttemptState = { attempts: 0, breaker, gate };
         let retryIndex = 0;
         let didRetry = false;
         for (;;) {
@@ -917,9 +953,53 @@ export class DocplannerClient implements OnModuleDestroy {
                     `${Math.round(decision.delayMs)}ms antes de repetir${decision.usedRetryAfter ? ' (Retry-After honrado)' : ''}.`,
                 );
                 await DocplannerClient.sleep(decision.delayMs);
+                // Task 162 — Gate NÃO-ADMISSIONAL antes de cada nova tentativa HTTP:
+                // se o breaker abriu (OPEN/HALF_OPEN) DEPOIS que esta operação foi
+                // admitida, o retry pendente NÃO dispara novo HTTP — falha imediata
+                // com DoctoraliaCircuitOpenError, sem consumir slot/budget, sem
+                // entrar na fila, sem alimentar o breaker e sem virar probe.
+                // A probe autorizada (gate.isProbe) é isenta: ela É o caminho de
+                // admissão do HALF_OPEN e mantém seus retries normais.
+                if (breaker && !gate?.isProbe) {
+                    breaker.assertRetryAllowed();
+                }
                 retryIndex++;
             }
         }
+    }
+
+    /**
+     * Task 162 — Gate não-admissional no PONTO DE DISPATCH de uma NOVA tentativa
+     * de operação já admitida (retry WP-07 ou repetição pós-401). A primeira
+     * tentativa (attempts === 0) nunca é bloqueada (admissão já ocorreu em
+     * beginRequest); a probe autorizada (gate.isProbe) é isenta. Lança
+     * DoctoraliaCircuitOpenError — ignorado por recordFailure (não alimenta o
+     * breaker).
+     */
+    /**
+     * Task 162 — Devolve por IDENTIDADE as reservas de um grant não utilizado
+     * (tentativa bloqueada pelo gate após a concessão do slot). Remove uma
+     * ocorrência do timestamp exato do grant em cada janela; sob concorrência,
+     * remover qualquer ocorrência de valor idêntico é contabilmente equivalente
+     * e nunca toca reservas com timestamps distintos de outras requisições.
+     */
+    private static releaseRateSlotGrant(grant: RateSlotGrant | undefined): void {
+        if (!grant) return;
+        if (typeof grant.aggTs === 'number') {
+            const i = DocplannerClient.rateTimestamps.indexOf(grant.aggTs);
+            if (i >= 0) DocplannerClient.rateTimestamps.splice(i, 1);
+        }
+        if (typeof grant.writeTs === 'number') {
+            const i = DocplannerClient.writeTimestamps.indexOf(grant.writeTs);
+            if (i >= 0) DocplannerClient.writeTimestamps.splice(i, 1);
+        }
+    }
+
+    private static guardRetryDispatch(attemptState: RetryAttemptState): void {
+        if (!attemptState.breaker) return;
+        if (attemptState.gate?.isProbe) return;
+        if (attemptState.attempts === 0) return; // 1ª tentativa: admissão normal
+        attemptState.breaker.assertRetryAllowed();
     }
 
     private async executeRequest(
@@ -928,8 +1008,10 @@ export class DocplannerClient implements OnModuleDestroy {
         data?: any,
         isRetry = false,
         // WP-07: orçamento COMPARTILHADO de tentativas HTTP (inclui repetição de 401).
-        attemptState: { attempts: number } = { attempts: 0 },
+        attemptState: RetryAttemptState = { attempts: 0 },
     ): Promise<any> {
+        // Task 162: bloqueia a nova tentativa ANTES de token/fila (sem custo).
+        DocplannerClient.guardRetryDispatch(attemptState);
         if (this.clientId) {
             // Sempre passa pelo cache: pega token válido, renova se expirado, e re-tenta
             // autenticar mesmo que a autenticação inicial (fire-and-forget do createClient)
@@ -953,7 +1035,20 @@ export class DocplannerClient implements OnModuleDestroy {
         // não pode consumir o tempo da requisição em si. Classifica como GET ou WRITE
         // para que cada tentativa (retry transitório ou pós-401) consuma o budget correto.
         const methodClass: 'GET' | 'WRITE' = method === 'GET' ? 'GET' : 'WRITE';
-        await DocplannerClient.acquireRateSlot(this.logger, methodClass);
+        // Task 162: re-checa após os awaits de token (o breaker pode ter aberto
+        // enquanto esta tentativa esperava) — ainda sem consumir slot.
+        DocplannerClient.guardRetryDispatch(attemptState);
+        const slotGrant = await DocplannerClient.acquireRateSlot(this.logger, methodClass);
+        // Task 162: última checagem IMEDIATAMENTE antes do fetch — se o breaker
+        // abriu durante a espera na fila, a tentativa NÃO dispara HTTP e as
+        // reservas EXATAS deste grant são devolvidas por identidade (nunca as
+        // de outra requisição concorrente).
+        try {
+            DocplannerClient.guardRetryDispatch(attemptState);
+        } catch (blocked) {
+            DocplannerClient.releaseRateSlotGrant(slotGrant);
+            throw blocked;
+        }
         attemptState.attempts++;
         const releasedAt = Date.now();
         const controller = new AbortController();

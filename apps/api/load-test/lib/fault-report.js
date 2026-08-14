@@ -84,6 +84,7 @@ function buildFaultReport(input) {
         scenario, profile, seed, startedAt, endedAt, tlsApproach,
         partial = false, interruptionReason = null,
         memoryCheck, sampleIntervalMs = 1500,
+        internalEvents = [],
     } = input;
 
     const docSummary = docLog.summary();
@@ -168,14 +169,63 @@ function buildFaultReport(input) {
         lastByAuth.set(key, c.ts);
     }
 
-    // Arrivals durante OPEN (fast-fail comprovado): fora da tolerância de borda e
-    // da graça de in-flight (retries WP-07 de operações admitidas antes do OPEN).
+    // Critério revisado (Task 162): o que importa é NENHUM HTTP NOVO ser
+    // INICIADO (dispatch/sentAt) após o OPEN — requests em voo iniciadas antes
+    // do OPEN podem legitimamente CHEGAR ao mock depois. Correlacionamos cada
+    // arrival durante OPEN com o evento interno (sentAt) via correlationId:
+    //  - dispatch ANTES do openStart (+tol) → in-flight legítimo, não viola;
+    //  - dispatch DEPOIS do openStart (+tol) → violação (novo HTTP em OPEN).
+    // Fallback: arrival sem evento interno correlacionado usa a graça antiga.
     const grace = plan.inflightGraceMs ?? 5_000;
-    const arrivalsDuringOpen = [];
+    const sentAtByCorrelation = new Map();
+    for (const e of internalEvents) {
+        if (e?.doctoraliaRequestId != null && typeof e.sentAt === 'number') {
+            sentAtByCorrelation.set(e.doctoraliaRequestId, e.sentAt);
+        }
+    }
+    const arrivalsDuringOpen = [];   // todos os arrivals no meio de um intervalo OPEN (informativo)
+    const newDispatchesDuringOpen = []; // violações: HTTP INICIADO após o OPEN
     for (const i of openIntervals) {
         for (const c of calls) {
-            if (c.ts > i.start + Math.max(tol, grace) && c.ts < i.end - tol) {
-                arrivalsDuringOpen.push({ ts: c.ts, method: c.method, path: c.path, faultTag: c.faultTag, openStart: i.start });
+            // OAuth não passa pelo breaker (endpoint distinto; renovação de token
+            // é legítima mesmo em OPEN) — fora do critério, como no scan interno.
+            if (typeof c.path === 'string' && c.path.includes('/oauth/')) continue;
+            if (c.ts > i.start + tol && c.ts < i.end - tol) {
+                const sentAt = c.correlationId != null ? sentAtByCorrelation.get(c.correlationId) : undefined;
+                const entry = {
+                    ts: c.ts, method: c.method, path: c.path, faultTag: c.faultTag,
+                    openStart: i.start, sentAt: sentAt ?? null,
+                    inFlightBeforeOpen: sentAt !== undefined ? sentAt <= i.start + tol : null,
+                };
+                arrivalsDuringOpen.push(entry);
+                const violates = sentAt !== undefined
+                    ? sentAt > i.start + tol
+                    : c.ts > i.start + Math.max(tol, grace); // sem correlação: graça antiga
+                if (violates) newDispatchesDuringOpen.push(entry);
+            }
+        }
+    }
+
+    // Varredura INDEPENDENTE de arrivals: TODO evento interno com sentAt dentro
+    // de um intervalo OPEN é violação, mesmo que a resposta nunca chegue ao mock,
+    // chegue fora do intervalo, ou seja atrasada em trânsito. A probe autorizada
+    // dispara em HALF_OPEN (fora dos intervalos OPEN, respeitada a tolerância de
+    // amostragem `tol`), portanto não entra aqui.
+    const seenViolations = new Set(newDispatchesDuringOpen.map(e => e.sentAt ?? e.ts));
+    for (const e of internalEvents) {
+        if (typeof e?.sentAt !== 'number') continue;
+        if (e.isOAuth) continue; // OAuth não passa pelo breaker (endpoint distinto)
+        for (const i of openIntervals) {
+            if (e.sentAt > i.start + tol && e.sentAt < i.end - tol) {
+                if (!seenViolations.has(e.sentAt)) {
+                    seenViolations.add(e.sentAt);
+                    newDispatchesDuringOpen.push({
+                        ts: null, method: e.method ?? null, path: e.endpoint ?? e.path ?? null,
+                        faultTag: null, openStart: i.start, sentAt: e.sentAt,
+                        inFlightBeforeOpen: false, source: 'internal-sentAt-scan',
+                    });
+                }
+                break;
             }
         }
     }
@@ -205,9 +255,16 @@ function buildFaultReport(input) {
     const stuckRuns = globalRuns.filter(r => r.status === 'running');
     const recoveredAfter = marks.recoveryAt ?? T4 ?? T3;
     const postRecovery = globalRuns.filter(r => new Date(r.startedAt).getTime() >= recoveredAfter);
-    const postRecoveryComplete = clinicIds.every(id =>
-        postRecovery.some(r => r.clinicId === id && r.type === 'full' && r.status === 'completed') &&
-        postRecovery.some(r => r.clinicId === id && r.type === 'vismed-full' && r.status === 'completed'));
+    const postRecoveryMissing = [];
+    for (const id of clinicIds) {
+        for (const type of ['full', 'vismed-full']) {
+            if (!postRecovery.some(r => r.clinicId === id && r.type === type && r.status === 'completed')) {
+                const found = postRecovery.filter(r => r.clinicId === id && r.type === type);
+                postRecoveryMissing.push(`${id}/${type}=${found.length ? found.map(r => r.status).join(',') : 'AUSENTE'}`);
+            }
+        }
+    }
+    const postRecoveryComplete = postRecoveryMissing.length === 0;
 
     const memRss = memoryCheck(processSamples.map(s => s.rssBytes).filter(v => v != null));
     const memHeap = memoryCheck(lagSamples.map(s => s.heapUsedBytes).filter(v => v != null));
@@ -232,8 +289,11 @@ function buildFaultReport(input) {
             const early = snaps.find(s => (breakerOf(s)?.state ?? 'CLOSED') !== 'CLOSED' && s.ts < armAt + exp.noOpenBeforeMs - tol);
             add(`F1-A: breaker permanece CLOSED na sub-janela intermitente (até +${Math.round(exp.noOpenBeforeMs / 1000)}s)`, !early, early ? `estado ${breakerOf(early)?.state} em +${Math.round((early.ts - armAt) / 1000)}s` : 'nenhum estado != CLOSED antes do F1-B');
         }
-        add('Durante OPEN: zero arrivals no mock (fast-fail; fila não cresce)', arrivalsDuringOpen.length === 0 && !queueGrewDuringOpen && fastFails > 0,
-            `arrivals em OPEN=${arrivalsDuringOpen.length} (graça in-flight ${Math.round(grace / 1000)}s), filaCresceu=${queueGrewDuringOpen}, fastFails=${fastFails}`);
+        add('Durante OPEN: zero HTTPs NOVOS iniciados (fast-fail; in-flight pré-OPEN pode chegar; fila não cresce)',
+            newDispatchesDuringOpen.length === 0 && !queueGrewDuringOpen && fastFails > 0,
+            `novos dispatches em OPEN=${newDispatchesDuringOpen.length}, arrivals em OPEN=${arrivalsDuringOpen.length} ` +
+            `(in-flight pré-OPEN=${arrivalsDuringOpen.filter(a => a.inFlightBeforeOpen === true).length}), ` +
+            `filaCresceu=${queueGrewDuringOpen}, fastFails=${fastFails}`);
         add('HALF_OPEN com exatamente 1 probe por ciclo', probesExecuted === halfOpens && halfOpens >= 1, `probes=${probesExecuted}, transições OPEN->HALF_OPEN=${halfOpens}`);
         add('Após recuperação: breaker volta a CLOSED', (finalBreaker?.state ?? null) === 'CLOSED', `estado final=${finalBreaker?.state ?? 'SEM DADO'}`);
         if (exp.minOpens) add(`Breaker abriu ≥${exp.minOpens}× (duas janelas de falha)`, opens >= exp.minOpens, `opens=${opens}`);
@@ -284,7 +344,9 @@ function buildFaultReport(input) {
     add('Timeline completa: T4 (recuperação) e T5 (drenagem) detectados', T4 != null && T5 != null, `T4=${T4 ? new Date(T4).toISOString() : '—'}, T5=${T5 ? new Date(T5).toISOString() : '—'}`);
     add('Filas HIGH/LOW = 0 ao final (dado ausente reprova)', lastQueue.high === 0 && lastQueue.low === 0, `final high=${lastQueue.high ?? 'SEM DADO'} low=${lastQueue.low ?? 'SEM DADO'}`);
     add('Nenhum SyncRun preso em running (nenhuma clínica presa no guard)', stuckRuns.length === 0, `${stuckRuns.length} preso(s)`);
-    add('Pós-recuperação: TODA clínica completa full+vismed-full (T6)', postRecoveryComplete && T6 != null, `clínicas=${clinicIds.length}, runs pós-recuperação=${postRecovery.length}`);
+    add('Pós-recuperação: TODA clínica completa full+vismed-full (T6)', postRecoveryComplete && T6 != null,
+        `clínicas=${clinicIds.length}, runs pós-recuperação=${postRecovery.length}` +
+        (postRecoveryMissing.length ? `, pendências: ${postRecoveryMissing.join(' · ')}` : ''));
     add('Memória RSS estável', memRss.pass, memRss.detail);
     add('Heap estável / timers liberados (heap + encerramento limpo)', memHeap.pass, memHeap.detail);
     add('API encerra limpa (SIGTERM sem Promise/timer órfão)', cleanExit ? cleanExit.clean === true : false, cleanExit ? `exit=${cleanExit.exitCode ?? cleanExit.signal} em ${cleanExit.waitedMs}ms` : 'SEM DADO');
@@ -307,7 +369,8 @@ function buildFaultReport(input) {
         queues: { waitMs: queueWait, queueFull, queueTimeouts, final: lastQueue },
         oauth: { totalPosts: oauthCalls.length, races: oauthRaces },
         arrivalsDuringOpen,
-        syncRuns: { total: globalRuns.length, stuck: stuckRuns.length, postRecovery: postRecovery.length, postRecoveryComplete },
+        newDispatchesDuringOpen,
+        syncRuns: { total: globalRuns.length, stuck: stuckRuns.length, postRecovery: postRecovery.length, postRecoveryComplete, postRecoveryMissing, postRecoveryRuns: postRecovery.map(r => ({ clinicId: r.clinicId, type: r.type, status: r.status, startedAt: r.startedAt, finishedAt: r.finishedAt ?? null, error: r.error ?? null })) },
         memoryStabilization: { rss: memRss, heap: memHeap },
         cleanExit,
         actions, notes,
