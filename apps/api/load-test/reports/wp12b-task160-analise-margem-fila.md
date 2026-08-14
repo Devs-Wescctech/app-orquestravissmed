@@ -95,3 +95,26 @@ budget: é o padrão rajada-e-seca do consumo da janela de 5min. Elevar LOW/HIGH
 Sem a proposta 1, rodar o D como está deve reprovar em oldest waiter/QueueTimeout por construção, ainda que
 os budgets externos (WAF) continuem 100% respeitados — o risco é de critério interno, não de estouro real
 do limite da Doctoralia.
+
+## 7. Adendo (Task 169) — Projeção do D SEM os OAuth artificiais do refresher
+
+A proposta 2 foi implementada: o harness agora sobe a API com `DISABLE_TOKEN_REFRESHER=true`
+(mesmo padrão dos demais `DISABLE_*`), o kill switch é registrado nas Notas do relatório e a
+autenticação sob demanda (getToken/single-flight/forceRefresh/401) permanece intacta —
+validado em suíte e num Cenário A completo (OAuth mock=2, igual ao baseline; refresher logou
+"DESATIVADO" no boot; nenhum tick `*/15` executou).
+
+Projeção do D reavaliada sem o artefato:
+
+- **OAuth: ~200 → 50** (1 auth sob demanda por clínica no boot dos fluxos). Eliminam-se as
+  ~150 auths WRITE artificiais em ~45min (3 ticks × 50 clínicas) previstas na seção 5.
+- **Budget WRITE/min:** somem as 3 rajadas de 50 WRITEs de auth (> budget de 40/min sozinhas).
+  As auths restantes concentram-se em t≈0, dentro da rajada inicial já modelada — nenhuma
+  pressão WRITE extra no meio do teste.
+- **O que NÃO muda:** a zona morta rajada-e-seca da janela agregada de 5min (~240s de exposição
+  contra deadline LOW de 61s) é estrutural do consumo do Global Sync e independe do refresher.
+  A previsão "QueueTimeout > 0 no D sem a proposta 1 (pacing)" permanece — agora, porém, o
+  resultado do D medirá apenas carga funcional, sem falso agravamento por auth em rajada.
+- **Veredito ajustado:** o refresher deixa de ser co-causa de saturação do WRITE/min no D;
+  o gargalo remanescente é exclusivamente a burstiness da janela de 5min (proposta 1, fora
+  do escopo da Task 169).

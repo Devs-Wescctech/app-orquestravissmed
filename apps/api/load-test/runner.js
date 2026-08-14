@@ -299,6 +299,9 @@ async function main() {
             DISABLE_SYNC_CRON: 'true',
             DISABLE_BOOKING_SWEEP: 'true',
             DISABLE_BLOCK_WATCHER: 'true',
+            // Task 169: o cron */15 do TokenRefresher × TTL 1h do mock gerava rajadas
+            // artificiais de OAuth (todas as clínicas por tick). Auth sob demanda intacta.
+            DISABLE_TOKEN_REFRESHER: 'true',
             REDIS_HOST: '127.0.0.1',
             REDIS_PORT: '6379', // nada escutando → fallback direto sem Redis
             NODE_EXTRA_CA_CERTS: tls.certPath,
@@ -311,6 +314,7 @@ async function main() {
         const connections = await readConnections(db.url);
         assertAllGuards({ databaseUrl: db.url, childEnv, connections });
         log(`Guards anti-produção OK (${connections.length} conexões, todas loopback).`);
+        notes.push('Task 169: TokenRefresher automático (cron */15) DESATIVADO via DISABLE_TOKEN_REFRESHER=true — OAuth medido reflete apenas autenticação sob demanda (single-flight/401/forceRefresh intactos).');
 
         // ── Mocks ────────────────────────────────────────────────────────────
         docMock = new MockDoctoralia({ dataset, tls, port: DOC_PORT, faultInjector: faultPlan ? new FaultInjector(faultPlan) : null });

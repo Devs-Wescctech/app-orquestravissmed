@@ -19,6 +19,8 @@ import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 export class TokenRefresherService implements OnModuleInit {
     private readonly logger = new Logger(TokenRefresherService.name);
     private isRunning = false;
+    /** Kill switch test-only (mesmo padrão de DISABLE_SYNC_CRON etc.). Default: ativo. */
+    private readonly disabled = process.env.DISABLE_TOKEN_REFRESHER === 'true';
 
     // Renova quando faltar menos que esta margem para expirar (2h de um token de 24h).
     private static readonly RENEW_MARGIN_MS = 2 * 60 * 60 * 1000;
@@ -29,11 +31,16 @@ export class TokenRefresherService implements OnModuleInit {
     ) {}
 
     onModuleInit() {
+        if (this.disabled) {
+            this.logger.warn('[TOKEN-REFRESHER] Renovador automático DESATIVADO via DISABLE_TOKEN_REFRESHER=true (autenticação sob demanda segue funcionando).');
+            return;
+        }
         this.logger.log('[TOKEN-REFRESHER] Ativo — garante token OAuth Doctoralia válido a cada 15min (aproveita janelas do WAF; token persiste 24h no banco).');
     }
 
     @Cron('*/15 * * * *', { name: 'doctoralia-token-refresher' })
     async refreshAll() {
+        if (this.disabled) return;
         if (this.isRunning) return;
         this.isRunning = true;
         try {
