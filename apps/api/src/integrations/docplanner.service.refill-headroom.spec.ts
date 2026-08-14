@@ -62,6 +62,9 @@ function resetStatics() {
     (DocplannerClient as any).lastThrottleLogAt = 0;
     (DocplannerClient as any).lastWriteThrottleLogAt = 0;
     (DocplannerClient as any).wakeupFn = null;
+    // Task 170: pacing LOW não deve vazar estado entre testes
+    (DocplannerClient as any).lastLowGrantAt = 0;
+    (DocplannerClient as any).lastPacingLogAt = 0;
     DoctoraliaCircuitBreaker.resetAll();
 }
 

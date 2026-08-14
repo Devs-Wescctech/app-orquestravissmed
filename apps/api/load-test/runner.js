@@ -474,7 +474,12 @@ async function main() {
         }
 
         // ── Drenagem final ───────────────────────────────────────────────────
-        const drainMaxMs = 120_000 + scenario.clinics * 5_000;
+        // Task 170: com o pacing LOW (25%/750ms), o backlog residual dos pollers
+        // em background drena a ~80/min enquanto a ocupação da janela agregada
+        // permanecer ≥ threshold (até ~5min após a última rajada). O deadline de
+        // drenagem acomoda uma janela agregada completa — o loop sai antes assim
+        // que as filas zeram (sem custo quando a drenagem é rápida).
+        const drainMaxMs = 120_000 + scenario.clinics * 5_000 + 300_000;
         log(`Aguardando drenagem final das filas (até ${Math.round(drainMaxMs / 1000)}s)...`);
         const drainT0 = Date.now();
         while (Date.now() - drainT0 < drainMaxMs) {

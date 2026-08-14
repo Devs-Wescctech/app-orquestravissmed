@@ -345,6 +345,11 @@ export class DoctoraliaMetricsService {
             this.circuitStats.clear();
             // WP-08B
             this.queueBackpressureStats = emptyQueueBackpressureStats();
+            // Task 170: pacing LOW
+            this.lowPacingStats = {
+                waitCount: 0, totalWaitMs: 0, maxWaitMs: 0,
+                lastOccupancyPct: 0, lastAppliedAt: null,
+            };
             this.startedAt = Date.now();
         } catch (err: any) {
             this.logger.warn(`[METRICS] reset() error: ${err?.message}`);
@@ -469,6 +474,45 @@ export class DoctoraliaMetricsService {
         } catch (err: any) {
             this.logger.debug(`[METRICS] recordQueueDepth() error (non-fatal): ${err?.message}`);
         }
+    }
+
+    // ─────────── Task 170: pacing de grants LOW (fail-safe, aditivo) ─────────
+
+    private lowPacingStats = {
+        waitCount: 0,
+        totalWaitMs: 0,
+        maxWaitMs: 0,
+        lastOccupancyPct: 0,
+        lastAppliedAt: null as number | null,
+    };
+
+    /**
+     * Registra UMA espera de pacing aplicada a um grant LOW (ocupação da janela
+     * agregada ≥ threshold). occupancy em fração 0–1; waitMs = atraso aplicado.
+     */
+    recordLowPacingWait(occupancy: number, waitMs: number): void {
+        try {
+            const s = this.lowPacingStats;
+            s.waitCount++;
+            s.totalWaitMs += waitMs;
+            if (waitMs > s.maxWaitMs) s.maxWaitMs = waitMs;
+            s.lastOccupancyPct = Math.round(occupancy * 100);
+            s.lastAppliedAt = Date.now();
+        } catch (err: any) {
+            this.logger.debug(`[METRICS] recordLowPacingWait() error (non-fatal): ${err?.message}`);
+        }
+    }
+
+    getLowPacingStats() {
+        const s = this.lowPacingStats;
+        return {
+            waitCount: s.waitCount,
+            totalWaitMs: s.totalWaitMs,
+            avgWaitMs: s.waitCount > 0 ? Math.round(s.totalWaitMs / s.waitCount) : 0,
+            maxWaitMs: s.maxWaitMs,
+            lastOccupancyPct: s.lastOccupancyPct,
+            lastAppliedAt: s.lastAppliedAt ? new Date(s.lastAppliedAt).toISOString() : null,
+        };
     }
 
     getQueueBackpressureStats() {
@@ -911,6 +955,9 @@ export class DoctoraliaMetricsService {
                 rateLimitRemaining: rateLimitRemainingStat,
                 queueHigh: queueHighStat,
                 queueLow: queueLowStat,
+                // Task 170: pacing de grants LOW (esperas aplicadas quando a
+                // ocupação da janela agregada ≥ threshold). Seção aditiva.
+                lowPacing: this.getLowPacingStats(),
             },
             rateLimiterService: {
                 totalEvents: this.rateLimiterEvents.length,

@@ -68,6 +68,9 @@ function resetStatics() {
     (DocplannerClient as any).lastWriteThrottleLogAt = 0;
     // Garante que nenhum wakeupFn pendente de um teste anterior vaze para o próximo
     (DocplannerClient as any).wakeupFn = null;
+    // Task 170: pacing LOW não deve vazar estado entre testes
+    (DocplannerClient as any).lastLowGrantAt = 0;
+    (DocplannerClient as any).lastPacingLogAt = 0;
 }
 
 beforeEach(() => {

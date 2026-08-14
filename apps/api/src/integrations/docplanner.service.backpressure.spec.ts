@@ -77,6 +77,9 @@ function resetStatics() {
     C.QUEUE_CAP_LOW = 100;
     C.QUEUE_DEADLINE_HIGH_MS = 15_000;
     C.QUEUE_DEADLINE_LOW_MS = 60_000;
+    // Task 170: pacing LOW não deve vazar estado entre testes
+    C.lastLowGrantAt = 0;
+    C.lastPacingLogAt = 0;
     DoctoraliaCircuitBreaker.resetAll();
 }
 

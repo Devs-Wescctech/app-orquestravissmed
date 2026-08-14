@@ -168,6 +168,62 @@ export class DocplannerClient implements OnModuleDestroy {
      */
     private static readonly QUEUE_DEADLINE_LOW_MS =
         60_000 + DocplannerClient.REFILL_HEADROOM_MS + 700;
+
+    /**
+     * Task 170 — Pacing de grants LOW (elimina a zona morta rajada→seca).
+     *
+     * A janela agregada 400/5min permite rajadas de ~400 grants em ~60s
+     * (Global Sync), trancando a fila por ~240s sem refill — acima do deadline
+     * LOW (~61s), o que projeta QueueTimeout no Cenário D. Quando a ocupação da
+     * janela agregada (pós-eviction) atinge o THRESHOLD, os grants LOW passam a
+     * ser espaçados em LOW_PACING_INTERVAL_MS (taxa sustentável do teto:
+     * 400/5min ≈ 1 grant/750ms), transformando a rajada em fluxo contínuo.
+     *
+     * Invariantes: HIGH nunca é paced (uma chegada HIGH aciona o wakeup, fura a
+     * espera e é atendida imediatamente); nada de budget novo — teto 400/5min,
+     * caps, deadlines, ε, budgets WRITE, anti-starvation 4:1, breaker e dedup
+     * permanecem intactos. Abaixo do threshold o comportamento é idêntico ao
+     * anterior (rajada permitida com folga na janela).
+     *
+     * SEM auto-tuning: os valores só mudam por env (com clamps de sanidade).
+     * Justificativa dos defaults 25%/750ms: com threshold X, o tempo de consumo
+     * dos 400 slots ≈ 60X + 300(1−X) s; a lacuna até a 1ª eviction fica abaixo
+     * do deadline LOW (~61s) apenas com X ≤ ~25% (Task 160).
+     */
+    private static readonly LOW_PACING_THRESHOLD =
+        DocplannerClient.resolveLowPacingThreshold(process.env.DOCTORALIA_LOW_PACING_THRESHOLD);
+    private static readonly LOW_PACING_INTERVAL_MS =
+        DocplannerClient.resolveLowPacingInterval(process.env.DOCTORALIA_LOW_PACING_INTERVAL_MS);
+    /** Instante do último grant LOW efetivado (base do espaçamento do pacing). */
+    private static lastLowGrantAt = 0;
+    /** Log do pacing é rate-limited (1/30s) — o estado muda a cada grant. */
+    private static lastPacingLogAt = 0;
+
+    /**
+     * Threshold de ocupação da janela agregada (fração 0–1) a partir do qual o
+     * pacing LOW é ativado. Aceita fração ("0.25") ou percentual ("25").
+     * Inválido/ausente → 0.25. Clamp de sanidade [0.05, 0.95]: nunca 0 (pacing
+     * permanente até em janela vazia) nem ≥1 (pacing nunca ativa e a zona morta
+     * volta).
+     */
+    private static resolveLowPacingThreshold(raw: string | undefined): number {
+        let parsed = Number.parseFloat(raw ?? '');
+        if (!Number.isFinite(parsed)) return 0.25;
+        if (parsed > 1) parsed = parsed / 100; // aceita percentual (ex.: "25")
+        return Math.min(0.95, Math.max(0.05, parsed));
+    }
+
+    /**
+     * Intervalo mínimo entre grants LOW com pacing ativo. Default 750ms
+     * (400/5min ≈ 1/750ms). Clamp [250, 5000]ms: abaixo de 250ms o pacing não
+     * espaça nada na prática; acima de 5s a vazão LOW cai para <60/5min e o
+     * próprio pacing viraria causa de QueueTimeout.
+     */
+    private static resolveLowPacingInterval(raw: string | undefined): number {
+        const parsed = Number.parseInt(raw ?? '', 10);
+        if (!Number.isFinite(parsed)) return 750;
+        return Math.min(5_000, Math.max(250, parsed));
+    }
     /** Logs de rejeição rate-limited (fila saturada gera muitos eventos). */
     private static lastQueueRejectLogAt = 0;
     /** WP-08B — Shutdown: recusa novos waiters e impede callbacks pós-shutdown. */
@@ -331,6 +387,48 @@ export class DocplannerClient implements OnModuleDestroy {
                         continue;
                     }
 
+                    // ── Task 170: pacing de grants LOW ──────────────────────
+                    // Só quando o PRÓXIMO grant seria LOW por não haver HIGH
+                    // elegível: acima do threshold de ocupação da janela
+                    // agregada (pós-eviction), o grant LOW é espaçado rumo à
+                    // taxa sustentável (1/LOW_PACING_INTERVAL_MS). A espera é
+                    // cancelável e corre em corrida com o wakeup — uma chegada
+                    // HIGH fura a espera e é atendida imediatamente na próxima
+                    // iteração (HIGH nunca é paced). A cota anti-inanição 4:1
+                    // (LOW cedido COM HIGH presente) tampouco é paced.
+                    if (eligHighIdx < 0 && eligLowIdx >= 0) {
+                        const occupancy = ts.length / DocplannerClient.RATE_LIMIT;
+                        if (occupancy >= DocplannerClient.LOW_PACING_THRESHOLD) {
+                            const pacingWaitMs =
+                                DocplannerClient.lastLowGrantAt + DocplannerClient.LOW_PACING_INTERVAL_MS - now;
+                            if (pacingWaitMs > 0) {
+                                try {
+                                    getDoctoraliaMetricsService()?.recordLowPacingWait(occupancy, pacingWaitMs);
+                                } catch (_e) { /* fail-safe */ }
+                                if (now - DocplannerClient.lastPacingLogAt > 30_000) {
+                                    DocplannerClient.lastPacingLogAt = now;
+                                    logger.log(
+                                        `[PACING-LOW] Ocupação da janela agregada em ${Math.round(occupancy * 100)}% ` +
+                                        `(≥${Math.round(DocplannerClient.LOW_PACING_THRESHOLD * 100)}%) — espaçando grants LOW ` +
+                                        `a 1/${DocplannerClient.LOW_PACING_INTERVAL_MS}ms (atraso atual ~${pacingWaitMs}ms; ` +
+                                        `fila: ${DocplannerClient.waitingHigh.length} prioritária(s), ${DocplannerClient.waitingLow.length} normal(is)). ` +
+                                        `HIGH não é paced (log limitado a 1/30s).`,
+                                    );
+                                }
+                                let pacingTimerId: ReturnType<typeof setTimeout> | undefined;
+                                const pacingTimer = new Promise<void>(r => {
+                                    pacingTimerId = setTimeout(r, pacingWaitMs);
+                                    (pacingTimerId as any)?.unref?.();
+                                });
+                                const pacingWakeup = new Promise<void>(r => { DocplannerClient.wakeupFn = r; });
+                                await Promise.race([pacingTimer, pacingWakeup]);
+                                clearTimeout(pacingTimerId);
+                                DocplannerClient.wakeupFn = null;
+                                continue; // reavalia tudo (HIGH pode ter chegado)
+                            }
+                        }
+                    }
+
                     // Reserva slot agregado (timestamp exato guardado para o grant)
                     reservedAggTs = now;
                     ts.push(now);
@@ -345,12 +443,14 @@ export class DocplannerClient implements OnModuleDestroy {
                 const eligLowIdx2 = DocplannerClient.findEligible(DocplannerClient.waitingLow, wSnap2.writeFull);
 
                 let next: RateWaiter | undefined;
+                let grantedFromLow = false;
                 if (
                     eligLowIdx2 >= 0 &&
                     (DocplannerClient.consecutiveHighGrants >= 4 || eligHighIdx2 < 0)
                 ) {
                     next = DocplannerClient.waitingLow.splice(eligLowIdx2, 1)[0];
                     DocplannerClient.consecutiveHighGrants = 0;
+                    grantedFromLow = true;
                 } else if (eligHighIdx2 >= 0) {
                     next = DocplannerClient.waitingHigh.splice(eligHighIdx2, 1)[0];
                     DocplannerClient.consecutiveHighGrants++;
@@ -370,6 +470,9 @@ export class DocplannerClient implements OnModuleDestroy {
                         DocplannerClient.writeTimestamps.push(now2);
                         grant.writeTs = now2;
                     }
+                    // Task 170: registra o instante do grant LOW efetivado —
+                    // base do espaçamento do pacing (só grants reais contam).
+                    if (grantedFromLow) DocplannerClient.lastLowGrantAt = now2;
                     next.resolve(grant);
                     DocplannerClient.reportQueueDepth();
                 } else {
