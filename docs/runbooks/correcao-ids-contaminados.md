@@ -10,7 +10,7 @@
 
 **Correção:** o script one-off `apps/api/scripts/fix-service-dict-ids.js` (auditado) reaponta mappings e pivots para a entrada correta do dicionário (match por `normalizedName`), limpa `invalidReason` causado pelo 404, apaga as entradas falsas e renomeia pivots compostos para o link id puro.
 
-**Comportamento real do script — ramo de COLISÃO (EXISTING_CORRECT_MAPPING):** se para um mapping contaminado JÁ EXISTIR um mapping (mesma `vismedSpecialtyId`) apontando à entrada correta do dicionário, o script NÃO reaponta: ele **modifica o mapping preexistente** (limpa `invalidReason`/`invalidAt` incondicionalmente e pode setar `requiresReview=false` se esse mapping tiver score ≥ 0.90) e deleta o mapping contaminado. Esse mapping preexistente pode inclusive ser `MANUAL`. A auditoria classificou **todos os 28 casos como SAFE_MERGE (colisões = 0)** — portanto este runbook exige, no pré-check P4 (seção 1), que o número de colisões seja **0**; se for > 0, a execução é **BLOQUEADA** (o comportamento de colisão não está autorizado). Como defesa em profundidade, o baseline (seção 4.1) fotografa todos os mappings candidatos que poderiam colidir e a validação pós (seção 9) exige que estejam byte-a-byte inalterados — qualquer alteração é gate de rollback.
+**Comportamento real do script — ramo de COLISÃO (EXISTING_CORRECT_MAPPING):** se para um mapping contaminado JÁ EXISTIR um mapping (mesma `vismedSpecialtyId`) apontando à entrada correta do dicionário, o script NÃO reaponta: ele **modifica o mapping preexistente** (limpa `invalidReason`/`invalidAt` incondicionalmente e pode setar `requiresReview=false` se esse mapping tiver score ≥ 0.90) e deleta o mapping contaminado. Esse mapping preexistente pode inclusive ser `MANUAL`. A auditoria classificou **todos os 28 casos como SAFE_MERGE (colisões = 0)** — portanto este runbook exige, no pré-check P4 (seção 1), que o número de colisões seja **0**; se for > 0, a execução é **BLOQUEADA** (o comportamento de colisão não está autorizado). Como defesa em profundidade, o baseline (seção 4.1) fotografa todos os mappings candidatos que poderiam colidir e a validação pós (seção 9) exige que estejam byte-a-byte inalterados — qualquer alteração aciona a REGRA OBRIGATÓRIA da seção 3.2 (congelar estado, preservar evidências, aguardar autorização humana para restore).
 
 **IMPORTANTE — números auditados são EXPECTATIVA, não garantia.** O banco pode ter mudado desde a auditoria. Os pré-checks da seção 1 DEVEM ser re-executados imediatamente antes da execução; **qualquer divergência bloqueia tudo**.
 
@@ -230,16 +230,33 @@ sha256sum ./backups/fix_dict_backup_${TS}.dump                                  
 
 Sem esses 4 itens registrados, o checklist de backup **não** pode ser marcado.
 
-### 3.1 Restore seletivo (rollback) — SÓ se a validação pós falhar
+### 3.1 Restore seletivo — SEGUNDA INTERVENÇÃO, com gate humano próprio
+
+**O restore NUNCA é automático.** Ele é uma NOVA intervenção em produção, distinta da execução do script, e **só pode ocorrer após aprovação explícita do segundo gate: `[ ] AUTORIZAÇÃO HUMANA PARA RESTORE`** (ver seção 3.2). Em caso de divergência pós-execução, o procedimento é congelar o estado e aguardar decisão humana — NÃO executar os comandos abaixo por iniciativa própria.
 
 ```bash
+# (SOMENTE após o gate AUTORIZAÇÃO HUMANA PARA RESTORE)
 # Restaura as 4 tabelas (drop+recreate) a partir do dump:
 docker exec -i <pg> pg_restore -U <user> -d <db> --clean --if-exists \
   -t '"DoctoraliaService"' -t '"DoctoraliaAddressService"' \
   -t '"SpecialtyServiceMapping"' -t '"ProfessionalUnifiedMapping"' \
   /tmp/fix_dict_backup_${TS}.dump
 ```
-> `--clean` derruba e recria as tabelas com FKs; **manter a aplicação pausada durante o restore**. Após rollback, re-rodar P1 (deve voltar a 28) e reativar writers (seção 2.2).
+> `--clean` derruba e recria as tabelas com FKs; **manter a aplicação pausada durante o restore**. Após o restore autorizado, re-rodar P1 (deve voltar a 28) e reativar writers (seção 2.2).
+
+### 3.2 REGRA OBRIGATÓRIA — Rollback/restore NUNCA é automático
+
+Em QUALQUER divergência pós-execução — incluindo: `[SEM MATCH]` no log; erro Prisma; constraint violation; interrupção parcial; resumo do script diferente do esperado; P1 pós ≠ 0; pivots compostos ≠ 0; perda de `SpecialtyServiceMapping`; perda/alteração inesperada em `ProfessionalUnifiedMapping`; alteração indevida de mapping MANUAL (incl. validação F vs `baseline_colisao.csv`); qualquer divergência vs baseline — o procedimento é:
+
+1. **NÃO reativar writers**; manter sync/push pausados;
+2. **NÃO executar `pg_restore`**; **NÃO tentar corrigir manualmente**;
+3. **Preservar o banco no estado encontrado**;
+4. **Preservar** log completo do script, baseline, dumps e hashes;
+5. Executar **somente SELECTs diagnósticos** (read-only);
+6. **Registrar** a divergência encontrada;
+7. **PARAR** e apresentar o diagnóstico para decisão humana.
+
+Esta regra **substitui** toda orientação anterior do tipo "se inconsistente, rollback". O restore (seção 3.1) é uma segunda intervenção em produção e só pode ocorrer após aprovação explícita do gate `[ ] AUTORIZAÇÃO HUMANA PARA RESTORE`.
 
 ---
 
@@ -391,7 +408,7 @@ docker exec <api> sh -c 'echo $DATABASE_URL | sed -E "s#//[^@]+@#//***@#"'
 - Falha em QUALQUER conferência do GATE 2 (SHA, DATABASE_URL, container/branch) — seção 5;
 - Durante a execução: qualquer linha `[SEM MATCH]` no log (esperado: nenhuma);
 - Resumo final do script diferente de `126 mesclado(s), 0 sem match, 126 entrada(s) falsa(s) removida(s), 28 mapping(s) reapontado(s)` (contadores de pivots renomeados/deduplicados podem variar até 126);
-- Erro Prisma / constraint violation / processo interrompido → considerar estado parcial → rodar validações (seção 9); se inconsistente, rollback (seção 3.1).
+- Erro Prisma / constraint violation / processo interrompido → considerar estado parcial → rodar validações read-only (seção 9); se inconsistente, aplicar a REGRA OBRIGATÓRIA da seção 3.2: **congelar estado, preservar evidências e aguardar autorização humana para restore** (NÃO executar restore automaticamente).
 
 ---
 
@@ -436,18 +453,19 @@ WHERE m.id IN (/* mapping_ids do baseline_28.csv */);
 -- F) Mappings preexistentes (potenciais colisões) INALTERADOS — comparar com baseline_colisao.csv:
 --    Re-rodar a query da seção 4.1 e comparar campo a campo (matchType, confidenceScore,
 --    requiresReview, invalidReason, invalidAt, overrideInvalid, isActive, updatedAt) com o CSV.
---    QUALQUER diferença em qualquer linha = alteração NÃO autorizada → GATE DE ROLLBACK
---    (seção 3.1). Com P4 = 0 no pré-check, nenhuma alteração é esperada.
+--    QUALQUER diferença em qualquer linha = alteração NÃO autorizada → aplicar a REGRA
+--    OBRIGATÓRIA da seção 3.2: congelar estado, preservar evidências e aguardar
+--    autorização humana para restore. Com P4 = 0 no pré-check, nenhuma alteração é esperada.
 ```
 
 **Restrição OBRIGATÓRIA sobre `requiresReview` (Observação 1 do aprovador):**
 Qualquer restauração de `requiresReview=false` deve seguir **estritamente a lógica já existente do script**: apenas mappings **diretamente afetados pelo bug** (ou seja, que tinham `invalidReason` preenchido por causa da invalidação provocada pelo id falso) **e** com `confidenceScore >= 0.90`. É **PROIBIDO** reclassificar (restaurar auto-aprovação de) mappings não relacionados ao bug apenas por terem score ≥ 0.90. Validar contra o `baseline_28.csv`: só os mappings desse conjunto que tinham `invalidReason` e score ≥ 0.90 podem ter passado a `requiresReview=false`.
 
 Regras adicionais:
-- Nenhum mapping `MANUAL` pode ter sido alterado além do reaponte de ID; decisões MANUAL permanecem intocadas. **Atenção ao ramo de colisão do script** (seção 0): ele alteraria mappings preexistentes (inclusive MANUAL) limpando `invalidReason` incondicionalmente — por isso P4 = 0 é pré-condição de execução e a validação F acima é gate de rollback;
+- Nenhum mapping `MANUAL` pode ter sido alterado além do reaponte de ID; decisões MANUAL permanecem intocadas. **Atenção ao ramo de colisão do script** (seção 0): ele alteraria mappings preexistentes (inclusive MANUAL) limpando `invalidReason` incondicionalmente — por isso P4 = 0 é pré-condição de execução e qualquer falha na validação F acima aciona a REGRA OBRIGATÓRIA da seção 3.2 (congelar, preservar, parar — restore só com o gate `AUTORIZAÇÃO HUMANA PARA RESTORE`);
 - `invalidReason` de mappings FORA do conjunto afetado deve permanecer como estava (rejeições legítimas continuam inválidas até remapeamento em `/mapping`).
 
-Se qualquer validação falhar → rollback (seção 3.1) + re-rodar P1 (deve voltar a 28).
+Se qualquer validação falhar → aplicar a REGRA OBRIGATÓRIA da seção 3.2: **NÃO executar restore**; congelar estado, manter writers pausados, preservar evidências, rodar apenas SELECTs diagnósticos, registrar a divergência e PARAR no gate `[ ] AUTORIZAÇÃO HUMANA PARA RESTORE`. Somente após esse gate humano o restore da seção 3.1 pode ser executado (e então re-rodar P1, que deve voltar a 28).
 
 ---
 
@@ -512,8 +530,18 @@ SELECT count(*) FROM "DoctoraliaService" WHERE "doctoraliaServiceId" = '3893319'
 [ ] DoctoraliaService = baseline − 126; SpecialtyServiceMapping = baseline
 [ ] ProfessionalUnifiedMapping preservado (contagem + IDs do snapshot)
 [ ] invalidReason limpo SÓ nos afetados; requiresReview restaurado SÓ conforme Observação 1; MANUAL intocados
-[ ] Validação F: mappings preexistentes idênticos ao baseline_colisao.csv (qualquer diff → rollback)
+[ ] Validação F: mappings preexistentes idênticos ao baseline_colisao.csv (qualquer diff → seção 3.2)
 [ ] Mastologia corrigida (dict id real registrado; 3893319 ausente do dicionário)
 [ ] Writers reativados (seção 2.2)
 [ ] Ciclo de sync/push validado (sem novos link-ids; P1 continua 0; fase catálogo de Mastologia observada)
+```
+
+**Ramo de DIVERGÊNCIA (qualquer validação pós falhou — seguir seção 3.2):**
+
+```text
+[ ] Writers permanecem pausados (NÃO reativar)
+[ ] Estado do banco preservado (nenhum restore, nenhuma correção manual)
+[ ] Logs/evidências preservados (log do script, baseline, dumps, hashes)
+[ ] Diagnóstico read-only concluído (somente SELECTs) e divergência registrada
+[ ] AUTORIZAÇÃO HUMANA PARA RESTORE   ← ⛔ STOP — segundo gate humano; restore (seção 3.1) só depois dele ⛔
 ```
