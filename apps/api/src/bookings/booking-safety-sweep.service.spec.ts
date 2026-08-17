@@ -39,10 +39,8 @@ describe('BookingSafetySweepService', () => {
             doctoraliaDoctor: { findMany: jest.fn().mockResolvedValue([]) },
             bookingSync: { findMany: jest.fn() },
         };
-        // 1ª chamada em sweepClinic é a lista de bookings conhecidos; a 2ª é a fonte 3 de endereços.
-        prisma.bookingSync.findMany.mockImplementation((args: any) =>
-            Promise.resolve(args?.select?.doctoraliaBookingId ? [] : []),
-        );
+        // Única chamada em sweepClinic: lista de bookings conhecidos (idempotência).
+        prisma.bookingSync.findMany.mockResolvedValue([]);
         docplanner = { createClient: jest.fn().mockReturnValue(client) };
         queue = { enqueueBatch: jest.fn().mockResolvedValue(undefined) };
         rateLimiter = { acquire: jest.fn().mockResolvedValue(undefined) };

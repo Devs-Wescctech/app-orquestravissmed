@@ -429,10 +429,12 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
 
     /**
      * Descobre os pares (facilityId, doctorId, addressId) dos médicos Doctoralia
-     * vinculados (Mapping DOCTOR LINKED), combinando três fontes:
+     * vinculados (Mapping DOCTOR LINKED), combinando duas fontes:
      * 1. conflictData do Mapping (facilityId + address.id enriquecidos no sync)
      * 2. DoctoraliaAddressService (endereços sincronizados do médico)
-     * 3. endereços já vistos em BookingSync
+     *
+     * BookingSync NÃO é usado como fonte: endereços históricos podem não
+     * pertencer mais ao médico na Doctoralia e geravam 403 no getBookings.
      */
     private async collectDoctorAddressPairs(
         clinicId: string,
@@ -469,21 +471,6 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
             for (const addrId of addressIds) {
                 add(d.doctoraliaFacilityId, d.doctoraliaDoctorId, addrId);
             }
-        }
-
-        // Fonte 3: endereços já vistos em BookingSync
-        const bsAddresses = await this.prisma.bookingSync.findMany({
-            where: {
-                clinicId,
-                doctoraliaDoctorId: { in: doctorIds },
-                doctoraliaAddressId: { not: null },
-                doctoraliaFacilityId: { not: null },
-            },
-            select: { doctoraliaDoctorId: true, doctoraliaAddressId: true, doctoraliaFacilityId: true },
-            distinct: ['doctoraliaDoctorId', 'doctoraliaAddressId'],
-        });
-        for (const b of bsAddresses) {
-            add(b.doctoraliaFacilityId, b.doctoraliaDoctorId, b.doctoraliaAddressId);
         }
 
         return pairs;
