@@ -13,6 +13,6 @@ import { WebhookController, BookingSyncController } from './webhook.controller';
     imports: [PrismaModule, IntegrationsModule, MappingsModule],
     controllers: [WebhookController, BookingSyncController],
     providers: [BookingSyncService, BookingSafetySweepService, QueueService, RateLimiterService, ClinicConcurrencyGuard],
-    exports: [BookingSyncService, QueueService, ClinicConcurrencyGuard],
+    exports: [BookingSyncService, QueueService, ClinicConcurrencyGuard, RateLimiterService],
 })
 export class BookingsModule {}

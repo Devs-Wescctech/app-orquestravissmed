@@ -148,25 +148,51 @@ export class VismedAvailabilityService {
         categoryIds: number[],
         dates: string[],
     ): Promise<ClinicAvailability | null> {
+        const uniqueCategories = [...new Set(categoryIds.filter(c => Number.isInteger(c)))];
+        const pairs: Array<{ categoryId: number; date: string }> = [];
+        for (const c of uniqueCategories) {
+            for (const d of dates) pairs.push({ categoryId: c, date: d });
+        }
+        return this.buildForPairs(clinicId, pairs);
+    }
+
+    /**
+     * WP3 (Ajuste 3) — Constrói o snapshot de disponibilidade para um conjunto
+     * EXPLÍCITO de pares (categoryId, date), deduplicados por chave categoria+data.
+     *
+     * Permite ao chamador (ex.: consistency check do BlockWatcher) planejar as
+     * chamadas scheduleDay por clinicId+categoria+data uma única vez por ciclo,
+     * reutilizando o resultado read-only para médicos que compartilhem a mesma
+     * combinação. Mesma semântica de coleta/coalesce do buildForCategories.
+     */
+    async buildForPairs(
+        clinicId: string,
+        pairs: Array<{ categoryId: number; date: string }>,
+    ): Promise<ClinicAvailability | null> {
         const conn = await this.resolveConnection(clinicId);
         if (!conn) {
             this.logger.warn(`[AVAIL] Clínica ${clinicId} sem conexão VisMed válida — disponibilidade não construída.`);
             return null;
         }
 
-        const uniqueCategories = [...new Set(categoryIds.filter(c => Number.isInteger(c)))];
         const availability = new ClinicAvailability();
-        if (uniqueCategories.length === 0) return availability;
+
+        // Dedup por categoria+data — cada combinação gera NO MÁXIMO uma chamada scheduleDay.
+        const seen = new Set<string>();
+        const tasks: Array<{ categoryId: number; date: string }> = [];
+        for (const p of pairs) {
+            if (!Number.isInteger(p.categoryId) || !p.date) continue;
+            const key = `${p.categoryId}|${p.date}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            tasks.push(p);
+        }
+        if (tasks.length === 0) return availability;
 
         // (categoryId, date) acumulando intervalos por profissional antes de coalescer.
         const rawByProfDate = new Map<string, Array<{ inicio: string; fim: string }>>();
 
-        const tasks: Array<{ categoryId: number; date: string }> = [];
-        for (const c of uniqueCategories) {
-            for (const d of dates) tasks.push({ categoryId: c, date: d });
-        }
-
-        this.logger.log(`[AVAIL] Construindo disponibilidade: ${uniqueCategories.length} especialidade(s) × ${dates.length} dia(s) = ${tasks.length} chamadas scheduleDay (clínica ${clinicId}).`);
+        this.logger.log(`[AVAIL] Construindo disponibilidade: ${tasks.length} combinação(ões) categoria×data deduplicada(s) = ${tasks.length} chamadas scheduleDay (clínica ${clinicId}).`);
 
         let idx = 0;
         const worker = async () => {

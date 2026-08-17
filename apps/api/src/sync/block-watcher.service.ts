@@ -9,6 +9,7 @@ import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 import { ClinicConcurrencyGuard } from '../bookings/clinic-concurrency-guard';
 import { getDoctoraliaMetricsService, concurrencyActorOf } from '../metrics/doctoralia-metrics.service';
 import { AdminBlockBreakService } from './admin-block-break.service';
+import { AdminBlockBreakSyncService } from './admin-block-break-sync.service';
 import { VismedBlockPeriodAuditService } from './vismed-block-period-audit.service';
 import { VismedAvailabilityService } from './vismed-availability.service';
 import type { BlockPeriod } from './vismed-block-period-parser';
@@ -41,6 +42,17 @@ export class BlockWatcherService implements OnModuleInit {
     // clinicId -> (idprofissional -> hash dos bloqueios desse médico)
     private snapshots = new Map<string, Map<number, string>>();
 
+    /**
+     * WP3 — último modo efetivo do executor de breaks visto por clínica.
+     * Quando o modo muda (off→shadow, shadow→active, ou primeiro ciclo pós-restart
+     * com modo ≠ off), TODOS os médicos com bloqueios são reconciliados pelo
+     * executor — a ativação clínica a clínica não depende de mudança de hash.
+     * O executor é idempotente (diff vs. vínculos persistidos + adoção de
+     * duplicatas), então a reconciliação pós-restart não duplica breaks.
+     * Só é commitado quando o ciclo do executor termina sem falhas re-tentáveis.
+     */
+    private lastBreakSyncModes = new Map<string, string>();
+
     constructor(
         private readonly prisma: PrismaService,
         private readonly vismed: VismedService,
@@ -48,6 +60,7 @@ export class BlockWatcherService implements OnModuleInit {
         private readonly slotSync: SlotSyncService,
         private readonly concurrencyGuard: ClinicConcurrencyGuard,
         private readonly adminBlockBreak: AdminBlockBreakService,
+        private readonly blockBreakSync: AdminBlockBreakSyncService,
         private readonly blockPeriodAudit: VismedBlockPeriodAuditService,
         private readonly availabilityService: VismedAvailabilityService,
     ) {
@@ -245,12 +258,27 @@ export class BlockWatcherService implements OnModuleInit {
             if (currentHashes.get(id) !== h) affected.add(id);
         }
 
-        if (affected.size === 0) {
+        // WP3: alvos do executor de breaks = médicos com mudança (`affected`) e, em
+        // transição de modo (ativação da flag ou primeiro ciclo pós-restart com modo
+        // ≠ off), TODOS os médicos com bloqueios atuais — a ativação clínica a
+        // clínica reconcilia bloqueios já existentes sem depender de mudança de hash.
+        const breakSyncMode = this.blockBreakSync.resolveMode(clinicId);
+        const modeTransition = breakSyncMode !== 'off' && this.lastBreakSyncModes.get(clinicId) !== breakSyncMode;
+        const executorTargets = new Set<number>(affected);
+        if (modeTransition) {
+            for (const id of byDoctor.keys()) executorTargets.add(id);
+            this.logger.log(`[BLOCK-WATCHER] Clínica "${clinicName}": modo do executor de breaks mudou para "${breakSyncMode}" — reconciliando ${executorTargets.size} médico(s) com bloqueios.`);
+        }
+
+        if (affected.size === 0 && (breakSyncMode === 'off' || executorTargets.size === 0)) {
             this.snapshots.set(clinicId, currentHashes);
+            if (breakSyncMode !== 'off') this.lastBreakSyncModes.set(clinicId, breakSyncMode);
             return;
         }
 
-        this.logger.log(`[BLOCK-WATCHER] Clínica "${clinicName}": ${affected.size} médico(s) com mudança de bloqueio — re-sync direcionado de slots.`);
+        if (affected.size > 0) {
+            this.logger.log(`[BLOCK-WATCHER] Clínica "${clinicName}": ${affected.size} médico(s) com mudança de bloqueio — re-sync direcionado de slots.`);
+        }
 
         const client = this.docplanner.createClient(
             doctoraliaConn.domain || 'www.doctoralia.com.br',
@@ -288,6 +316,41 @@ export class BlockWatcherService implements OnModuleInit {
             }
         }
 
+        // WP3: executor de breaks administrativos (flag off → nunca chamado; shadow →
+        // apenas logs/auditoria; active → escrita real). Falha re-tentável mantém o
+        // médico pendente: hash com rollback (se afetado) E transição de modo não
+        // commitada, para que o ciclo seguinte re-execute — o executor é idempotente
+        // (diff vs. vínculos persistidos + adoção de duplicatas).
+        let executorFailures = false;
+        if (breakSyncMode !== 'off') {
+            for (const idprofissional of executorTargets) {
+                try {
+                    const breakRes = await runWithDoctoraliaContext(
+                        { origin: 'SLOT_SYNC', clinicId },
+                        () => this.blockBreakSync.syncDoctorBlocks({
+                            clinicId,
+                            clinicName,
+                            idprofissional,
+                            rawBlocks: byDoctor.get(idprofissional) ?? [],
+                            client,
+                        }),
+                    );
+                    if (!breakRes.ok) {
+                        executorFailures = true;
+                        this.logger.warn(`[BLOCK-WATCHER] Executor de breaks com ${breakRes.failures} falha(s) para idprofissional ${idprofissional} — manterá detecção no próximo ciclo.`);
+                        this.rollbackForRetry(committed, currentHashes, prevHashes, idprofissional);
+                    }
+                } catch (err: any) {
+                    executorFailures = true;
+                    this.logger.error(`[BLOCK-WATCHER] Falha no executor de breaks idprofissional ${idprofissional}: ${err?.message} — manterá detecção no próximo ciclo.`);
+                    this.rollbackForRetry(committed, currentHashes, prevHashes, idprofissional);
+                }
+            }
+            // Transição de modo só é commitada quando o ciclo do executor terminou sem
+            // falhas re-tentáveis — caso contrário o próximo ciclo re-reconcilia tudo.
+            if (!executorFailures) this.lastBreakSyncModes.set(clinicId, breakSyncMode);
+        }
+
         this.snapshots.set(clinicId, committed);
 
         // WP1: persiste e reconcilia o snapshot no banco.
@@ -300,9 +363,16 @@ export class BlockWatcherService implements OnModuleInit {
             this.logger.error(`[BLOCK-WATCHER] Falha ao persistir snapshot no banco: ${err?.message}`);
         }
 
-        // WP2: verificador auxiliar de consistência (best-effort, não bloqueia o fluxo).
-        if (validByProfDate.size > 0) {
-            this.runConsistencyChecks(clinicId, idEmpresaGestora, baseUrl, validByProfDate).catch(
+        // WP2/WP3 (Ajuste 1): verificador auxiliar de consistência (best-effort, não
+        // bloqueia o fluxo) — roda SOMENTE para médicos com mudança de bloqueio
+        // (`affected`). Ciclos sem mudança não geram NENHUMA chamada scheduleDay
+        // por causa da consistency check.
+        const affectedValid = new Map<number, Array<{ date: string; period: BlockPeriod; blockId?: any }>>();
+        for (const [id, entries] of validByProfDate) {
+            if (affected.has(id)) affectedValid.set(id, entries);
+        }
+        if (affectedValid.size > 0) {
+            this.runConsistencyChecks(clinicId, affectedValid).catch(
                 (err: any) => this.logger.warn(`[BLOCK-WATCHER] Falha no verificador de consistência (não-crítico): ${err?.message}`),
             );
         }
@@ -359,26 +429,29 @@ export class BlockWatcherService implements OnModuleInit {
     }
 
     /**
-     * WP2 — Verificador auxiliar de consistência (não-árbitro).
+     * WP2/WP3 — Verificador auxiliar de consistência (não-árbitro).
      *
-     * Para cada médico com bloqueios de período válido, constrói o snapshot de
-     * disponibilidade real (scheduleDay) para as datas relevantes e emite alerta
-     * de anomalia quando o período normalizado ainda aparece coberto.
+     * Ajuste 1: chamado SOMENTE com médicos presentes em `affected` (mudança de
+     * bloqueio no ciclo) — ciclo sem mudança gera zero chamadas scheduleDay aqui.
+     * Rechecagem periódica, se um dia desejada, deve ser config explícita separada
+     * do cron de 10 min (não implementada de propósito).
+     *
+     * Ajuste 3: as chamadas scheduleDay são planejadas/deduplicadas por chave
+     * clinicId+categoria+data — médicos que compartilham a mesma combinação
+     * reutilizam o MESMO resultado read-only (uma única passada buildForPairs).
+     * A deduplicação não altera a semântica do parser nem transforma o resultado
+     * em fonte de período: o sinal continua sendo apenas anomalia/observabilidade.
      *
      * Nunca altera períodos, nunca bloqueia o fluxo principal (best-effort).
-     * Execução envolve chamadas ao scheduleDay VisMed — proporcional ao número
-     * de datas únicas com bloqueios válidos (tipicamente 1-3 por médico).
      */
     private async runConsistencyChecks(
         clinicId: string,
-        _idEmpresaGestora: number,
-        _baseUrl: string | undefined,
-        validByProfDate: Map<number, Array<{ date: string; period: BlockPeriod; blockId?: any }>>,
+        affectedValid: Map<number, Array<{ date: string; period: BlockPeriod; blockId?: any }>>,
     ): Promise<void> {
-        for (const [idprofissional, entries] of validByProfDate) {
+        // 1) Resolve as categorias (idcategoriaservico) de cada médico afetado.
+        const categoriesByProf = new Map<number, number[]>();
+        for (const idprofissional of affectedValid.keys()) {
             try {
-                // Busca as categorias (idcategoriaservico) do médico via especialidades VisMed.
-                // Necessário para chamar scheduleDay, que é indexado por categoria.
                 const doctor = await this.prisma.vismedDoctor.findFirst({
                     where: { vismedId: idprofissional },
                     select: {
@@ -389,7 +462,6 @@ export class BlockWatcherService implements OnModuleInit {
                     },
                 });
                 if (!doctor) continue;
-
                 const categoryIds: number[] = [
                     ...new Set(
                         (doctor.specialties || [])
@@ -397,32 +469,44 @@ export class BlockWatcherService implements OnModuleInit {
                             .filter((v: any): v is number => Number.isInteger(v)),
                     ),
                 ];
-                if (categoryIds.length === 0) continue;
-
-                // Datas únicas com bloqueios válidos para este médico
-                const uniqueDates = [...new Set(entries.map(e => e.date))];
-
-                // Constrói disponibilidade real apenas para essas datas (chamada mínima)
-                const avail = await this.availabilityService.buildForCategories(
-                    clinicId,
-                    categoryIds,
-                    uniqueDates,
-                );
-                if (!avail) continue;
-
-                // Para cada bloqueio com período válido, verifica consistência vs scheduleDay
-                for (const { date, period, blockId } of entries) {
-                    const ranges = avail.getRanges(idprofissional, date);
-                    this.blockPeriodAudit.checkAndLogConsistency(period, ranges, {
-                        blockId,
-                        clinicId,
-                        idprofissional,
-                    });
-                }
+                if (categoryIds.length > 0) categoriesByProf.set(idprofissional, categoryIds);
             } catch (err: any) {
-                this.logger.warn(
-                    `[BLOCK-WATCHER] Verificador de consistência falhou para idprofissional=${idprofissional}: ${err?.message}`,
-                );
+                this.logger.warn(`[BLOCK-WATCHER] Verificador de consistência: falha ao resolver categorias idprofissional=${idprofissional}: ${err?.message}`);
+            }
+        }
+        if (categoriesByProf.size === 0) return;
+
+        // 2) Planeja o conjunto ÚNICO de pares (categoria, data) do ciclo inteiro.
+        const pairKeySeen = new Set<string>();
+        const pairs: Array<{ categoryId: number; date: string }> = [];
+        for (const [idprofissional, entries] of affectedValid) {
+            const cats = categoriesByProf.get(idprofissional);
+            if (!cats) continue;
+            for (const date of new Set(entries.map(e => e.date))) {
+                for (const categoryId of cats) {
+                    const key = `${categoryId}|${date}`;
+                    if (pairKeySeen.has(key)) continue;
+                    pairKeySeen.add(key);
+                    pairs.push({ categoryId, date });
+                }
+            }
+        }
+        if (pairs.length === 0) return;
+
+        // 3) UMA passada read-only, resultado compartilhado entre todos os médicos.
+        const avail = await this.availabilityService.buildForPairs(clinicId, pairs);
+        if (!avail) return;
+
+        // 4) Emite os sinais de anomalia por bloqueio (nunca altera períodos).
+        for (const [idprofissional, entries] of affectedValid) {
+            if (!categoriesByProf.has(idprofissional)) continue;
+            for (const { date, period, blockId } of entries) {
+                const ranges = avail.getRanges(idprofissional, date);
+                this.blockPeriodAudit.checkAndLogConsistency(period, ranges, {
+                    blockId,
+                    clinicId,
+                    idprofissional,
+                });
             }
         }
     }
