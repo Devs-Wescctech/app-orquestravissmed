@@ -657,3 +657,87 @@ SELECT count(*) FROM "DoctoraliaService" WHERE "doctoraliaServiceId" = '3893319'
 [ ] Diagnóstico read-only concluído (somente SELECTs) e divergência registrada
 [ ] AUTORIZAÇÃO HUMANA PARA RESTORE   ← ⛔ STOP — segundo gate humano; restore (seção 3.1) só depois dele ⛔
 ```
+
+---
+
+## 13. ADENDO — Via SQL direta (container `<api>` parado)
+
+**Quando usar:** o operador tem acesso direto ao PostgreSQL de produção (psql no `<pg>`), mas o container `<api>` está **parado e não será religado**. Nesse cenário `node apps/api/scripts/fix-service-dict-ids.js` (seção 8) é inviável; a correção é executada pelo artefato SQL transacional versionado:
+
+```
+docs/runbooks/sql/fix-service-dict-ids-transacional.sql
+```
+
+Esse artefato é a tradução auditada do script JS (SHA-256 do JS: `a98f588f78762e9e1d5a0bd372676af1aa70ab57004dccbbb955bb14af4e771c`). Ele revalida TODO o Gate 1 (P1/P2/P3/P4/P5/P5b) **dentro da própria transação** via `RAISE EXCEPTION`, executa somente o ramo SAFE_MERGE, roda as validações pós (seção 9, incl. 9.1 dos 7 MANUAL) ainda dentro da transação e **termina SEM COMMIT** — o `COMMIT` manual do operador é o gate humano.
+
+### 13.1 Divergências INTENCIONAIS vs o script JS auditado
+
+| # | Script JS | Via SQL |
+|---|---|---|
+| D1 | Ramo NO_MATCH: deleta a entrada falsa com **cascade** em mappings/PUM | `RAISE EXCEPTION` (abort da transação inteira) |
+| D2 | Ramo EXISTING_CORRECT_MAPPING/colisão: **modifica mapping preexistente** (limpa invalidReason, pode setar requiresReview=false) e deleta o contaminado | `RAISE EXCEPTION` (abort) |
+| D3 | Fallback de `normalizedName` por normalização NFD em JS | Não replicado (sem `unaccent` garantido); `normalizedName` NULL em entrada falsa → `RAISE EXCEPTION` |
+| D4 | Candidato ordenado só por `createdAt` asc | Desempate extra por `id` asc (determinismo total; sem efeito com P5 AMBIGUOUS=0) |
+| D5 | Clash-check iterativo dos pivots compostos (rename ou delete por iteração) | Dedup determinística em conjunto: mantém 1 pivot por link id puro (eleição por `createdAt` asc, `id` asc); resultado final equivalente |
+| D6 | Script commita implicitamente a cada operação | **Sem COMMIT no arquivo** — transação fica aberta aguardando decisão humana |
+
+**Propriedades de segurança adicionais da via SQL (não são divergências de semântica de mutação):** todos os gates pré (P1/P2/P3/P4/P5/P5b) e as validações pós rodam **dentro** da transação — qualquer falha desfaz tudo automaticamente; assert extra de **equivalência de candidatos** entre a exclusão do gatilho do script (`fake_from_composite`) e a definição oficial (`suspect_ids`) para as 126 entradas; assert extra de **alvos duplicados** (dois mappings da mesma `vismedSpecialtyId` convergindo ao mesmo candidato → abort, em vez do clash sequencial do JS).
+
+Consequência da D6 + gates transacionais: o restore da seção 3.1 **não é necessário nesta via** enquanto não houver COMMIT — abort/ROLLBACK não persiste nada. O backup da seção 3 continua **obrigatório** mesmo assim (defesa em profundidade para o pós-COMMIT).
+
+### 13.2 GATE 2 redefinido para a via SQL
+
+O Gate 2 original (seção 5) verifica script/ambiente **no container** — inaplicável com o `<api>` parado. Substituir por:
+
+1. **Hash do artefato SQL** — o arquivo usado na execução deve ter SHA-256 idêntico ao de referência:
+   ```
+   50975a7a5fc8ceedd12796e6bb1b94797aa56ddf9579d4d8ab6c963aff0864f2  docs/runbooks/sql/fix-service-dict-ids-transacional.sql
+   ```
+   Conferir no host que executa: `sha256sum fix-service-dict-ids-transacional.sql`. Divergência = arquivo alterado → **ABORT** (regenerar/reauditar o hash via commit no repo antes).
+2. **Prova de banco-alvo por SQL** (registrar a saída como evidência):
+   ```sql
+   SELECT current_database() AS db,
+          inet_server_addr() AS server_ip,
+          inet_server_port() AS server_port,
+          current_user,
+          version();
+   -- Contagens-sentinela (devem bater com o baseline auditado de produção):
+   SELECT 'DoctoraliaService' t, count(*) FROM "DoctoraliaService"
+   UNION ALL SELECT 'DoctoraliaAddressService', count(*) FROM "DoctoraliaAddressService"
+   UNION ALL SELECT 'SpecialtyServiceMapping', count(*) FROM "SpecialtyServiceMapping"
+   UNION ALL SELECT 'ProfessionalUnifiedMapping', count(*) FROM "ProfessionalUnifiedMapping";
+   -- P1 deve retornar 34 (seção 1). Se retornar 0/valor de outro ambiente → banco errado → ABORT.
+   ```
+   `db`/`server_ip` devem corresponder ao Postgres do stack Portainer (NUNCA host Replit/Neon).
+3. **Quiescência com container parado**:
+   ```bash
+   docker ps --filter name=<api>        # deve NÃO listar o container (parado)
+   ```
+   ```sql
+   -- Nenhuma conexão de aplicação no banco (só a sessão do psql do operador):
+   SELECT pid, usename, application_name, client_addr, state
+   FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid();
+   -- Nenhum SyncRun em andamento:
+   SELECT id, status, "startedAt" FROM "SyncRun"
+   WHERE status IN ('running','in_progress') ORDER BY "startedAt" DESC LIMIT 5;  -- 0 linhas
+   ```
+   Com o `<api>` parado, a pausa de 2 camadas da seção 2.1 fica automaticamente satisfeita (não há writers); ainda assim NÃO usar a UI `/mapping` (não há UI ativa com o container parado) e registrar a evidência acima.
+
+### 13.3 Checklist adaptado (até a autorização humana)
+
+```text
+[ ] Backup das 4 tabelas concluído e validado + 4 evidências (seção 3)
+[ ] Baseline salvo (contagens + baseline_34.csv + baseline_colisao.csv + snapshot PUM — seção 4)
+[ ] GATE 2 (SQL): sha256 do artefato = 50975a7a5fc8ceedd12796e6bb1b94797aa56ddf9579d4d8ab6c963aff0864f2
+[ ] GATE 2 (SQL): prova de banco-alvo registrada (current_database/inet_server_addr/sentinelas/P1=34)
+[ ] GATE 2 (SQL): container <api> confirmado parado + pg_stat_activity sem conexões de app + 0 SyncRun ativo
+[ ] Divergências intencionais D1–D6 (seção 13.1) lidas e entendidas
+[ ] Execução em sessão psql INTERATIVA: \i fix-service-dict-ids-transacional.sql (com \o/tee para log)
+[ ] Todos os RAISE NOTICE revisados: Gate 1 revalidado OK; Resumo = 126 mescladas / 0 sem match /
+    126 removidas / 34 reapontados; validações pós A–I OK
+[ ] Em QUALQUER RAISE EXCEPTION: transação já abortada — executar ROLLBACK;, preservar o log,
+    registrar a divergência e PARAR (seção 3.2 se aplicável; nada foi persistido)
+[ ] AUTORIZAÇÃO HUMANA PARA EXECUTAR (= digitar COMMIT;)   ← ⛔ STOP — o COMMIT é o gate humano ⛔
+```
+
+Pós-COMMIT: seguir os itens pós-gate da seção 12 que se aplicam (Mastologia — seção 10; NÃO reativar writers via seção 2.2 enquanto o container permanecer parado; ao religar o stack no futuro, executar a observação da seção 11).
