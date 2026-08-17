@@ -6,13 +6,36 @@
 
 ## 0. Contexto e placeholders
 
-**Problema:** um bug antigo de ingestão gravava o `address_service_id` (id do vínculo serviço↔endereço) como se fosse o `service_id` do dicionário global. Resultado auditado: **28 mappings contaminados** em `SpecialtyServiceMapping`, **126 entradas falsas** em `DoctoraliaService`, todos classificados **SAFE_MERGE** (AMBIGUOUS=0, NO_MATCH=0).
+**Problema:** um bug antigo de ingestão gravava o `address_service_id` (id do vínculo serviço↔endereço) como se fosse o `service_id` do dicionário global. Resultado auditado (auditoria read-only no banco real do Portainer, 2026-08-14+): **34 mappings contaminados** em `SpecialtyServiceMapping`, **126 entradas falsas** em `DoctoraliaService`, todos classificados **SAFE_MERGE** (AMBIGUOUS=0, NO_MATCH=0, EXISTING_CORRECT_MAPPING=0). O baseline anterior de 28 estava incompleto por definição de detecção — ver seção 0.1 ("Por que o baseline mudou de 28 para 34").
 
 **Correção:** o script one-off `apps/api/scripts/fix-service-dict-ids.js` (auditado) reaponta mappings e pivots para a entrada correta do dicionário (match por `normalizedName`), limpa `invalidReason` causado pelo 404, apaga as entradas falsas e renomeia pivots compostos para o link id puro.
 
-**Comportamento real do script — ramo de COLISÃO (EXISTING_CORRECT_MAPPING):** se para um mapping contaminado JÁ EXISTIR um mapping (mesma `vismedSpecialtyId`) apontando à entrada correta do dicionário, o script NÃO reaponta: ele **modifica o mapping preexistente** (limpa `invalidReason`/`invalidAt` incondicionalmente e pode setar `requiresReview=false` se esse mapping tiver score ≥ 0.90) e deleta o mapping contaminado. Esse mapping preexistente pode inclusive ser `MANUAL`. A auditoria classificou **todos os 28 casos como SAFE_MERGE (colisões = 0)** — portanto este runbook exige, no pré-check P4 (seção 1), que o número de colisões seja **0**; se for > 0, a execução é **BLOQUEADA** (o comportamento de colisão não está autorizado). Como defesa em profundidade, o baseline (seção 4.1) fotografa todos os mappings candidatos que poderiam colidir e a validação pós (seção 9) exige que estejam byte-a-byte inalterados — qualquer alteração aciona a REGRA OBRIGATÓRIA da seção 3.2 (congelar estado, preservar evidências, aguardar autorização humana para restore).
+**Comportamento real do script — ramo de COLISÃO (EXISTING_CORRECT_MAPPING):** se para um mapping contaminado JÁ EXISTIR um mapping (mesma `vismedSpecialtyId`) apontando à entrada correta do dicionário, o script NÃO reaponta: ele **modifica o mapping preexistente** (limpa `invalidReason`/`invalidAt` incondicionalmente e pode setar `requiresReview=false` se esse mapping tiver score ≥ 0.90) e deleta o mapping contaminado. Esse mapping preexistente pode inclusive ser `MANUAL`. A auditoria classificou **todos os 34 casos como SAFE_MERGE (colisões = 0)** — portanto este runbook exige, no pré-check P4 (seção 1), que o número de colisões seja **0**; se for > 0, a execução é **BLOQUEADA** (o comportamento de colisão não está autorizado). Como defesa em profundidade, o baseline (seção 4.1) fotografa todos os mappings candidatos que poderiam colidir e a validação pós (seção 9) exige que estejam byte-a-byte inalterados — qualquer alteração aciona a REGRA OBRIGATÓRIA da seção 3.2 (congelar estado, preservar evidências, aguardar autorização humana para restore).
 
-**IMPORTANTE — números auditados são EXPECTATIVA, não garantia.** O banco pode ter mudado desde a auditoria. Os pré-checks da seção 1 DEVEM ser re-executados imediatamente antes da execução; **qualquer divergência bloqueia tudo**.
+**IMPORTANTE — números auditados são EXPECTATIVA, não garantia.** O banco pode ter mudado desde a auditoria. Os pré-checks da seção 1 DEVEM ser re-executados imediatamente antes da execução (Gate 1 re-executado imediatamente antes de qualquer autorização); **qualquer divergência bloqueia tudo**.
+
+### 0.1 Por que o baseline mudou de 28 para 34
+
+A auditoria read-only concluída no banco REAL do Portainer (2026-08-14+) mostrou que o total estruturalmente contaminado é **34**, e não 28. Fatos consolidados:
+
+- **Não houve 6 mappings novos** e **não há evidência de recontaminação ativa**: nenhuma entrada falsa ou pivot composto foi criado após 2026-08-14 nem nos 7 dias anteriores à auditoria.
+- **Os 34 são históricos** — todos já existiam antes de 2026-08-14.
+- A diferença 28→34 veio de **DEFINIÇÃO da detecção**: a query antiga era mais restrita (não derivava o link id dos pivots compostos em todas as formas). A definição **oficial** do Gate 1 é a do CTE `suspect_ids` com as **duas formas** de pivot (id puro + composto via `split_part`), já presente na seção 1.
+- **NÃO usar `invalidReason` isoladamente como definição de contaminação.** Distribuição observada nos 34: **24 ERRO_ADDRESS_SERVICE, 6 ERRO_CATALOGO_FACILITY, 4 SEM_ERRO_ATUAL** — todos os 34 são estruturalmente derivados dos IDs falsos históricos e classificados **SAFE_MERGE**.
+
+### 0.2 Veredito de recontaminação
+
+**Não há evidência de recontaminação ativa do dicionário pela ingestão atual.** Sobre `apps/api/fetch_catalog.js` e `apps/api/import_catalog_and_map.js`: têm o padrão histórico perigoso de `item.id`, mas estão **excluídos da imagem por `.dockerignore`**, fora do runtime do Dockerfile e não são invocados por package.json/entrypoint/compose/NestJS — classificação: **código presente, não executável em produção e não utilizado**. NÃO tratá-los como writer ativo na tabela da seção 2. A remoção deles é follow-up separado que **NÃO bloqueia** esta correção.
+
+### 0.3 Regra dos mappings MANUAL (baseline: 7 dos 34)
+
+**Mappings MANUAL preservam integralmente a decisão humana.** `matchType`, `confidenceScore`, `reviewedAt`, `reviewedBy`, `overrideInvalid` e `isActive` **não podem ser alterados**. No ramo SAFE_MERGE, o script pode reapontar `doctoraliaServiceId`, limpar `invalidReason`/`invalidAt` causados pela contaminação e restaurar `requiresReview=false` quando a invalidação técnica colocou o mapping novamente em revisão e `confidenceScore >= 0.90`.
+
+MANUAL esperado no baseline = **7**: Ginecologia e obstetrícia (1), Mastologia (2), Medicina de Família e Comunidade (2), Oftalmologia (2). Nos 7 (auditado): `confidenceScore=1`, `requiresReview=true`, `invalidReason` do bug de address_service_id, `overrideInvalid=false` — o script setaria `requiresReview=false`.
+
+Comportamento confirmado do script no ramo SAFE_MERGE (`apps/api/scripts/fix-service-dict-ids.js:87-95`): altera somente `doctoraliaServiceId`, `invalidReason→null`, `invalidAt→null`, `requiresReview→false` (só se `invalidReason` preenchido E score ≥ 0.90) e `updatedAt` automático. **NÃO altera** `matchType`, `confidenceScore`, `reviewedAt`, `reviewedBy`, `overrideInvalid`, `isActive`, `id`, `vismedSpecialtyId`.
+
+É **PROIBIDO** preencher `reviewedAt`/`reviewedBy` vazios (são evidência histórica; fora de escopo).
 
 Placeholders (ajustar aos nomes reais do stack Portainer):
 - `<api>` = container da API NestJS
@@ -57,7 +80,7 @@ suspect_ids AS (
 ```
 
 ```sql
--- P1: contaminação (esperado: 28)
+-- P1: contaminação (esperado: 34)
 WITH fake_from_composite AS (
   SELECT DISTINCT split_part("doctoraliaAddressServiceId", '_', 3) AS fake_id
   FROM "DoctoraliaAddressService"
@@ -74,7 +97,7 @@ SELECT count(*) FROM "SpecialtyServiceMapping" m
 JOIN "DoctoraliaService" ds ON ds.id = m."doctoraliaServiceId"
 WHERE ds."doctoraliaServiceId" IN (SELECT sid FROM suspect_ids);
 
--- P2: cobertura do gatilho do script (esperado: 28 / 28 / 0)
+-- P2: cobertura do gatilho do script (esperado: 34 / 34 / 0)
 WITH fake_from_composite AS (
   SELECT DISTINCT split_part("doctoraliaAddressServiceId", '_', 3) AS fake_id
   FROM "DoctoraliaAddressService"
@@ -94,7 +117,7 @@ FROM "SpecialtyServiceMapping" m
 JOIN "DoctoraliaService" ds ON ds.id = m."doctoraliaServiceId"
 WHERE ds."doctoraliaServiceId" IN (SELECT sid FROM suspect_ids);
 
--- P3: V2 (esperado: 126 / 126 / 0 / 17)
+-- P3: V2 (esperado: 126 / 126 / 0 / <COM_MAPPING_ATUAL_VALIDADO>)
 WITH fake_dict_ids AS (
   SELECT DISTINCT split_part("doctoraliaAddressServiceId", '_', 3) AS fake_id
   FROM "DoctoraliaAddressService"
@@ -150,18 +173,89 @@ WHERE ds."doctoraliaServiceId" IN (SELECT sid FROM suspect_ids)
   );
 ```
 
-Valores esperados (baseline auditado — EXPECTATIVA a revalidar):
-- P1 = **28**
-- P2 = **28 / 28 / 0** (`fora_do_gatilho` DEVE ser 0)
-- P3 = **126 / 126 / 0 / 17** (`sem_match` DEVE ser 0)
-- P4 = **0 colisões** (`colisoes` DEVE ser 0 — se > 0, o script entraria no ramo EXISTING_CORRECT_MAPPING e modificaria mappings preexistentes, comportamento NÃO autorizado)
-- Classificação da auditoria: **SAFE_MERGE = 28, AMBIGUOUS = 0, NO_MATCH = 0, EXISTING_CORRECT_MAPPING = 0** (queries Q3/Q4 de `.local/audit/audit-contaminated-mappings.sql` podem ser re-rodadas para confirmar).
+```sql
+-- P5: CLASSIFICAÇÃO com a definição OFICIAL (esperado: SAFE_MERGE=34, demais=0)
+-- Replica a classificação da auditoria usando o CTE suspect_ids (duas formas de pivot).
+WITH fake_from_composite AS (
+  SELECT DISTINCT split_part("doctoraliaAddressServiceId", '_', 3) AS fake_id
+  FROM "DoctoraliaAddressService"
+  WHERE "doctoraliaAddressServiceId" LIKE '%\_%' ESCAPE '\'
+    AND array_length(string_to_array("doctoraliaAddressServiceId", '_'), 1) = 3
+),
+suspect_ids AS (
+  SELECT "doctoraliaAddressServiceId" AS sid FROM "DoctoraliaAddressService"
+  WHERE "doctoraliaAddressServiceId" NOT LIKE '%\_%' ESCAPE '\'
+  UNION
+  SELECT fake_id FROM fake_from_composite
+),
+contaminated AS (
+  SELECT m.id AS mapping_id, m."vismedSpecialtyId", ds.id AS fake_uuid,
+         COALESCE(ds."normalizedName", lower(trim(ds.name))) AS norm
+  FROM "SpecialtyServiceMapping" m
+  JOIN "DoctoraliaService" ds ON ds.id = m."doctoraliaServiceId"
+  WHERE ds."doctoraliaServiceId" IN (SELECT sid FROM suspect_ids)
+),
+cands AS (
+  SELECT cm.mapping_id, cm."vismedSpecialtyId",
+         count(cand.id) AS candidate_count,
+         (ARRAY_AGG(cand.id ORDER BY cand."createdAt" ASC))[1] AS chosen_uuid
+  FROM contaminated cm
+  LEFT JOIN "DoctoraliaService" cand
+    ON cand."normalizedName" = cm.norm
+   AND cand.id <> cm.fake_uuid
+   AND cand."doctoraliaServiceId" NOT IN (SELECT sid FROM suspect_ids)
+  GROUP BY cm.mapping_id, cm."vismedSpecialtyId"
+)
+SELECT CASE
+  WHEN candidate_count = 0 THEN 'NO_MATCH'
+  WHEN candidate_count > 1 THEN 'AMBIGUOUS'
+  WHEN EXISTS (SELECT 1 FROM "SpecialtyServiceMapping" ex
+               WHERE ex."vismedSpecialtyId" = c."vismedSpecialtyId"
+                 AND ex."doctoraliaServiceId" = c.chosen_uuid)
+       THEN 'EXISTING_CORRECT_MAPPING'
+  ELSE 'SAFE_MERGE'
+END AS class, count(*)
+FROM cands c
+GROUP BY 1 ORDER BY 1;
 
-**REGRA DE BLOQUEIO:** qualquer divergência — especialmente `sem_match > 0` (o script deletaria mappings com cascade em `ProfessionalUnifiedMapping`), `fora_do_gatilho > 0` (o script não corrigiria todos os 28) ou `colisoes > 0` (o script alteraria mappings preexistentes, possivelmente MANUAL) — → **PARAR, não executar, reportar a divergência**.
+-- P5b: MANUAL dentro do conjunto contaminado (esperado: 7)
+WITH fake_from_composite AS (
+  SELECT DISTINCT split_part("doctoraliaAddressServiceId", '_', 3) AS fake_id
+  FROM "DoctoraliaAddressService"
+  WHERE "doctoraliaAddressServiceId" LIKE '%\_%' ESCAPE '\'
+    AND array_length(string_to_array("doctoraliaAddressServiceId", '_'), 1) = 3
+),
+suspect_ids AS (
+  SELECT "doctoraliaAddressServiceId" AS sid FROM "DoctoraliaAddressService"
+  WHERE "doctoraliaAddressServiceId" NOT LIKE '%\_%' ESCAPE '\'
+  UNION
+  SELECT fake_id FROM fake_from_composite
+)
+SELECT count(*) AS manual_contaminados
+FROM "SpecialtyServiceMapping" m
+JOIN "DoctoraliaService" ds ON ds.id = m."doctoraliaServiceId"
+WHERE ds."doctoraliaServiceId" IN (SELECT sid FROM suspect_ids)
+  AND m."matchType" = 'MANUAL';
+```
+
+> Nota sobre P5: a exclusão de candidatos usa `suspect_ids` (definição oficial de detecção). O script exclui apenas `fake_from_composite` na escolha do candidato — com P2 `fora_do_gatilho = 0` os dois conjuntos coincidem para os casos cobertos; qualquer divergência entre P5 e a expectativa é bloqueio de qualquer forma.
+
+Valores esperados (baseline auditado — EXPECTATIVA a revalidar no dia):
+- P1 = **34**
+- P2 = **34 / 34 / 0** (`fora_do_gatilho` DEVE ser 0)
+- P3 = **126 / 126 / 0 / `<COM_MAPPING_ATUAL_VALIDADO>`** (`sem_match` DEVE ser 0). O 4º valor (`com_mapping`) é **placeholder a derivar do SQL atual no dia** e tratado como expectativa a revalidar — NÃO reutilizar o antigo "17".
+- P4 = **0 colisões** (`colisoes` DEVE ser 0 — se > 0, o script entraria no ramo EXISTING_CORRECT_MAPPING e modificaria mappings preexistentes, comportamento NÃO autorizado)
+- P5 (classificação, abaixo) = **SAFE_MERGE = 34, AMBIGUOUS = 0, NO_MATCH = 0, EXISTING_CORRECT_MAPPING = 0**; P5b (MANUAL) = **7**.
+  **ATENÇÃO:** as queries Q3/Q4 de `.local/audit/audit-contaminated-mappings.sql` usam a definição ANTIGA de detecção (igualdade direta pivot=id, sem `split_part` dos compostos) — foi exatamente essa definição que deixou 6 casos de fora. Elas NÃO validam o baseline 34; usar P5/P5b deste runbook.
+- MANUAL esperado dentro dos 34 = **7** (ver seção 0.3).
+
+**Definição oficial do conjunto contaminado (Gate 1):** a das **duas formas de pivot** (puro + composto via `split_part`) do CTE `suspect_ids` acima — é essa definição que produz 34.
+
+**REGRA DE BLOQUEIO:** qualquer divergência — especialmente `sem_match > 0` (o script deletaria mappings com cascade em `ProfessionalUnifiedMapping`), `fora_do_gatilho > 0` (o script não corrigiria todos os 34) ou `colisoes > 0` (o script alteraria mappings preexistentes, possivelmente MANUAL) — → **PARAR, não executar, reportar a divergência**.
 
 **Evidência a coletar:** saída completa de P1, P2, P3 e P4 (texto/print).
 
-**Dry-run recomendado das queries:** antes da janela de execução, rodar as queries deste runbook (todas read-only) contra um restore do dump de auditoria (ou diretamente no banco de produção, já que não escrevem nada) e conferir que P1/P2/P3/P4 reproduzem os números auditados. Se as queries retornarem 0/vazio onde se esperam 28/126, a causa provável é divergência de formato dos pivots (puro vs composto) — investigar antes de prosseguir; não executar.
+**Dry-run recomendado das queries:** antes da janela de execução, rodar as queries deste runbook (todas read-only) contra um restore do dump de auditoria (ou diretamente no banco de produção, já que não escrevem nada) e conferir que P1/P2/P3/P4 reproduzem os números auditados. Se as queries retornarem 0/vazio onde se esperam 34/126, a causa provável é divergência de formato dos pivots (puro vs composto) — investigar antes de prosseguir; não executar.
 
 ---
 
@@ -177,6 +271,8 @@ Valores esperados (baseline auditado — EXPECTATIVA a revalidar):
 | Token refresher (cron 15min) | só tokens de integração | — | **NÃO** |
 | Booking polling/sweep (`booking-sync.service.ts`) | apenas **leitura** nas 4 tabelas | polling | NÃO obrigatório (a pausa da fila também o cobre) |
 | Operador na UI `/mapping` (`mappings.service.ts`) | update `SpecialtyServiceMapping`, `ProfessionalUnifiedMapping` | ação humana | **SIM — não usar a UI de mapping durante a janela** |
+
+> **Nota:** `apps/api/fetch_catalog.js` e `apps/api/import_catalog_and_map.js` NÃO constam desta tabela por decisão auditada — são código presente mas **não executável em produção e não utilizado** (excluídos por `.dockerignore`, fora do runtime; ver seção 0.2). Não tratá-los como writer ativo.
 
 ### 2.1 Como pausar (2 camadas — usar AMBAS)
 
@@ -242,7 +338,7 @@ docker exec -i <pg> pg_restore -U <user> -d <db> --clean --if-exists \
   -t '"SpecialtyServiceMapping"' -t '"ProfessionalUnifiedMapping"' \
   /tmp/fix_dict_backup_${TS}.dump
 ```
-> `--clean` derruba e recria as tabelas com FKs; **manter a aplicação pausada durante o restore**. Após o restore autorizado, re-rodar P1 (deve voltar a 28) e reativar writers (seção 2.2).
+> `--clean` derruba e recria as tabelas com FKs; **manter a aplicação pausada durante o restore**. Após o restore autorizado, re-rodar P1 (deve voltar a 34) e reativar writers (seção 2.2).
 
 ### 3.2 REGRA OBRIGATÓRIA — Rollback/restore NUNCA é automático
 
@@ -268,11 +364,11 @@ SELECT 'DoctoraliaService' t, count(*) FROM "DoctoraliaService"
 UNION ALL SELECT 'DoctoraliaAddressService', count(*) FROM "DoctoraliaAddressService"
 UNION ALL SELECT 'SpecialtyServiceMapping', count(*) FROM "SpecialtyServiceMapping"
 UNION ALL SELECT 'ProfessionalUnifiedMapping', count(*) FROM "ProfessionalUnifiedMapping";
--- + P1 (28) e pivots compostos (126) da seção 1.
+-- + P1 (34) e pivots compostos (126) da seção 1.
 ```
 
 ```sql
--- Relação dos 28 (exportar em CSV: \copy (...) TO 'baseline_28.csv' CSV HEADER)
+-- Relação dos 34 (exportar em CSV: \copy (...) TO 'baseline_34.csv' CSV HEADER)
 WITH fake_from_composite AS (
   SELECT DISTINCT split_part("doctoraliaAddressServiceId", '_', 3) AS fake_id
   FROM "DoctoraliaAddressService"
@@ -285,10 +381,12 @@ suspect_ids AS (
   UNION
   SELECT fake_id FROM fake_from_composite
 )
-SELECT vs.name AS vismed_specialty, m.id AS mapping_id,
+SELECT vs.name AS vismed_specialty, m.id AS mapping_id, m."vismedSpecialtyId",
        ds.id AS fake_uuid, ds."doctoraliaServiceId" AS fake_ext_id, ds.name AS fake_name,
        cand.id AS correct_uuid, cand."doctoraliaServiceId" AS correct_ext_id, cand.name AS correct_name,
-       m."matchType", m."confidenceScore", m."requiresReview", m."invalidReason", m."isActive"
+       m."matchType", m."confidenceScore", m."requiresReview",
+       m."invalidReason", m."invalidAt",
+       m."reviewedAt", m."reviewedBy", m."overrideInvalid", m."isActive"
 FROM "SpecialtyServiceMapping" m
 JOIN "DoctoraliaService" ds ON ds.id = m."doctoraliaServiceId"
 LEFT JOIN "VismedSpecialty" vs ON vs.id = m."vismedSpecialtyId"
@@ -303,7 +401,7 @@ ORDER BY vs.name;
 ```
 
 ```sql
--- Snapshot de ProfessionalUnifiedMapping ligado aos 28 (deve permanecer intacto):
+-- Snapshot de ProfessionalUnifiedMapping ligado aos 34 (deve permanecer intacto):
 WITH fake_from_composite AS (
   SELECT DISTINCT split_part("doctoraliaAddressServiceId", '_', 3) AS fake_id
   FROM "DoctoraliaAddressService"
@@ -326,7 +424,7 @@ WHERE pum."specialtyServiceMappingId" IN (
 
 ### 4.1 Snapshot dos mappings candidatos que poderiam colidir (`baseline_colisao.csv`)
 
-Fotografa TODO mapping já apontando a um candidato correto dos 28 — o conjunto que o ramo de colisão do script poderia alterar. Com P4 = 0 espera-se **0 linhas de colisão real**, mas o snapshot cobre também os mappings dos serviços candidatos em geral, como defesa em profundidade:
+Fotografa TODO mapping já apontando a um candidato correto dos 34 — o conjunto que o ramo de colisão do script poderia alterar. Com P4 = 0 espera-se **0 linhas de colisão real**, mas o snapshot cobre também os mappings dos serviços candidatos em geral, como defesa em profundidade:
 
 ```sql
 -- Exportar: \copy (...) TO 'baseline_colisao.csv' CSV HEADER
@@ -366,7 +464,7 @@ LEFT JOIN "VismedSpecialty" vs ON vs.id = ex."vismedSpecialtyId"
 ORDER BY vs.name;
 ```
 
-**Evidências a coletar:** contagens gerais, `baseline_28.csv`, `baseline_colisao.csv`, snapshot PUM.
+**Evidências a coletar:** contagens gerais, `baseline_34.csv`, `baseline_colisao.csv`, snapshot PUM.
 
 ---
 
@@ -407,14 +505,14 @@ docker exec <api> sh -c 'echo $DATABASE_URL | sed -E "s#//[^@]+@#//***@#"'
 - Backup não gerado, não validado por `pg_restore --list`, ou sem as 4 evidências (arquivo/timestamp/tamanho/checksum) — seção 3;
 - Falha em QUALQUER conferência do GATE 2 (SHA, DATABASE_URL, container/branch) — seção 5;
 - Durante a execução: qualquer linha `[SEM MATCH]` no log (esperado: nenhuma);
-- Resumo final do script diferente de `126 mesclado(s), 0 sem match, 126 entrada(s) falsa(s) removida(s), 28 mapping(s) reapontado(s)` (contadores de pivots renomeados/deduplicados podem variar até 126);
+- Resumo final do script diferente de `126 mesclado(s), 0 sem match, 126 entrada(s) falsa(s) removida(s), 34 mapping(s) reapontado(s)` (contadores de pivots renomeados/deduplicados podem variar até 126);
 - Erro Prisma / constraint violation / processo interrompido → considerar estado parcial → rodar validações read-only (seção 9); se inconsistente, aplicar a REGRA OBRIGATÓRIA da seção 3.2: **congelar estado, preservar evidências e aguardar autorização humana para restore** (NÃO executar restore automaticamente).
 
 ---
 
 ## 7. Evidências obrigatórias (resumo)
 
-**Antes:** resultados de P1/P2/P3/P4; `baseline_28.csv`; `baseline_colisao.csv`; contagens gerais das 4 tabelas; snapshot de `ProfessionalUnifiedMapping`; identificação + timestamp + tamanho + sha256 do dump de backup; saídas do GATE 2 (SHA do script, commit/tag, DATABASE_URL mascarado).
+**Antes:** resultados de P1/P2/P3/P4; `baseline_34.csv`; `baseline_colisao.csv`; contagens gerais das 4 tabelas; snapshot de `ProfessionalUnifiedMapping`; identificação + timestamp + tamanho + sha256 do dump de backup; saídas do GATE 2 (SHA do script, commit/tag, DATABASE_URL mascarado).
 
 **Depois:** log completo do script (`fix_dict_run_<TS>.log`); resultados das validações pós (seção 9); consultas de Mastologia (seção 10).
 
@@ -443,13 +541,13 @@ SELECT count(*) FROM "DoctoraliaAddressService" WHERE "doctoraliaAddressServiceI
 -- C) Entradas falsas eliminadas: re-rodar P3; entradas_falsas deve ser 0.
 -- D) Contagens vs baseline:
 --    DoctoraliaService = baseline − 126;
---    SpecialtyServiceMapping = baseline (28 reapontados, NENHUM deletado — todos SAFE_MERGE);
+--    SpecialtyServiceMapping = baseline (34 reapontados, NENHUM deletado — todos SAFE_MERGE);
 --    ProfessionalUnifiedMapping = baseline (0 perdas). Conferir os IDs do snapshot da seção 4.
 -- E) invalidReason limpo SÓ nos afetados / requiresReview:
 SELECT m.id, vs.name, m."confidenceScore", m."matchType", m."requiresReview", m."invalidReason"
 FROM "SpecialtyServiceMapping" m
 LEFT JOIN "VismedSpecialty" vs ON vs.id = m."vismedSpecialtyId"
-WHERE m.id IN (/* mapping_ids do baseline_28.csv */);
+WHERE m.id IN (/* mapping_ids do baseline_34.csv */);
 -- F) Mappings preexistentes (potenciais colisões) INALTERADOS — comparar com baseline_colisao.csv:
 --    Re-rodar a query da seção 4.1 e comparar campo a campo (matchType, confidenceScore,
 --    requiresReview, invalidReason, invalidAt, overrideInvalid, isActive, updatedAt) com o CSV.
@@ -459,13 +557,24 @@ WHERE m.id IN (/* mapping_ids do baseline_28.csv */);
 ```
 
 **Restrição OBRIGATÓRIA sobre `requiresReview` (Observação 1 do aprovador):**
-Qualquer restauração de `requiresReview=false` deve seguir **estritamente a lógica já existente do script**: apenas mappings **diretamente afetados pelo bug** (ou seja, que tinham `invalidReason` preenchido por causa da invalidação provocada pelo id falso) **e** com `confidenceScore >= 0.90`. É **PROIBIDO** reclassificar (restaurar auto-aprovação de) mappings não relacionados ao bug apenas por terem score ≥ 0.90. Validar contra o `baseline_28.csv`: só os mappings desse conjunto que tinham `invalidReason` e score ≥ 0.90 podem ter passado a `requiresReview=false`.
+Qualquer restauração de `requiresReview=false` deve seguir **estritamente a lógica já existente do script**: apenas mappings **diretamente afetados pelo bug** (ou seja, que tinham `invalidReason` preenchido por causa da invalidação provocada pelo id falso) **e** com `confidenceScore >= 0.90`. É **PROIBIDO** reclassificar (restaurar auto-aprovação de) mappings não relacionados ao bug apenas por terem score ≥ 0.90. Validar contra o `baseline_34.csv`: só os mappings desse conjunto que tinham `invalidReason` e score ≥ 0.90 podem ter passado a `requiresReview=false`.
 
 Regras adicionais:
-- Nenhum mapping `MANUAL` pode ter sido alterado além do reaponte de ID; decisões MANUAL permanecem intocadas. **Atenção ao ramo de colisão do script** (seção 0): ele alteraria mappings preexistentes (inclusive MANUAL) limpando `invalidReason` incondicionalmente — por isso P4 = 0 é pré-condição de execução e qualquer falha na validação F acima aciona a REGRA OBRIGATÓRIA da seção 3.2 (congelar, preservar, parar — restore só com o gate `AUTORIZAÇÃO HUMANA PARA RESTORE`);
+- **Regra dos MANUAL (ver seção 0.3):** mappings MANUAL preservam integralmente a decisão humana. `matchType`, `confidenceScore`, `reviewedAt`, `reviewedBy`, `overrideInvalid` e `isActive` não podem ser alterados. No ramo SAFE_MERGE, o script pode reapontar `doctoraliaServiceId`, limpar `invalidReason`/`invalidAt` causados pela contaminação e restaurar `requiresReview=false` quando a invalidação técnica colocou o mapping novamente em revisão e `confidenceScore >= 0.90`. **Atenção ao ramo de colisão do script** (seção 0): ele alteraria mappings preexistentes (inclusive MANUAL) limpando `invalidReason` incondicionalmente — por isso P4 = 0 é pré-condição de execução e qualquer falha na validação F acima aciona a REGRA OBRIGATÓRIA da seção 3.2 (congelar, preservar, parar — restore só com o gate `AUTORIZAÇÃO HUMANA PARA RESTORE`);
 - `invalidReason` de mappings FORA do conjunto afetado deve permanecer como estava (rejeições legítimas continuam inválidas até remapeamento em `/mapping`).
 
-Se qualquer validação falhar → aplicar a REGRA OBRIGATÓRIA da seção 3.2: **NÃO executar restore**; congelar estado, manter writers pausados, preservar evidências, rodar apenas SELECTs diagnósticos, registrar a divergência e PARAR no gate `[ ] AUTORIZAÇÃO HUMANA PARA RESTORE`. Somente após esse gate humano o restore da seção 3.1 pode ser executado (e então re-rodar P1, que deve voltar a 28).
+### 9.1 Validação pós dedicada dos 7 mappings MANUAL (ANTES→DEPOIS)
+
+MANUAL esperado no baseline = **7**: Ginecologia e obstetrícia (1), Mastologia (2), Medicina de Família e Comunidade (2), Oftalmologia (2). O `baseline_34.csv` (seção 4) exporta todos os campos comparados aqui (`vismedSpecialtyId`, `matchType`, `confidenceScore`, `requiresReview`, `invalidReason`, `invalidAt`, `reviewedAt`, `reviewedBy`, `overrideInvalid`, `isActive`) — a comparação ANTES→DEPOIS é feita campo a campo contra esse snapshot. Para cada um dos 7 (linhas do `baseline_34.csv` com `matchType=MANUAL`):
+
+- **Idênticos (obrigatório):** `id`, `vismedSpecialtyId`, `matchType=MANUAL`, `confidenceScore`, `reviewedAt`, `reviewedBy`, `overrideInvalid`, `isActive`;
+- **Mudança esperada:** `doctoraliaServiceId` mudou do id falso para o correto;
+- **Permitido:** `invalidReason`/`invalidAt` limpos quando causados pelo bug; `requiresReview` pode ir `true→false` SOMENTE nas condições auditadas (`invalidReason` preenchido pelo bug E `confidenceScore >= 0.90` — nos 7 auditados, score = 1);
+- **PROIBIDO:** preencher `reviewedAt`/`reviewedBy` vazios (são evidência histórica; fora de escopo).
+
+**Qualquer alteração fora dessas regras = divergência** → writers permanecem pausados + gate `AUTORIZAÇÃO HUMANA PARA RESTORE` (seção 3.2).
+
+Se qualquer validação falhar → aplicar a REGRA OBRIGATÓRIA da seção 3.2: **NÃO executar restore**; congelar estado, manter writers pausados, preservar evidências, rodar apenas SELECTs diagnósticos, registrar a divergência e PARAR no gate `[ ] AUTORIZAÇÃO HUMANA PARA RESTORE`. Somente após esse gate humano o restore da seção 3.1 pode ser executado (e então re-rodar P1, que deve voltar a 34).
 
 ---
 
@@ -502,15 +611,17 @@ SELECT count(*) FROM "DoctoraliaService" WHERE "doctoraliaServiceId" = '3893319'
 ## 12. Checklist de execução
 
 ```text
-[ ] Pré-validação P1+P2 = 28/28/0 (fora_do_gatilho = 0)
-[ ] Pré-validação P3 = 126/126/0/17 (sem_match = 0)
+[ ] Pré-validação P1 = 34; P2 = 34/34/0 (fora_do_gatilho = 0)
+[ ] Pré-validação P3 = 126/126/0/<COM_MAPPING_ATUAL_VALIDADO> (sem_match = 0; 4º valor derivado do SQL no dia)
 [ ] Pré-validação P4 = 0 colisões (senão o script alteraria mappings preexistentes — BLOQUEAR)
-[ ] Classificação confirmada: SAFE_MERGE=28, AMBIGUOUS=0, NO_MATCH=0, EXISTING_CORRECT_MAPPING=0
+[ ] Classificação confirmada via P5 (definição oficial): SAFE_MERGE=34, AMBIGUOUS=0, NO_MATCH=0, EXISTING_CORRECT_MAPPING=0
+[ ] MANUAL no baseline = 7 via P5b (Gineco 1, Masto 2, MFC 2, Oftalmo 2 — seção 0.3)
+[ ] Regra: QUALQUER divergência nos valores acima → STOP, não executar
 [ ] Writers identificados e plano de pausa entendido (seção 2)
 [ ] Sync/push pausados (toggle da fila + DISABLE_SYNC_CRON) e quiescência confirmada (0 SyncRun em running)
 [ ] Backup concluído e validado (pg_restore --list + tamanho > 0)
 [ ] Evidência do backup registrada: arquivo + timestamp + tamanho + sha256 do dump
-[ ] Baseline salvo (contagens + baseline_28.csv + baseline_colisao.csv + snapshot ProfessionalUnifiedMapping)
+[ ] Baseline salvo (contagens + baseline_34.csv + baseline_colisao.csv + snapshot ProfessionalUnifiedMapping)
 [ ] GATE 2 conferido: sha256 do script no container = a98f588f78762e9e1d5a0bd372676af1aa70ab57004dccbbb955bb14af4e771c
 [ ] GATE 2 conferido: DATABASE_URL mascarado aponta para o Postgres do stack Portainer (senão ABORT)
 [ ] GATE 2 conferido: container/commit/branch/tag corretos (senão ABORT)
@@ -525,11 +636,12 @@ SELECT count(*) FROM "DoctoraliaService" WHERE "doctoraliaServiceId" = '3893319'
 ```text
 [ ] Script executado com log salvo (fix_dict_run_<TS>.log)
 [ ] unmatched = 0 no log (nenhuma linha [SEM MATCH])
-[ ] Resumo do script = 126 mesclado(s) / 0 sem match / 126 removida(s) / 28 reapontado(s)
+[ ] Resumo do script = 126 mesclado(s) / 0 sem match / 126 removida(s) / 34 reapontado(s)
 [ ] Contaminação pós = 0 (P1) e pivots compostos = 0
 [ ] DoctoraliaService = baseline − 126; SpecialtyServiceMapping = baseline
 [ ] ProfessionalUnifiedMapping preservado (contagem + IDs do snapshot)
-[ ] invalidReason limpo SÓ nos afetados; requiresReview restaurado SÓ conforme Observação 1; MANUAL intocados
+[ ] invalidReason limpo SÓ nos afetados; requiresReview restaurado SÓ conforme Observação 1
+[ ] Validação dedicada dos 7 MANUAL passou (seção 9.1: campos de decisão humana idênticos; só reaponte/limpeza autorizada)
 [ ] Validação F: mappings preexistentes idênticos ao baseline_colisao.csv (qualquer diff → seção 3.2)
 [ ] Mastologia corrigida (dict id real registrado; 3893319 ausente do dicionário)
 [ ] Writers reativados (seção 2.2)
