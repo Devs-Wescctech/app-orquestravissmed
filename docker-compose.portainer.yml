@@ -21,14 +21,31 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       JWT_SECRET: ${JWT_SECRET}
       VISMED_API_PORT: "3000"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
       # Opcionais (descomente/defina se precisar):
       # SKIP_DB_INIT: "false"
       # SKIP_SEED: "false"
       # DISABLE_SYNC_CRON: "true"
-      # REDIS_HOST: ""
-      # REDIS_PORT: ""
       # REDIS_PASSWORD: ""
     extra_hosts:
       # Faz o container enxergar o PostgreSQL rodando no host.
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    container_name: vismed-redis
+    # Sem "ports:": o Redis fica acessível SOMENTE dentro da network da stack
+    # (o container vismed alcança via hostname "redis"); nada é publicado no host.
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
