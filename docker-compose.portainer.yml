@@ -23,6 +23,9 @@ services:
       VISMED_API_PORT: "3000"
       REDIS_HOST: redis
       REDIS_PORT: "6379"
+      # WP3 (#188) — admin block-break sync; defaults mantêm o sync desligado:
+      ADMIN_BLOCK_BREAK_SYNC_MODE: ${ADMIN_BLOCK_BREAK_SYNC_MODE:-off}
+      ADMIN_BLOCK_BREAK_SYNC_ACTIVE_CLINICS: ${ADMIN_BLOCK_BREAK_SYNC_ACTIVE_CLINICS:-}
       # Opcionais (descomente/defina se precisar):
       # SKIP_DB_INIT: "false"
       # SKIP_SEED: "false"
