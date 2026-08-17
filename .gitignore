@@ -35,6 +35,7 @@ tsc_errors.txt
 *.sql
 # Prisma migrations DEVEM ser versionadas (senão o deploy não aplica o schema)
 !apps/api/prisma/migrations/**/*.sql
+!docs/runbooks/sql/*.sql
 *.json
 !package.json
 !package-lock.json
