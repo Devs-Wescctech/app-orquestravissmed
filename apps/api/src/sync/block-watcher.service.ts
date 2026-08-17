@@ -9,6 +9,9 @@ import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 import { ClinicConcurrencyGuard } from '../bookings/clinic-concurrency-guard';
 import { getDoctoraliaMetricsService, concurrencyActorOf } from '../metrics/doctoralia-metrics.service';
 import { AdminBlockBreakService } from './admin-block-break.service';
+import { VismedBlockPeriodAuditService } from './vismed-block-period-audit.service';
+import { VismedAvailabilityService } from './vismed-availability.service';
+import type { BlockPeriod } from './vismed-block-period-parser';
 
 /**
  * Vigia leve de bloqueios de agenda (fast-lane, a cada 10min).
@@ -30,8 +33,11 @@ import { AdminBlockBreakService } from './admin-block-break.service';
 @Injectable()
 export class BlockWatcherService implements OnModuleInit {
     private readonly logger = new Logger(BlockWatcherService.name);
+
     private readonly disabled: boolean;
+
     private isRunning = false;
+
     // clinicId -> (idprofissional -> hash dos bloqueios desse médico)
     private snapshots = new Map<string, Map<number, string>>();
 
@@ -42,6 +48,8 @@ export class BlockWatcherService implements OnModuleInit {
         private readonly slotSync: SlotSyncService,
         private readonly concurrencyGuard: ClinicConcurrencyGuard,
         private readonly adminBlockBreak: AdminBlockBreakService,
+        private readonly blockPeriodAudit: VismedBlockPeriodAuditService,
+        private readonly availabilityService: VismedAvailabilityService,
     ) {
         this.disabled = process.env.DISABLE_BLOCK_WATCHER === 'true';
     }
@@ -185,6 +193,36 @@ export class BlockWatcherService implements OnModuleInit {
         // snapshot (evita tratar erro de rede como "bloqueios removidos").
         const blocks = await this.vismed.getBloqueiosProfissional(idEmpresaGestora, baseUrl);
 
+        // WP2: Audita períodos irrecuperáveis de cada bloqueio fetched.
+        // O parser puro detecta malformações em horarioagendamento/horarioagendamentofinal
+        // (ex.: "011:0", "012:0"). Períodos inválidos ficam visíveis no AuditLog
+        // (action=BLOCK_PERIOD_UNRECOVERABLE) em vez de serem silenciados.
+        // Dedup em memória evita INSERTs repetidos a cada ciclo de 10min.
+        //
+        // Para bloqueios com período VÁLIDO, também colhemos a faixa normalizada
+        // para o verificador auxiliar de consistência (vs. scheduleDay).
+        // validByProfDate: Map<idprofissional, { date, period, blockId }[]>
+        const validByProfDate = new Map<number, Array<{ date: string; period: BlockPeriod; blockId?: any }>>();
+
+        for (const b of blocks) {
+            const idprofissional = Number(b?.idprofissional);
+            if (!Number.isFinite(idprofissional)) continue;
+            const date = String(b?.dataagendamento ?? '').substring(0, 10); // YYYY-MM-DD
+            const parsedPeriod = await this.blockPeriodAudit.parseWithAudit(
+                {
+                    blockId: b?.idbloqueio ?? undefined,
+                    date,
+                    startRaw: String(b?.horarioagendamento ?? ''),
+                    endRaw: String(b?.horarioagendamentofinal ?? ''),
+                },
+                { clinicId, clinicName, idprofissional },
+            );
+            if (parsedPeriod !== null) {
+                if (!validByProfDate.has(idprofissional)) validByProfDate.set(idprofissional, []);
+                validByProfDate.get(idprofissional)!.push({ date, period: parsedPeriod, blockId: b?.idbloqueio });
+            }
+        }
+
         // Agrupa por idprofissional e calcula hash por médico.
         const byDoctor = new Map<number, any[]>();
         for (const b of blocks) {
@@ -261,18 +299,17 @@ export class BlockWatcherService implements OnModuleInit {
         } catch (err: any) {
             this.logger.error(`[BLOCK-WATCHER] Falha ao persistir snapshot no banco: ${err?.message}`);
         }
+
+        // WP2: verificador auxiliar de consistência (best-effort, não bloqueia o fluxo).
+        if (validByProfDate.size > 0) {
+            this.runConsistencyChecks(clinicId, idEmpresaGestora, baseUrl, validByProfDate).catch(
+                (err: any) => this.logger.warn(`[BLOCK-WATCHER] Falha no verificador de consistência (não-crítico): ${err?.message}`),
+            );
+        }
     }
 
     /**
-     * Persiste o estado atual de bloqueios no banco (AdminBlockBreak, addressId='').
-     *
-     * - Para cada médico em `committed` (bloqueios ativos confirmados): upsert de cada
-     *   bloco individual com os campos raw da VisMed. O hash por bloco usa
-     *   `computeBlockPeriodHash` com os campos raw.
-     * - Para cada médico que saiu de `prevHashes` e não entrou em `committed` (bloqueios
-     *   removidos e re-sync concluído): cancela os registros de snapshot no banco.
-     *
-     * Usa addressId='' como sentinela: esses registros representam o snapshot do
+     * WP1 — Usa addressId='' como sentinela: esses registros representam o snapshot do
      * BlockWatcher e ainda não têm endereço Doctoralia vinculado (WP3 fará isso).
      */
     private async persistBlockSnapshot(
@@ -318,6 +355,75 @@ export class BlockWatcherService implements OnModuleInit {
         for (const [idprofissional] of prevHashes) {
             if (committed.has(idprofissional)) continue; // ainda ativo
             await this.adminBlockBreak.cancelSnapshotForDoctor(clinicId, idprofissional);
+        }
+    }
+
+    /**
+     * WP2 — Verificador auxiliar de consistência (não-árbitro).
+     *
+     * Para cada médico com bloqueios de período válido, constrói o snapshot de
+     * disponibilidade real (scheduleDay) para as datas relevantes e emite alerta
+     * de anomalia quando o período normalizado ainda aparece coberto.
+     *
+     * Nunca altera períodos, nunca bloqueia o fluxo principal (best-effort).
+     * Execução envolve chamadas ao scheduleDay VisMed — proporcional ao número
+     * de datas únicas com bloqueios válidos (tipicamente 1-3 por médico).
+     */
+    private async runConsistencyChecks(
+        clinicId: string,
+        _idEmpresaGestora: number,
+        _baseUrl: string | undefined,
+        validByProfDate: Map<number, Array<{ date: string; period: BlockPeriod; blockId?: any }>>,
+    ): Promise<void> {
+        for (const [idprofissional, entries] of validByProfDate) {
+            try {
+                // Busca as categorias (idcategoriaservico) do médico via especialidades VisMed.
+                // Necessário para chamar scheduleDay, que é indexado por categoria.
+                const doctor = await this.prisma.vismedDoctor.findFirst({
+                    where: { vismedId: idprofissional },
+                    select: {
+                        id: true,
+                        specialties: {
+                            select: { specialty: { select: { vismedId: true } } },
+                        },
+                    },
+                });
+                if (!doctor) continue;
+
+                const categoryIds: number[] = [
+                    ...new Set(
+                        (doctor.specialties || [])
+                            .map((ps: any) => ps?.specialty?.vismedId)
+                            .filter((v: any): v is number => Number.isInteger(v)),
+                    ),
+                ];
+                if (categoryIds.length === 0) continue;
+
+                // Datas únicas com bloqueios válidos para este médico
+                const uniqueDates = [...new Set(entries.map(e => e.date))];
+
+                // Constrói disponibilidade real apenas para essas datas (chamada mínima)
+                const avail = await this.availabilityService.buildForCategories(
+                    clinicId,
+                    categoryIds,
+                    uniqueDates,
+                );
+                if (!avail) continue;
+
+                // Para cada bloqueio com período válido, verifica consistência vs scheduleDay
+                for (const { date, period, blockId } of entries) {
+                    const ranges = avail.getRanges(idprofissional, date);
+                    this.blockPeriodAudit.checkAndLogConsistency(period, ranges, {
+                        blockId,
+                        clinicId,
+                        idprofissional,
+                    });
+                }
+            } catch (err: any) {
+                this.logger.warn(
+                    `[BLOCK-WATCHER] Verificador de consistência falhou para idprofissional=${idprofissional}: ${err?.message}`,
+                );
+            }
         }
     }
 
