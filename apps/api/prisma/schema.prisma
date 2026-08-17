@@ -599,3 +599,53 @@ model SlotPushState {
 
   @@unique([doctoraliaDoctorId, addressId])
 }
+
+enum AdminBlockBreakStatus {
+  ACTIVE
+  CANCELLED
+}
+
+// Persistência do vínculo bloqueio administrativo VisMed ↔ break Doctoralia.
+// Substitui o snapshot em memória do BlockWatcher, que se perde em cada restart.
+//
+// Chave natural: (clinicId, idprofissional, dataagendamento, horarioagendamento, addressId)
+//   - horarioagendamento (início) é confiável; horarioagendamentofinal (fim) é malformado
+//     no lado VisMed — NÃO faz parte da chave natural.
+//   - addressId cobre o relacionamento 1 bloqueio → N breaks (um por endereço Doctoralia).
+//
+// periodHash: SHA-256 de (horarioagendamento, horarioagendamentofinal normalizado) do raw
+//   VisMed, para detectar mudança de período sem re-consultar Doctoralia.
+model AdminBlockBreak {
+  id                   String                @id @default(uuid())
+  clinicId             String
+  // Chave natural VisMed
+  idprofissional       Int
+  dataagendamento      String                // "YYYY-MM-DD" ou formato VisMed
+  horarioagendamento   String                // HH:mm — início (confiável)
+  // Raw end-time string da VisMed (horarioagendamentofinal), preservado para
+  // reconstrução do hash agregado por médico na recuperação pós-restart.
+  // Pode ser malformado (ex.: "012:0") — não é usado para calcular breaks.
+  rawEndTime           String?
+  // Período normalizado para uso nos breaks Doctoralia
+  periodStart          DateTime
+  periodEnd            DateTime
+  periodHash           String                // SHA-256 do período — detecta mudança
+  // Vínculo Doctoralia
+  doctoraliaBreakId    String?               // null enquanto pendente de criação
+  addressId            String
+  facilityId           String
+  // Controle de estado
+  status               AdminBlockBreakStatus @default(ACTIVE)
+  lastSyncAttemptAt    DateTime?
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @updatedAt
+
+  // Chave natural única: um bloqueio VisMed por endereço Doctoralia
+  @@unique([clinicId, idprofissional, dataagendamento, horarioagendamento, addressId])
+  // Consultas do diff: "todos os breaks ativos desta clínica"
+  @@index([clinicId, status])
+  // Consultas do diff: "todos os breaks de um médico"
+  @@index([clinicId, idprofissional, status])
+  // Lookup rápido por break Doctoralia (ex.: ao receber evento de remoção)
+  @@index([doctoraliaBreakId])
+}

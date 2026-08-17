@@ -14,6 +14,7 @@ import { SlotSyncService } from './slot-sync.service';
 import { VismedAvailabilityService } from './vismed-availability.service';
 import { SyncSchedulerService } from './sync-scheduler.service';
 import { BlockWatcherService } from './block-watcher.service';
+import { AdminBlockBreakService } from './admin-block-break.service';
 import { BookingsModule } from '../bookings/bookings.module';
 
 @Module({
@@ -33,7 +34,7 @@ import { BookingsModule } from '../bookings/bookings.module';
         }),
     ],
     controllers: [SyncController],
-    providers: [SyncService, SyncProcessor, VismedSyncProcessor, VismedService, PushSyncService, SlotSyncService, VismedAvailabilityService, SyncSchedulerService, BlockWatcherService],
-    exports: [SyncService, SlotSyncService],
+    providers: [SyncService, SyncProcessor, VismedSyncProcessor, VismedService, PushSyncService, SlotSyncService, VismedAvailabilityService, SyncSchedulerService, BlockWatcherService, AdminBlockBreakService],
+    exports: [SyncService, SlotSyncService, AdminBlockBreakService],
 })
 export class SyncModule { }

@@ -8,6 +8,7 @@ import { SlotSyncService } from './slot-sync.service';
 import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 import { ClinicConcurrencyGuard } from '../bookings/clinic-concurrency-guard';
 import { getDoctoraliaMetricsService, concurrencyActorOf } from '../metrics/doctoralia-metrics.service';
+import { AdminBlockBreakService } from './admin-block-break.service';
 
 /**
  * Vigia leve de bloqueios de agenda (fast-lane, a cada 10min).
@@ -20,9 +21,9 @@ import { getDoctoraliaMetricsService, concurrencyActorOf } from '../metrics/doct
  * (que recalcula a disponibilidade real via scheduleDay — fonte limpa). Assim ganhamos
  * responsividade de ~10min para bloqueios sem o custo do sync completo.
  *
- * O snapshot é em memória: após um restart, o primeiro ciclo trata os médicos atualmente
- * bloqueados como "mudados" e re-sincroniza uma vez (barato e seguro). A lógica incremental
- * por hash do slot-sync (SlotPushState) evita pushes redundantes quando os slots finais não mudam.
+ * WP1: o snapshot é agora persistido no banco (AdminBlockBreak com addressId='').
+ * Na recuperação pós-restart, o primeiro ciclo restaura o snapshot do banco, evitando
+ * que todos os médicos bloqueados sejam tratados como "alterados" desnecessariamente.
  *
  * Kill switch: env DISABLE_BLOCK_WATCHER=true.
  */
@@ -40,15 +41,26 @@ export class BlockWatcherService implements OnModuleInit {
         private readonly docplanner: DocplannerService,
         private readonly slotSync: SlotSyncService,
         private readonly concurrencyGuard: ClinicConcurrencyGuard,
+        private readonly adminBlockBreak: AdminBlockBreakService,
     ) {
         this.disabled = process.env.DISABLE_BLOCK_WATCHER === 'true';
     }
 
-    onModuleInit() {
+    async onModuleInit() {
         if (this.disabled) {
             this.logger.warn('[BLOCK-WATCHER] Vigia de bloqueios DESATIVADO via DISABLE_BLOCK_WATCHER=true.');
-        } else {
-            this.logger.log('[BLOCK-WATCHER] Vigia de bloqueios ATIVO — checa bloqueios VisMed a cada 10 minutos (cron: */10 * * * *) e dispara re-sync direcionado de slots.');
+            return;
+        }
+        this.logger.log('[BLOCK-WATCHER] Vigia de bloqueios ATIVO — checa bloqueios VisMed a cada 10 minutos (cron: */10 * * * *) e dispara re-sync direcionado de slots.');
+        // WP1: restaura snapshot persistido para evitar falso-positivo pós-restart.
+        try {
+            this.snapshots = await this.adminBlockBreak.loadAllSnapshots();
+            const clinicCount = this.snapshots.size;
+            let doctorCount = 0;
+            for (const m of this.snapshots.values()) doctorCount += m.size;
+            this.logger.log(`[BLOCK-WATCHER] Snapshot restaurado do banco: ${clinicCount} clínica(s), ${doctorCount} médico(s) com bloqueios activos.`);
+        } catch (err: any) {
+            this.logger.warn(`[BLOCK-WATCHER] Falha ao restaurar snapshot do banco (continuando sem restauração): ${err?.message}`);
         }
     }
 
@@ -92,6 +104,24 @@ export class BlockWatcherService implements OnModuleInit {
             }))
             .sort((a, b) => (a.d + a.i + a.f).localeCompare(b.d + b.i + b.f));
         return crypto.createHash('sha256').update(JSON.stringify(norm)).digest('hex');
+    }
+
+    /**
+     * Analisa o período de um bloqueio VisMed raw em datas normalizadas.
+     * - Início malformado → retorna null (bloco ignorado).
+     * - Fim malformado → fallback de +30 min sobre o início.
+     * Nota: parsing detalhado (WP2) refinará esta lógica; aqui usamos inline guard básico.
+     */
+    private parseBlockPeriod(block: any): { start: Date; end: Date } | null {
+        const date = String(block.dataagendamento ?? '');
+        const timeI = String(block.horarioagendamento ?? '');
+        const timeF = String(block.horarioagendamentofinal ?? '');
+
+        const start = new Date(`${date}T${timeI}:00-03:00`);
+        if (isNaN(start.getTime())) return null;
+
+        const end = new Date(`${date}T${timeF}:00-03:00`);
+        return { start, end: isNaN(end.getTime()) ? new Date(start.getTime() + 30 * 60_000) : end };
     }
 
     private async watchClinic(clinicId: string, clinicName: string) {
@@ -221,6 +251,74 @@ export class BlockWatcherService implements OnModuleInit {
         }
 
         this.snapshots.set(clinicId, committed);
+
+        // WP1: persiste e reconcilia o snapshot no banco.
+        // É aguardado (não fire-and-forget) para garantir que uma escrita de um ciclo
+        // anterior não sobrescreva o estado de um ciclo posterior.
+        // Falha na persistência não afeta o fluxo de re-sync: apenas loga o erro.
+        try {
+            await this.persistBlockSnapshot(clinicId, doctoraliaConn, byDoctor, committed, prevHashes);
+        } catch (err: any) {
+            this.logger.error(`[BLOCK-WATCHER] Falha ao persistir snapshot no banco: ${err?.message}`);
+        }
+    }
+
+    /**
+     * Persiste o estado atual de bloqueios no banco (AdminBlockBreak, addressId='').
+     *
+     * - Para cada médico em `committed` (bloqueios ativos confirmados): upsert de cada
+     *   bloco individual com os campos raw da VisMed. O hash por bloco usa
+     *   `computeBlockPeriodHash` com os campos raw.
+     * - Para cada médico que saiu de `prevHashes` e não entrou em `committed` (bloqueios
+     *   removidos e re-sync concluído): cancela os registros de snapshot no banco.
+     *
+     * Usa addressId='' como sentinela: esses registros representam o snapshot do
+     * BlockWatcher e ainda não têm endereço Doctoralia vinculado (WP3 fará isso).
+     */
+    private async persistBlockSnapshot(
+        clinicId: string,
+        doctoraliaConn: any,
+        byDoctor: Map<number, any[]>,
+        committed: Map<number, string>,
+        prevHashes: Map<number, string>,
+    ): Promise<void> {
+        const facilityId = doctoraliaConn?.facilityId || '';
+
+        // Upsert blocos de médicos ativos no committed + reconcilia chaves obsoletas.
+        for (const [idprofissional, doctorBlocks] of byDoctor) {
+            if (!committed.has(idprofissional)) continue; // re-sync falhou — não persistir
+
+            const validBlocks: Array<{ dataagendamento: string; horarioagendamento: string }> = [];
+
+            for (const block of doctorBlocks) {
+                const period = this.parseBlockPeriod(block);
+                if (!period) continue; // início malformado — pular
+                const dataagendamento = String(block.dataagendamento ?? '');
+                const horarioagendamento = String(block.horarioagendamento ?? '');
+                await this.adminBlockBreak.upsert({
+                    clinicId,
+                    idprofissional,
+                    dataagendamento,
+                    horarioagendamento,
+                    addressId: '',
+                    rawEndTime: String(block.horarioagendamentofinal ?? ''),
+                    periodStart: period.start,
+                    periodEnd: period.end,
+                    facilityId,
+                });
+                validBlocks.push({ dataagendamento, horarioagendamento });
+            }
+
+            // Cancela blocos individuais que desapareceram mas o médico ainda tem outros activos
+            // (ex.: A+B→B+C: A deve ser cancelado sem remover B e C).
+            await this.adminBlockBreak.reconcileSnapshotForDoctor(clinicId, idprofissional, validBlocks);
+        }
+
+        // Cancela snapshot inteiro de médicos que saíram completamente (sem nenhum bloco).
+        for (const [idprofissional] of prevHashes) {
+            if (committed.has(idprofissional)) continue; // ainda ativo
+            await this.adminBlockBreak.cancelSnapshotForDoctor(clinicId, idprofissional);
+        }
     }
 
     /**
