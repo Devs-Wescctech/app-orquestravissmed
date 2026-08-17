@@ -1038,6 +1038,10 @@ export class DoctoraliaMetricsService {
             },
             // WP-02 P2c + WP-04: Guard de concorrência por clínica (todos os cruzamentos)
             concurrencyGuard: { ...this.concurrencySkipCounts },
+            // WP-14: retries transitórios (WP-07) — seção aditiva, nada renomeado.
+            retry: this.getTransientRetryStats(),
+            // WP-14: backpressure da fila HIGH/LOW (WP-08B) — seção aditiva.
+            backpressure: this.getQueueBackpressureStats(),
         };
     }
 

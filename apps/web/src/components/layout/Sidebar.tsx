@@ -12,7 +12,8 @@ import {
     ChevronLeft,
     ChevronRight,
     Database,
-    BookOpen
+    BookOpen,
+    Activity
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useAuthStore } from '@/lib/store';
@@ -52,6 +53,7 @@ export function Sidebar() {
 
     const adminLinks = [
         { name: 'Clínicas', href: '/clinics', icon: Building2 },
+        { name: 'Operação Doctoralia', href: '/admin/operations', icon: Activity },
     ];
 
     return (

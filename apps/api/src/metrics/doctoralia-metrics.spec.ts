@@ -807,3 +807,100 @@ describe('DoctoraliaMetricsService — contador de GETs deduplicados (WP-05)', (
         expect(service.getBaseline().dedup.DOCTORALIA_DEDUPED_GET_COUNT).toBe(0);
     });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WP-14 — blocos aditivos retry e backpressure no baseline
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('DoctoraliaMetricsService — baseline retry/backpressure (WP-14)', () => {
+    let service: DoctoraliaMetricsService;
+
+    beforeEach(() => {
+        service = new DoctoraliaMetricsService();
+    });
+
+    it('baseline vazio inclui retry e backpressure com zeros seguros (estado válido, sem eventos)', () => {
+        const baseline = service.getBaseline();
+
+        expect(baseline.retry).toBeDefined();
+        expect(baseline.retry.total).toBe(0);
+        expect(baseline.retry.byClassification).toEqual({});
+        expect(baseline.retry.succeeded).toBe(0);
+        expect(baseline.retry.exhausted).toBe(0);
+        expect(baseline.retry.retryAfterWaits).toBe(0);
+        expect(baseline.retry.retryAfterWaitMsTotal).toBe(0);
+
+        expect(baseline.backpressure).toBeDefined();
+        expect(baseline.backpressure.queueHighCurrent).toBe(0);
+        expect(baseline.backpressure.queueLowCurrent).toBe(0);
+        expect(baseline.backpressure.queueHighRejectedFull).toBe(0);
+        expect(baseline.backpressure.queueLowRejectedFull).toBe(0);
+        expect(baseline.backpressure.queueHighExpired).toBe(0);
+        expect(baseline.backpressure.queueLowExpired).toBe(0);
+        expect(baseline.backpressure.peakHigh).toBe(0);
+        expect(baseline.backpressure.peakLow).toBe(0);
+        expect(baseline.backpressure.waitHigh).toEqual({ grantedCount: 0, avgWaitMs: 0, p95WaitMs: 0 });
+        expect(baseline.backpressure.waitLow).toEqual({ grantedCount: 0, avgWaitMs: 0, p95WaitMs: 0 });
+    });
+
+    it('retry reflete getTransientRetryStats() com contadores reais', () => {
+        service.recordTransientRetry('HTTP_429', 1200);
+        service.recordTransientRetry('HTTP_429');
+        service.recordTransientRetry('NETWORK');
+        service.recordTransientRetryOutcome('succeeded');
+        service.recordTransientRetryOutcome('exhausted');
+
+        const baseline = service.getBaseline();
+        expect(baseline.retry.total).toBe(3);
+        expect(baseline.retry.byClassification).toEqual({ HTTP_429: 2, NETWORK: 1 });
+        expect(baseline.retry.succeeded).toBe(1);
+        expect(baseline.retry.exhausted).toBe(1);
+        expect(baseline.retry.retryAfterWaits).toBe(1);
+        expect(baseline.retry.retryAfterWaitMsTotal).toBe(1200);
+    });
+
+    it('backpressure reflete getQueueBackpressureStats() com filas/waits reais', () => {
+        service.recordQueueRejectedFull('HIGH', 50);
+        service.recordQueueExpired('LOW', 61000);
+        service.recordQueueWait('LOW', 100);
+        service.recordQueueWait('LOW', 300);
+        service.recordQueueDepth(3, 12, 500, 9000);
+
+        const baseline = service.getBaseline();
+        expect(baseline.backpressure.queueHighRejectedFull).toBe(1);
+        expect(baseline.backpressure.queueLowExpired).toBe(1);
+        expect(baseline.backpressure.queueHighCurrent).toBe(3);
+        expect(baseline.backpressure.queueLowCurrent).toBe(12);
+        expect(baseline.backpressure.oldestWaiterAgeMsHigh).toBe(500);
+        expect(baseline.backpressure.oldestWaiterAgeMsLow).toBe(9000);
+        expect(baseline.backpressure.peakHigh).toBe(3);
+        expect(baseline.backpressure.peakLow).toBe(12);
+        expect(baseline.backpressure.waitLow.grantedCount).toBe(2);
+        expect(baseline.backpressure.waitLow.avgWaitMs).toBe(200);
+    });
+
+    it('retrocompatibilidade: nenhuma métrica existente foi renomeada ou removida', () => {
+        const baseline = service.getBaseline();
+        for (const key of [
+            'generatedAt', 'dataSource', 'measurementPeriodMs', 'measurementScope',
+            'volume', 'queue', 'rateLimiterService', 'dedup', 'circuitBreaker',
+            'writeBudget', 'errors', 'polling', 'appointments', 'slotSync',
+            'duplicates', 'concurrencyGuard',
+        ]) {
+            expect(baseline).toHaveProperty(key);
+        }
+        expect(baseline.dedup).toHaveProperty('DOCTORALIA_DEDUPED_GET_COUNT');
+        expect(baseline.queue).toHaveProperty('DOCTORALIA_RATE_LIMIT_USAGE');
+    });
+
+    it('reset() zera retry e backpressure no baseline', () => {
+        service.recordTransientRetry('HTTP_429', 100);
+        service.recordQueueWait('HIGH', 500);
+        service.recordQueueDepth(5, 5, 1, 1);
+        service.reset();
+        const baseline = service.getBaseline();
+        expect(baseline.retry.total).toBe(0);
+        expect(baseline.backpressure.peakHigh).toBe(0);
+        expect(baseline.backpressure.waitHigh.grantedCount).toBe(0);
+    });
+});
