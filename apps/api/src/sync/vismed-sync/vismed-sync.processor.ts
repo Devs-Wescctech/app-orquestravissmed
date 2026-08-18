@@ -4,6 +4,7 @@ import { Job } from 'bullmq';
 import { PrismaService } from '../../prisma/prisma.service';
 import { VismedService } from '../../integrations/vismed/vismed.service';
 import { MatchingEngineService } from '../../mappings/matching-engine.service';
+import { resolveVismedConnection } from './vismed-connection.resolver';
 
 @Processor('vismed-sync')
 @Injectable()
@@ -19,10 +20,10 @@ export class VismedSyncProcessor extends WorkerHost {
     }
 
     async process(job: Job<any, any, string>): Promise<any> {
-        const { idEmpresaGestora, clinicId, syncRunId } = job.data;
+        const { idEmpresaGestora: jobEmpresa, clinicId, syncRunId } = job.data;
 
         console.log(`[WORKER] Iniciando Processamento OBRIGATÓRIO do Job: ${job.name} (ID: ${job.id})`);
-        this.logger.log(`Iniciando Sincronização VisMed (Empresa: ${idEmpresaGestora}, ClinicLocal: ${clinicId}, RunID: ${syncRunId})`);
+        this.logger.log(`Iniciando Sincronização VisMed (JobEmpresa: ${jobEmpresa}, ClinicLocal: ${clinicId}, RunID: ${syncRunId})`);
 
         try {
             // Se o syncRunId não vier (fallback), criar um novo, mas o correto é vir do SyncService
@@ -39,7 +40,47 @@ export class VismedSyncProcessor extends WorkerHost {
                 currentSyncRunId = newSync.id;
             }
 
-            await this.logEvent(currentSyncRunId, 'SYSTEM', 'sync_started', 'Iniciando extração de dados da Central VisMed.');
+            // -----------------------------------------------------------------
+            // RESOLUÇÃO FAIL-CLOSED: conexão VisMed da clínica.
+            // Nenhum GET à VisMed ocorre antes desta validação.
+            // Garante que a baseUrl e idEmpresaGestora corretos da CLÍNICA sejam
+            // usados — nunca o default global api-vissmed-7 nem a empresa 286.
+            // -----------------------------------------------------------------
+            let baseUrl: string;
+            let idEmpresaGestora: number;
+            try {
+                const resolved = await resolveVismedConnection(this.prisma, clinicId);
+                baseUrl = resolved.baseUrl;
+                idEmpresaGestora = resolved.idEmpresaGestora;
+            } catch (resolveErr) {
+                const msg = resolveErr instanceof Error ? resolveErr.message : String(resolveErr);
+                this.logger.error(`[VISMED-ROUTING] Falha ao resolver conexão VisMed — clinicId=${clinicId}: ${msg}`);
+                await this.prisma.syncRun.update({
+                    where: { id: currentSyncRunId },
+                    data: { status: 'failed', endedAt: new Date(), metrics: { error: msg } },
+                });
+                await this.logEvent(currentSyncRunId, 'SYSTEM', 'sync_error', msg);
+                throw resolveErr;
+            }
+
+            // Divergência entre idEmpresaGestora do job e clientId da conexão → falha observável.
+            // Escolher silenciosamente um dos dois contaminaria o catálogo.
+            if (jobEmpresa !== undefined && jobEmpresa !== null && Number(jobEmpresa) !== idEmpresaGestora) {
+                const msg = `idEmpresaGestora divergente: job=${jobEmpresa}, conexão da clínica ${clinicId}=${idEmpresaGestora}. Sync abortado para evitar contaminação de catálogo.`;
+                this.logger.error(`[VISMED-ROUTING] ${msg}`);
+                await this.prisma.syncRun.update({
+                    where: { id: currentSyncRunId },
+                    data: { status: 'failed', endedAt: new Date(), metrics: { error: msg } },
+                });
+                await this.logEvent(currentSyncRunId, 'SYSTEM', 'sync_error', msg);
+                throw new Error(msg);
+            }
+
+            // Log de roteamento por ciclo (sem expor segredos)
+            const host = (() => { try { return new URL(baseUrl).host; } catch (_) { return baseUrl; } })();
+            this.logger.log(`[VISMED-ROUTING] clinicId=${clinicId} idEmpresaGestora=${idEmpresaGestora} host=${host}`);
+
+            await this.logEvent(currentSyncRunId, 'SYSTEM', 'sync_started', `Iniciando extração de dados da Central VisMed. idEmpresaGestora=${idEmpresaGestora} host=${host}`);
             let insertedOrUpdated = 0;
 
             // ----------------------------------------------------
@@ -47,7 +88,7 @@ export class VismedSyncProcessor extends WorkerHost {
             // ----------------------------------------------------
             this.logger.log('Sincronizando Unidades...');
             await this.logEvent(currentSyncRunId, 'LOCATION', 'fetch_started', 'Buscando unidades geográficas...');
-            const unidades = await this.vismedClient.getUnidades(idEmpresaGestora);
+            const unidades = await this.vismedClient.getUnidades(idEmpresaGestora, baseUrl);
             await this.logEvent(currentSyncRunId, 'LOCATION', 'fetch_success', `Encontradas ${unidades.length} unidades.`);
 
             for (const u of unidades) {
@@ -95,7 +136,7 @@ export class VismedSyncProcessor extends WorkerHost {
             // ----------------------------------------------------
             this.logger.log('Sincronizando Especialidades/Categorias de Serviço...');
             await this.logEvent(currentSyncRunId, 'SPECIALTY', 'fetch_started', 'Buscando catálogo de especialidades...');
-            const especialidades = await this.vismedClient.getEspecialidades(idEmpresaGestora);
+            const especialidades = await this.vismedClient.getEspecialidades(idEmpresaGestora, baseUrl);
             await this.logEvent(currentSyncRunId, 'SPECIALTY', 'fetch_success', `Encontradas ${especialidades.length} especialidades.`);
 
             // vismedIds retornados pela API nesta execução + índice por nome normalizado,
@@ -172,7 +213,7 @@ export class VismedSyncProcessor extends WorkerHost {
             // ----------------------------------------------------
             this.logger.log('Sincronizando Profissionais (Médicos) e vínculos de especialidades...');
             await this.logEvent(currentSyncRunId, 'DOCTOR', 'fetch_started', 'Extraindo profissionais vinculados...');
-            const profissionais = await this.vismedClient.getProfissionais(idEmpresaGestora);
+            const profissionais = await this.vismedClient.getProfissionais(idEmpresaGestora, baseUrl);
             await this.logEvent(currentSyncRunId, 'DOCTOR', 'fetch_success', `Encontrados ${profissionais.length} profissionais.`);
 
             for (const p of profissionais) {
@@ -323,7 +364,7 @@ export class VismedSyncProcessor extends WorkerHost {
             this.logger.log('Sincronizando Convênios...');
             await this.logEvent(currentSyncRunId, 'INSURANCE', 'fetch_started', 'Buscando convênios...');
             try {
-                const convenios = await this.vismedClient.getConvenios(idEmpresaGestora);
+                const convenios = await this.vismedClient.getConvenios(idEmpresaGestora, baseUrl);
                 await this.logEvent(currentSyncRunId, 'INSURANCE', 'fetch_success', `Encontrados ${convenios.length} convênios.`);
 
                 for (const c of convenios) {

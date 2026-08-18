@@ -16,6 +16,12 @@
  */
 import { VismedSyncProcessor } from './vismed-sync.processor';
 
+// Conexões VisMed usadas pelos testes de escopo: cada clínica tem a sua.
+const VISMED_CONNECTIONS: any[] = [
+    { clinicId: 'clinic-petro', provider: 'vismed', status: 'active', clientId: '52', domain: 'https://app.vissmed.com.br/api-docctor-3' },
+    { clinicId: 'clinic-leo',  provider: 'vismed', status: 'active', clientId: '4',  domain: 'https://app.vissmed.com.br/api-vissmed-5' },
+];
+
 function buildPrismaFake(seedSpecialties: any[] = [], seedLinks: any[] = []) {
     let uid = 0;
     const id = () => `id-${++uid}`;
@@ -37,6 +43,10 @@ function buildPrismaFake(seedSpecialties: any[] = [], seedLinks: any[] = []) {
         mapping: { upsert: jest.fn(async () => ({})) },
         vismedUnit: { upsert: jest.fn(async () => ({ id: id() })), findUnique: jest.fn(async () => null) },
         vismedInsurance: { upsert: jest.fn(async () => ({ id: id() })) },
+        integrationConnection: {
+            findFirst: jest.fn(async ({ where }: any) =>
+                VISMED_CONNECTIONS.find(c => c.clinicId === where.clinicId && c.provider === where.provider) || null),
+        },
         vismedDoctor: {
             upsert: jest.fn(async ({ where, create }: any) => {
                 let d = doctors.find(x => x.vismedId === where.vismedId);

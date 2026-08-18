@@ -42,7 +42,14 @@ function buildPrismaFake() {
         mapping: { upsert: jest.fn(async () => ({})) },
         vismedUnit: { upsert: jest.fn(async () => ({ id: id() })), findUnique: jest.fn(async () => null) },
         vismedInsurance: { upsert: jest.fn(async () => ({ id: id() })) },
-        integrationConnection: { findFirst: jest.fn(async () => null), findMany: jest.fn(async () => []) },
+        integrationConnection: {
+            // Retorna conexão válida para c1 (empresa 286) — necessário pelo resolver fail-closed.
+            findFirst: jest.fn(async ({ where }: any) =>
+                where?.clinicId === 'c1' && where?.provider === 'vismed'
+                    ? { status: 'active', clientId: '286', domain: 'https://app.vissmed.com.br/api-vissmed-7' }
+                    : null),
+            findMany: jest.fn(async () => []),
+        },
         vismedDoctor: {
             upsert: jest.fn(async ({ where, create }: any) => {
                 let d = doctors.find(x => x.vismedId === where.vismedId);

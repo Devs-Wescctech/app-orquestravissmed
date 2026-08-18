@@ -12,6 +12,7 @@ import { ClinicConcurrencyGuard } from '../bookings/clinic-concurrency-guard';
 import { getDoctoraliaMetricsService, concurrencyActorOf } from '../metrics/doctoralia-metrics.service';
 import { isDoctoraliaCircuitOpenError } from '../integrations/doctoralia-circuit-breaker';
 import { buildDoctoraliaDoctorUpsertData } from '../mappings/license.util';
+import { resolveVismedConnection } from './vismed-sync/vismed-connection.resolver';
 
 @Injectable()
 export class SyncService {
@@ -62,18 +63,40 @@ export class SyncService {
         });
 
         if (type === 'vismed-full') {
-            const empresaId = idEmpresaGestora || await this.getEmpresaGestoraForClinic(clinicId);
+            // RESOLUÇÃO FAIL-CLOSED: nunca cair no default global nem na empresa 286.
+            let resolvedEmpresa: number;
+            try {
+                const resolved = await resolveVismedConnection(this.prisma, clinicId);
+                resolvedEmpresa = resolved.idEmpresaGestora;
+
+                // Se o caller forneceu idEmpresaGestora explicitamente, deve coincidir
+                // com o clientId da conexão — divergência implica configuração incorreta.
+                if (idEmpresaGestora !== undefined && Number(idEmpresaGestora) !== resolvedEmpresa) {
+                    throw new Error(
+                        `idEmpresaGestora divergente: caller=${idEmpresaGestora}, conexão=${resolvedEmpresa} para clinicId=${clinicId}.`,
+                    );
+                }
+            } catch (resolveErr) {
+                const msg = resolveErr instanceof Error ? resolveErr.message : String(resolveErr);
+                this.logger.error(`[VISMED-ROUTING] ${msg}`);
+                await this.prisma.syncRun.update({
+                    where: { id: syncRun.id },
+                    data: { status: 'failed', endedAt: new Date(), metrics: { error: msg } },
+                });
+                return syncRun;
+            }
+
             try {
                 await this.vismedQueue.add('vismed-sync', {
                     syncRunId: syncRun.id,
                     clinicId,
-                    idEmpresaGestora: empresaId
+                    idEmpresaGestora: resolvedEmpresa,
                 }, { attempts: 1 });
-                this.logger.log(`Dispatched VISMED sync job for clinic ${clinicId}`);
+                this.logger.log(`Dispatched VISMED sync job for clinic ${clinicId} (idEmpresaGestora=${resolvedEmpresa})`);
             } catch (e) {
                 if (this.isRedisUnavailable(e)) {
                     this.logger.warn(`Redis unavailable, running VISMED sync directly for clinic ${clinicId}`);
-                    this.runVismedSyncDirect(syncRun.id, clinicId, empresaId).catch(err =>
+                    this.runVismedSyncDirect(syncRun.id, clinicId, resolvedEmpresa).catch(err =>
                         this.logger.error(`Direct VISMED sync failed: ${err.message}`)
                     );
                 } else {
@@ -221,23 +244,45 @@ export class SyncService {
         return { units, doctors, specialties, insurances };
     }
 
-    private async getEmpresaGestoraForClinic(clinicId: string): Promise<number> {
-        const conn = await this.prisma.integrationConnection.findFirst({
-            where: { clinicId, provider: 'vismed' }
-        });
-        return conn?.clientId ? Number(conn.clientId) : 286;
-    }
-
     private async runVismedSyncDirect(syncRunId: string, clinicId: string, idEmpresaGestora: number) {
         this.logger.log(`[DIRECT] Starting VisMed sync (Empresa: ${idEmpresaGestora}, Clinic: ${clinicId})`);
         try {
-            await this.logEvent(syncRunId, 'SYSTEM', 'sync_started', 'Iniciando extração de dados da Central VisMed (execução direta).');
-            let insertedOrUpdated = 0;
+            // RESOLUÇÃO FAIL-CLOSED idêntica ao processor — garante paridade nos dois caminhos.
+            // Nunca usa conn?.domain || undefined (que caía no default global api-vissmed-7).
+            let baseUrl: string;
+            let resolvedEmpresa: number;
+            try {
+                const resolved = await resolveVismedConnection(this.prisma, clinicId);
+                baseUrl = resolved.baseUrl;
+                resolvedEmpresa = resolved.idEmpresaGestora;
+            } catch (resolveErr) {
+                const msg = resolveErr instanceof Error ? resolveErr.message : String(resolveErr);
+                this.logger.error(`[VISMED-ROUTING][DIRECT] Falha ao resolver conexão VisMed — clinicId=${clinicId}: ${msg}`);
+                await this.prisma.syncRun.update({
+                    where: { id: syncRunId },
+                    data: { status: 'failed', endedAt: new Date(), metrics: { error: msg } },
+                });
+                await this.logEvent(syncRunId, 'SYSTEM', 'sync_error', msg);
+                return;
+            }
 
-            const conn = await this.prisma.integrationConnection.findFirst({
-                where: { clinicId, provider: 'vismed' }
-            });
-            const baseUrl = conn?.domain || undefined;
+            // Verificação de consistência: idEmpresaGestora passado por triggerManualSync deve bater.
+            if (Number(idEmpresaGestora) !== resolvedEmpresa) {
+                const msg = `[DIRECT] idEmpresaGestora divergente: recebido=${idEmpresaGestora}, conexão=${resolvedEmpresa} para clinicId=${clinicId}.`;
+                this.logger.error(`[VISMED-ROUTING] ${msg}`);
+                await this.prisma.syncRun.update({
+                    where: { id: syncRunId },
+                    data: { status: 'failed', endedAt: new Date(), metrics: { error: msg } },
+                });
+                await this.logEvent(syncRunId, 'SYSTEM', 'sync_error', msg);
+                return;
+            }
+
+            const host = (() => { try { return new URL(baseUrl).host; } catch (_) { return baseUrl; } })();
+            this.logger.log(`[VISMED-ROUTING][DIRECT] clinicId=${clinicId} idEmpresaGestora=${resolvedEmpresa} host=${host}`);
+
+            await this.logEvent(syncRunId, 'SYSTEM', 'sync_started', `Iniciando extração de dados da Central VisMed (execução direta). idEmpresaGestora=${resolvedEmpresa} host=${host}`);
+            let insertedOrUpdated = 0;
 
             this.logger.log('Sincronizando Unidades...');
             await this.logEvent(syncRunId, 'LOCATION', 'fetch_started', 'Buscando unidades geográficas...');
