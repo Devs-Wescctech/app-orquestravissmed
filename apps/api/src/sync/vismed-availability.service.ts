@@ -279,8 +279,19 @@ export class VismedAvailabilityService {
         const clinicDoctorIds = clinicDoctorMappings.map(m => m.vismedId).filter(Boolean) as string[];
         if (clinicDoctorIds.length === 0) return [];
 
+        // ESCOPADO: só categorias do catálogo da empresa gestora da clínica — nunca
+        // consultar scheduleDay com idcategoriaservico de outra empresa.
+        const conn = await this.prisma.integrationConnection.findFirst({
+            where: { clinicId, provider: 'vismed' },
+            select: { clientId: true },
+        });
+        const empresa = conn?.clientId ? parseInt(conn.clientId) : null;
+
         const links = await this.prisma.vismedProfessionalSpecialty.findMany({
-            where: { vismedDoctorId: { in: clinicDoctorIds } },
+            where: {
+                vismedDoctorId: { in: clinicDoctorIds },
+                ...(empresa != null ? { specialty: { idEmpresaGestora: empresa } } : {}),
+            },
             include: { specialty: { select: { vismedId: true } } },
         });
         return [...new Set(links.map(l => l.specialty?.vismedId).filter((v): v is number => Number.isInteger(v as any)))];

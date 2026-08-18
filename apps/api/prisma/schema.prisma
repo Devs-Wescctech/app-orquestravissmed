@@ -157,15 +157,19 @@ model VismedDoctor {
 }
 
 model VismedSpecialty {
-  id             String         @id @default(uuid())
-  vismedId       Int            @unique // idcategoriaservico
-  name           String         // nomecategoriaservico
-  createdAt      DateTime       @default(now())
-  updatedAt      DateTime       @updatedAt
+  id               String       @id @default(uuid())
+  vismedId         Int          // idcategoriaservico (único DENTRO da empresa gestora)
+  idEmpresaGestora Int?         // escopo do catálogo (IntegrationConnection.clientId); NULL = legado/ambíguo aguardando claim pelo sync
+  name             String       // nomecategoriaservico
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
 
   normalizedName String?
   doctors VismedProfessionalSpecialty[]
   mappings SpecialtyServiceMapping[]
+
+  @@unique([idEmpresaGestora, vismedId])
+  @@index([normalizedName])
 }
 
 model VismedInsurance {

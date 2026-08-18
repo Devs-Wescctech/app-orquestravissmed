@@ -448,7 +448,13 @@ export class BlockWatcherService implements OnModuleInit {
         clinicId: string,
         affectedValid: Map<number, Array<{ date: string; period: BlockPeriod; blockId?: any }>>,
     ): Promise<void> {
-        // 1) Resolve as categorias (idcategoriaservico) de cada médico afetado.
+        // 1) Resolve as categorias (idcategoriaservico) de cada médico afetado,
+        //    ESCOPADAS à empresa gestora da clínica.
+        const clinicConn = await this.prisma.integrationConnection.findFirst({
+            where: { clinicId, provider: 'vismed' },
+            select: { clientId: true },
+        });
+        const clinicEmpresa = clinicConn?.clientId ? parseInt(clinicConn.clientId) : null;
         const categoriesByProf = new Map<number, number[]>();
         for (const idprofissional of affectedValid.keys()) {
             try {
@@ -457,7 +463,7 @@ export class BlockWatcherService implements OnModuleInit {
                     select: {
                         id: true,
                         specialties: {
-                            select: { specialty: { select: { vismedId: true } } },
+                            select: { specialty: { select: { vismedId: true, idEmpresaGestora: true } } },
                         },
                     },
                 });
@@ -465,6 +471,7 @@ export class BlockWatcherService implements OnModuleInit {
                 const categoryIds: number[] = [
                     ...new Set(
                         (doctor.specialties || [])
+                            .filter((ps: any) => clinicEmpresa == null || ps?.specialty?.idEmpresaGestora === clinicEmpresa)
                             .map((ps: any) => ps?.specialty?.vismedId)
                             .filter((v: any): v is number => Number.isInteger(v)),
                     ),

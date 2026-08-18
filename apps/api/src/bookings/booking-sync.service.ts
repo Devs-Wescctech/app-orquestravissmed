@@ -3076,13 +3076,16 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             throw new Error(`VisMed doctor ${vismedDoctorId} not found`);
         }
 
+        // ESCOPADO: só especialidades do catálogo da empresa gestora da clínica do booking.
+        // Categoria de outra empresa (ou legada sem escopo) nunca pode virar idcategoriaservico.
         const doctorSpecialties = (vismedDoctor.specialties || [])
             .map((s: any) => s.specialty)
-            .filter((s: any) => s && s.vismedId)
+            .filter((s: any) => s && s.vismedId && s.idEmpresaGestora === idEmpresaGestora)
             .sort((a: any, b: any) => a.vismedId - b.vismedId);
 
         let idCategoriaServico = 0;
         let categoriaSource = '';
+        let chosenSpecialty: any = null;
 
         // 1) Preferir a especialidade do médico mapeada ao serviço Doctoralia agendado.
         const addressServiceId = booking.address_service?.id ? String(booking.address_service.id) : null;
@@ -3105,6 +3108,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 if (specMapping?.vismedSpecialty?.vismedId) {
                     idCategoriaServico = specMapping.vismedSpecialty.vismedId;
                     categoriaSource = `serviço agendado (${specMapping.vismedSpecialty.name})`;
+                    chosenSpecialty = specMapping.vismedSpecialty;
                 }
             }
         }
@@ -3113,13 +3117,24 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         if (!idCategoriaServico && doctorSpecialties.length > 0) {
             idCategoriaServico = doctorSpecialties[0].vismedId;
             categoriaSource = `especialidade do médico (${doctorSpecialties[0].name})`;
+            chosenSpecialty = doctorSpecialties[0];
         }
 
         // 3) Sem especialidade do médico: falhar com erro claro (não usar especialidade
         //    aleatória do banco — pode ser de outra unidade e gerar agendamento inválido).
         if (!idCategoriaServico) {
             throw new Error(
-                `Médico "${vismedDoctor.name}" não possui especialidade (categoria de serviço) cadastrada na VisMed — impossível determinar idcategoriaservico. Cadastre a especialidade do profissional na VisMed e rode o sync.`,
+                `Médico "${vismedDoctor.name}" não possui especialidade (categoria de serviço) cadastrada na VisMed para a empresa gestora ${idEmpresaGestora} — impossível determinar idcategoriaservico. Cadastre a especialidade do profissional na VisMed e rode o sync.`,
+            );
+        }
+
+        // GUARDA DE CONSISTÊNCIA (fail-closed): a categoria escolhida DEVE pertencer ao
+        // catálogo da mesma empresa gestora enviada em idempresagestora. Divergência = não
+        // fazer o POST — melhor booking FAILED com erro claro do que agendamento na VisMed
+        // com categoria da empresa errada (causa do caso 228750781, categoria 192 vs 3484).
+        if (!chosenSpecialty || chosenSpecialty.idEmpresaGestora !== idEmpresaGestora) {
+            throw new Error(
+                `Guarda de consistência: categoria ${idCategoriaServico} (${chosenSpecialty?.name || '?'}) pertence à empresa gestora ${chosenSpecialty?.idEmpresaGestora ?? 'desconhecida'}, mas o agendamento seria enviado com idempresagestora=${idEmpresaGestora}. POST bloqueado — rode o sync da clínica para atualizar o catálogo de categorias.`,
             );
         }
 
@@ -3425,13 +3440,22 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 });
 
                 if (vismedDoctor) {
+                    // ESCOPADO: só categorias da empresa gestora da conexão desta clínica.
                     let idCategoriaServico = 0;
-                    if (vismedDoctor.specialties && vismedDoctor.specialties.length > 0) {
-                        idCategoriaServico = vismedDoctor.specialties[0].specialty.vismedId || 0;
+                    const scopedSpecs = (vismedDoctor.specialties || [])
+                        .map((s: any) => s.specialty)
+                        .filter((s: any) => s && s.vismedId && s.idEmpresaGestora === idEmpresaGestora)
+                        .sort((a: any, b: any) => a.vismedId - b.vismedId);
+                    if (scopedSpecs.length > 0) {
+                        idCategoriaServico = scopedSpecs[0].vismedId;
                     }
                     if (!idCategoriaServico) {
-                        const anySpec = await this.prisma.vismedSpecialty.findFirst();
-                        if (anySpec) idCategoriaServico = anySpec.vismedId;
+                        // FAIL-CLOSED: sem categoria do médico no catálogo da empresa gestora,
+                        // NÃO criamos o espelho na VisMed com categoria arbitrária. O booking
+                        // Doctoralia permanece; o erro fica registrado pelo catch abaixo.
+                        throw new Error(
+                            `Guarda de consistência: médico ${vismedDoctor.name} não possui especialidade no catálogo da empresa gestora ${idEmpresaGestora} — espelho VisMed não criado (nenhuma categoria arbitrária é usada). Verifique os vínculos em /mapping.`,
+                        );
                     }
 
                     const startDate = new Date(startFormatted);

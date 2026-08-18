@@ -30,7 +30,7 @@ function makeDeps(blocks: any[]) {
             findFirst: jest.fn(async ({ where }: any) => ({
                 id: `vd-${where.vismedId}`,
                 // Ambos os médicos compartilham a MESMA categoria 100
-                specialties: [{ specialty: { vismedId: 100 } }],
+                specialties: [{ specialty: { vismedId: 100, idEmpresaGestora: 286 } }],
             })),
         },
         auditLog: { create: jest.fn(async ({ data }: any) => data) },

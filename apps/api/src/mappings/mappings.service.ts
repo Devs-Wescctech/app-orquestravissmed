@@ -507,7 +507,8 @@ export class MappingsService {
         const seen = new Map<string, any>();
         for (const row of rows) {
             const specKey = row.vismedSpecialty?.normalizedName || row.vismedSpecialty?.name || row.vismedSpecialtyId;
-            const key = `${specKey}::${row.doctoraliaServiceId}`;
+            // Homônimas de empresas gestoras DIFERENTES são categorias distintas — não dedup entre empresas.
+            const key = `${row.vismedSpecialty?.idEmpresaGestora ?? 'null'}::${specKey}::${row.doctoraliaServiceId}`;
             const existing = seen.get(key);
             if (!existing) {
                 seen.set(key, row);

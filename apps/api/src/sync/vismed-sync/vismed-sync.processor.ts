@@ -102,24 +102,43 @@ export class VismedSyncProcessor extends WorkerHost {
             // para detectar/migrar registros cujo código mudou na VisMed (ex.: 180 → 3472).
             const returnedVismedIds = new Set<number>();
             const currentSpecTargetByNorm = new Map<string, { id: string; vismedId: number }>(); // normalizedName -> registro atual de menor vismedId
+            const empresaScope = Number(idEmpresaGestora);
 
             for (const e of especialidades) {
                 if (!e.idcategoriaservico || !e.nomecategoriaservico) continue;
 
                 const normName = e.nomecategoriaservico.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+                const vid = Number(e.idcategoriaservico);
 
-                const spec = await this.prisma.vismedSpecialty.upsert({
-                    where: { vismedId: Number(e.idcategoriaservico) },
-                    create: {
-                        vismedId: Number(e.idcategoriaservico),
-                        name: e.nomecategoriaservico,
-                        normalizedName: normName
-                    },
-                    update: {
-                        name: e.nomecategoriaservico,
-                        normalizedName: normName
-                    }
+                // Upsert ESCOPADO por empresa gestora. Registros legados sem escopo
+                // (idEmpresaGestora NULL) são "reivindicados" pelo vismedId — os catálogos
+                // das empresas são disjuntos na VisMed, então o claim é seguro e preserva
+                // vínculos de médicos e mapeamentos existentes.
+                let spec = await this.prisma.vismedSpecialty.findFirst({
+                    where: { idEmpresaGestora: empresaScope, vismedId: vid },
                 });
+                if (spec) {
+                    spec = await this.prisma.vismedSpecialty.update({
+                        where: { id: spec.id },
+                        data: { name: e.nomecategoriaservico, normalizedName: normName },
+                    });
+                } else {
+                    const unscoped = await this.prisma.vismedSpecialty.findFirst({
+                        where: { idEmpresaGestora: null, vismedId: vid },
+                    });
+                    if (unscoped) {
+                        spec = await this.prisma.vismedSpecialty.update({
+                            where: { id: unscoped.id },
+                            data: { idEmpresaGestora: empresaScope, name: e.nomecategoriaservico, normalizedName: normName },
+                        });
+                        await this.logEvent(currentSyncRunId, 'SPECIALTY', 'specialty_claimed',
+                            `Especialidade "${e.nomecategoriaservico}" (idcategoriaservico=${vid}) reivindicada pela empresa gestora ${empresaScope} (registro legado sem escopo).`);
+                    } else {
+                        spec = await this.prisma.vismedSpecialty.create({
+                            data: { idEmpresaGestora: empresaScope, vismedId: vid, name: e.nomecategoriaservico, normalizedName: normName },
+                        });
+                    }
+                }
 
                 returnedVismedIds.add(Number(e.idcategoriaservico));
                 // Determinístico: entre homônimas, o alvo de migração é sempre a de MENOR vismedId,
@@ -141,7 +160,7 @@ export class VismedSyncProcessor extends WorkerHost {
             if (returnedVismedIds.size > 0) {
                 const currentSpecIdsByNorm = new Map<string, string>();
                 for (const [norm, t] of currentSpecTargetByNorm) currentSpecIdsByNorm.set(norm, t.id);
-                await this.migrateObsoleteSpecialties(currentSyncRunId, returnedVismedIds, currentSpecIdsByNorm);
+                await this.migrateObsoleteSpecialties(currentSyncRunId, empresaScope, returnedVismedIds, currentSpecIdsByNorm);
             } else {
                 this.logger.warn('API de especialidades retornou vazia — pulando detecção de códigos obsoletos (fail-safe).');
             }
@@ -232,17 +251,20 @@ export class VismedSyncProcessor extends WorkerHost {
                         // Buscar TODAS as categorias homônimas (determinístico: ordenado por vismedId).
                         // A VisMed pode ter duas categorias com o mesmo nome (ex.: Oftalmologia 180 e 3472)
                         // e o médico deve ficar vinculado a TODAS, não a uma escolhida ao acaso.
+                        // ESCOPADO: só homônimas do catálogo DESTA empresa gestora — nunca
+                        // vincular médico a categoria de outra empresa.
                         let matchedSpecs = await this.prisma.vismedSpecialty.findMany({
-                            where: { normalizedName: normSpecName },
+                            where: { normalizedName: normSpecName, idEmpresaGestora: empresaScope },
                             orderBy: { vismedId: 'asc' },
                         });
 
-                        // Categoria "fantasma" SOMENTE quando nenhuma homônima existe.
+                        // Categoria "fantasma" SOMENTE quando nenhuma homônima existe no escopo.
                         if (matchedSpecs.length === 0) {
                             const randomId = Math.floor(Math.random() * 10000000) + 1000000;
                             const ghost = await this.prisma.vismedSpecialty.create({
                                 data: {
                                     vismedId: randomId,
+                                    idEmpresaGestora: empresaScope,
                                     name: specName,
                                     normalizedName: normSpecName
                                 }
@@ -273,11 +295,14 @@ export class VismedSyncProcessor extends WorkerHost {
                     // Limpeza de vínculos obsoletos: remove vínculos criados pela SYNC cujas
                     // categorias não constam mais nas especialidades atuais do profissional.
                     // Vínculos MANUAL são preservados. Só roda quando a string veio preenchida.
+                    // ESCOPADO: só remove vínculos a categorias DESTA empresa (ou legadas sem
+                    // escopo) — nunca apaga vínculo apontando ao catálogo de outra empresa.
                     const staleLinks = await this.prisma.vismedProfessionalSpecialty.findMany({
                         where: {
                             vismedDoctorId: doctor.id,
                             source: 'SYNC',
                             vismedSpecialtyId: { notIn: Array.from(expectedSpecIds) },
+                            specialty: { OR: [{ idEmpresaGestora: empresaScope }, { idEmpresaGestora: null }] },
                         },
                         include: { specialty: true },
                     });
@@ -385,11 +410,15 @@ export class VismedSyncProcessor extends WorkerHost {
      */
     private async migrateObsoleteSpecialties(
         syncRunId: string,
+        idEmpresaGestora: number,
         returnedVismedIds: Set<number>,
         currentSpecIdsByNorm: Map<string, string>,
     ): Promise<void> {
+        // ESCOPADO: só registros DESTA empresa gestora podem ser considerados obsoletos.
+        // Registros de outra empresa ou ainda sem escopo (NULL) NUNCA são tocados aqui —
+        // é exatamente isso que elimina o ping-pongue 192↔3484 entre as clínicas.
         const staleSpecs = await this.prisma.vismedSpecialty.findMany({
-            where: { vismedId: { notIn: Array.from(returnedVismedIds) } },
+            where: { idEmpresaGestora, vismedId: { notIn: Array.from(returnedVismedIds) } },
             include: {
                 doctors: true,
                 mappings: true,

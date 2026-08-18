@@ -70,6 +70,14 @@ export class PushSyncService {
 
         this.logger.log(`Found ${mappings.length} actively mapped doctors for push sync.`);
 
+        // Empresa gestora da clínica: escopo do catálogo de categorias VisMed. Especialidades
+        // de outra empresa (vínculos cruzados remanescentes) NUNCA entram no push desta clínica.
+        const vismedConn = await this.prisma.integrationConnection.findFirst({
+            where: { clinicId, provider: 'vismed' },
+            select: { clientId: true },
+        });
+        const clinicEmpresa = vismedConn?.clientId ? parseInt(vismedConn.clientId) : null;
+
         // Cache do catálogo de serviços POR UNIDADE (facility). É a fonte de verdade dos
         // service_id que a unidade aceita — só empurramos IDs presentes aqui. Evita mandar
         // IDs do dicionário global que a unidade não conhece (404 "ItemService object not found").
@@ -91,6 +99,9 @@ export class PushSyncService {
         for (const mapping of mappings) {
             const vDoc = mapping.vismedDoctor;
             const dDoc = mapping.doctoraliaDoctor;
+            const scopedSpecialties = (vDoc.specialties || []).filter(
+                (vs: any) => clinicEmpresa == null || vs?.specialty?.idEmpresaGestora === clinicEmpresa,
+            );
 
             if (!vDoc.unit) {
                 this.logger.warn(`VisMed Doctor ${vDoc.name} has no Unit. Skipping push...`);
@@ -175,7 +186,7 @@ export class PushSyncService {
                 }
 
                 // 3. SERVICES DELTA
-                await this.syncServicesDelta(syncRunId, client, dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, vDoc.specialties, dDoc.name, facilityCatalogIds, cycleCtx);
+                await this.syncServicesDelta(syncRunId, client, dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, scopedSpecialties, dDoc.name, facilityCatalogIds, cycleCtx, clinicEmpresa);
 
                 // 4. INSURANCE PROVIDERS SYNC
                 await this.syncInsuranceProviders(syncRunId, client, clinicId, dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, dDoc.name);
@@ -227,7 +238,13 @@ export class PushSyncService {
         doctorName: string,
         facilityCatalogIds: Set<string> | null,
         cycleCtx?: SyncCycleContext,
+        clinicEmpresa?: number | null,
     ) {
+        // ESCOPADO (defesa em profundidade): só especialidades do catálogo da empresa
+        // gestora da clínica entram no delta de serviços — nunca push de mapping de outra empresa.
+        vismedSpecialties = (vismedSpecialties || []).filter(
+            (vs: any) => clinicEmpresa == null || vs?.specialty?.idEmpresaGestora === clinicEmpresa,
+        );
         // Fetch current address services from Doctoralia (reusa do contexto se disponível).
         let currentServices = [];
         try {

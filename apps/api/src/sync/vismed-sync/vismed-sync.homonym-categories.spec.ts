@@ -54,18 +54,29 @@ function buildPrismaFake() {
             }),
         },
         vismedSpecialty: {
-            upsert: jest.fn(async ({ where, create, update }: any) => {
-                let s = specialties.find(x => x.vismedId === where.vismedId);
-                if (s) Object.assign(s, update);
-                else { s = { id: id(), ...create }; specialties.push(s); }
+            // Filtro de empresa gestora: `null` casa registros sem escopo; número casa igual.
+            findFirst: jest.fn(async ({ where }: any) => {
+                return specialties.find(s =>
+                    (where.vismedId === undefined || s.vismedId === where.vismedId)
+                    && (where.idEmpresaGestora === undefined
+                        || (where.idEmpresaGestora === null ? s.idEmpresaGestora == null : s.idEmpresaGestora === where.idEmpresaGestora))
+                ) || null;
+            }),
+            update: jest.fn(async ({ where, data }: any) => {
+                const s = specialties.find(x => x.id === where.id);
+                Object.assign(s, data);
                 return s;
             }),
             findMany: jest.fn(async ({ where, orderBy }: any) => {
-                let res = specialties.filter(s => s.normalizedName === where?.normalizedName);
-                if (where?.vismedId?.notIn) res = specialties.filter(s => !where.vismedId.notIn.includes(s.vismedId));
+                let res = specialties;
+                if (where?.normalizedName !== undefined) res = res.filter(s => s.normalizedName === where.normalizedName);
+                if (where?.vismedId?.notIn) res = res.filter(s => !where.vismedId.notIn.includes(s.vismedId));
+                if (where?.idEmpresaGestora !== undefined) {
+                    res = res.filter(s => where.idEmpresaGestora === null ? s.idEmpresaGestora == null : s.idEmpresaGestora === where.idEmpresaGestora);
+                }
                 if (orderBy?.vismedId === 'asc') res = [...res].sort((a, b) => a.vismedId - b.vismedId);
                 // include doctors/mappings p/ migrateObsoleteSpecialties
-                return res.map(s => ({ ...s, doctors: [], mappings: [] }));
+                return res.map(s => ({ ...s, doctors: links.filter(l => l.vismedSpecialtyId === s.id), mappings: [] }));
             }),
             create: jest.fn(async ({ data }: any) => {
                 const s = { id: id(), ...data };
@@ -73,7 +84,11 @@ function buildPrismaFake() {
                 return s;
             }),
             findUnique: jest.fn(async ({ where }: any) => specialties.find(s => s.id === where.id) || null),
-            delete: jest.fn(async () => ({})),
+            delete: jest.fn(async ({ where }: any) => {
+                const i = specialties.findIndex(s => s.id === where.id);
+                if (i >= 0) specialties.splice(i, 1);
+                return {};
+            }),
         },
         vismedProfessionalSpecialty: {
             upsert: jest.fn(async ({ where, create }: any) => {
@@ -87,6 +102,13 @@ function buildPrismaFake() {
                     .filter(l => l.vismedDoctorId === where.vismedDoctorId
                         && l.source === where.source
                         && !where.vismedSpecialtyId.notIn.includes(l.vismedSpecialtyId))
+                    .filter(l => {
+                        // Filtro de escopo do stale-link cleanup: empresa da execução OU sem escopo.
+                        if (!where.specialty?.OR) return true;
+                        const spec = specialties.find(s => s.id === l.vismedSpecialtyId);
+                        return where.specialty.OR.some((cond: any) =>
+                            cond.idEmpresaGestora === null ? spec?.idEmpresaGestora == null : spec?.idEmpresaGestora === cond.idEmpresaGestora);
+                    })
                     .map(l => ({ ...l, specialty: specialties.find(s => s.id === l.vismedSpecialtyId) }));
             }),
             delete: jest.fn(async ({ where }: any) => {

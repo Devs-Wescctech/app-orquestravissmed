@@ -279,14 +279,38 @@ export class SyncService {
             const especialidades = await this.vismedClient.getEspecialidades(idEmpresaGestora, baseUrl);
             await this.logEvent(syncRunId, 'SPECIALTY', 'fetch_success', `Encontradas ${especialidades.length} especialidades.`);
 
+            const empresaScope = Number(idEmpresaGestora);
             for (const e of especialidades) {
                 if (!e.idcategoriaservico || !e.nomecategoriaservico) continue;
                 const normName = e.nomecategoriaservico.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
-                const spec = await this.prisma.vismedSpecialty.upsert({
-                    where: { vismedId: Number(e.idcategoriaservico) },
-                    create: { vismedId: Number(e.idcategoriaservico), name: e.nomecategoriaservico, normalizedName: normName },
-                    update: { name: e.nomecategoriaservico, normalizedName: normName }
+                const vid = Number(e.idcategoriaservico);
+                // Upsert ESCOPADO por empresa gestora; registros legados sem escopo são
+                // reivindicados pelo vismedId (catálogos disjuntos entre empresas na VisMed).
+                let spec = await this.prisma.vismedSpecialty.findFirst({
+                    where: { idEmpresaGestora: empresaScope, vismedId: vid },
                 });
+                if (spec) {
+                    spec = await this.prisma.vismedSpecialty.update({
+                        where: { id: spec.id },
+                        data: { name: e.nomecategoriaservico, normalizedName: normName },
+                    });
+                } else {
+                    const unscoped = await this.prisma.vismedSpecialty.findFirst({
+                        where: { idEmpresaGestora: null, vismedId: vid },
+                    });
+                    if (unscoped) {
+                        spec = await this.prisma.vismedSpecialty.update({
+                            where: { id: unscoped.id },
+                            data: { idEmpresaGestora: empresaScope, name: e.nomecategoriaservico, normalizedName: normName },
+                        });
+                        await this.logEvent(syncRunId, 'SPECIALTY', 'specialty_claimed',
+                            `Especialidade "${e.nomecategoriaservico}" (idcategoriaservico=${vid}) reivindicada pela empresa gestora ${empresaScope} (registro legado sem escopo).`);
+                    } else {
+                        spec = await this.prisma.vismedSpecialty.create({
+                            data: { idEmpresaGestora: empresaScope, vismedId: vid, name: e.nomecategoriaservico, normalizedName: normName },
+                        });
+                    }
+                }
                 await this.matchingEngine.runMatchingForSpecialty(spec.id);
                 insertedOrUpdated++;
             }
@@ -344,15 +368,16 @@ export class SyncService {
                     const expectedSpecIds = new Set<string>();
                     for (const specName of docSpecs) {
                         const normSpecName = specName.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
-                        // TODAS as homônimas, ordenadas (determinístico) — não findFirst ao acaso.
+                        // TODAS as homônimas DO ESCOPO desta empresa gestora, ordenadas
+                        // (determinístico) — nunca vincular a categoria de outra empresa.
                         let matchedSpecs = await this.prisma.vismedSpecialty.findMany({
-                            where: { normalizedName: normSpecName },
+                            where: { normalizedName: normSpecName, idEmpresaGestora: empresaScope },
                             orderBy: { vismedId: 'asc' },
                         });
                         if (matchedSpecs.length === 0) {
                             const randomId = Math.floor(Math.random() * 10000000) + 1000000;
                             const ghost = await this.prisma.vismedSpecialty.create({
-                                data: { vismedId: randomId, name: specName, normalizedName: normSpecName }
+                                data: { vismedId: randomId, idEmpresaGestora: empresaScope, name: specName, normalizedName: normSpecName }
                             });
                             await this.matchingEngine.runMatchingForSpecialty(ghost.id);
                             matchedSpecs = [ghost];
@@ -372,11 +397,14 @@ export class SyncService {
                     }
                     // Remove vínculos SYNC obsoletos (categoria não consta mais nas especialidades);
                     // vínculos MANUAL são preservados.
+                    // ESCOPADO: só remove vínculos a categorias DESTA empresa (ou legadas sem
+                    // escopo) — nunca apaga vínculo apontando ao catálogo de outra empresa.
                     const staleLinks = await this.prisma.vismedProfessionalSpecialty.findMany({
                         where: {
                             vismedDoctorId: doctor.id,
                             source: 'SYNC',
                             vismedSpecialtyId: { notIn: Array.from(expectedSpecIds) },
+                            specialty: { OR: [{ idEmpresaGestora: empresaScope }, { idEmpresaGestora: null }] },
                         },
                         include: { specialty: true },
                     });

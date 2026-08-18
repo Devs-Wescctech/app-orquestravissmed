@@ -273,7 +273,23 @@ export class SlotSyncService {
         const dates = this.generateDateRange(startDate, daysAhead);
 
         // ── Disponibilidade real (scheduleDay) ────────────────────────────────────────────
-        // Categorias (idcategoriaservico) deste médico = vismedId de cada especialidade dele.
+        // Categorias (idcategoriaservico) deste médico = vismedId de cada especialidade dele,
+        // ESCOPADAS à empresa gestora da clínica (nunca consultar categoria de outra empresa).
+        let clinicEmpresa: number | null = null;
+        if (clinicId) {
+            const clinicConn = await this.prisma.integrationConnection.findFirst({
+                where: { clinicId, provider: 'vismed' },
+                select: { clientId: true },
+            });
+            clinicEmpresa = clinicConn?.clientId ? parseInt(clinicConn.clientId) : null;
+        }
+        // Filtra AQUI as especialidades do médico ao catálogo da empresa da clínica —
+        // todo o restante do fluxo (categorias, auto-provisioning de serviços) usa a
+        // lista já escopada e nunca propaga mapping/serviço de outra empresa.
+        if (clinicEmpresa != null) {
+            doctor.specialties = (doctor.specialties || [])
+                .filter((ps: any) => ps?.specialty?.idEmpresaGestora === clinicEmpresa);
+        }
         const doctorCategoryIds = [...new Set(
             (doctor.specialties || [])
                 .map((ps: any) => ps?.specialty?.vismedId)
@@ -345,7 +361,7 @@ export class SlotSyncService {
 
             if (addressServices.length === 0) {
                 this.logger.log(`Doctor ${doctor.name} address ${addrId}: no services found, attempting auto-provision from specialty mappings...`);
-                const provisioned = await this.provisionAddressServices(doctor, client, dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, syncRunId);
+                const provisioned = await this.provisionAddressServices(doctor, client, dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, syncRunId, clinicEmpresa);
                 if (provisioned.length > 0) {
                     addressServices = provisioned;
                     this.logger.log(`Doctor ${doctor.name} address ${addrId}: provisioned ${provisioned.length} service(s) from specialty mappings`);
@@ -688,10 +704,15 @@ export class SlotSyncService {
         doctorId: string,
         addressId: string,
         syncRunId?: string,
+        clinicEmpresa?: number | null,
     ): Promise<any[]> {
         const provisionedServices: any[] = [];
 
-        const doctorSpecialties = doctor.specialties || [];
+        // ESCOPADO (defesa em profundidade): só especialidades do catálogo da empresa
+        // gestora da clínica podem provisionar serviços — nunca mapping de outra empresa.
+        const doctorSpecialties = (doctor.specialties || []).filter(
+            (ps: any) => clinicEmpresa == null || ps?.specialty?.idEmpresaGestora === clinicEmpresa,
+        );
         const serviceIdsToAdd: { doctoraliaServiceId: string; name: string; mappingId: string }[] = [];
 
         for (const ps of doctorSpecialties) {
