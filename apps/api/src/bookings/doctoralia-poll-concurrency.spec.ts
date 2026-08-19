@@ -15,7 +15,7 @@ import { DoctoraliaMetricsService } from '../metrics/doctoralia-metrics.service'
 
 interface PollResult {
     ran: boolean;
-    skipReason?: 'POLL_SKIPPED_SWEEP_ACTIVE' | 'POLL_SKIPPED_POLL_ACTIVE';
+    skipReason?: 'POLL_SKIPPED_POLL_ACTIVE';
 }
 
 /**
@@ -29,11 +29,8 @@ async function runDoctoraliaPoll(
     clinicId: string,
     externalCall: () => Promise<void> = async () => {},
 ): Promise<PollResult> {
-    if (guard.isActive(clinicId, 'SAFETY_SWEEP')) {
-        metrics.recordConcurrencySkip('POLL_SKIPPED_SWEEP_ACTIVE', clinicId);
-        return { ran: false, skipReason: 'POLL_SKIPPED_SWEEP_ACTIVE' };
-    }
-    if (!guard.tryAcquire(clinicId, 'POLLING')) {
+    if (!guard.tryAcquire(clinicId, 'NOTIFICATION_POLL')) {
+        metrics.recordNotificationPollSingleFlight(clinicId);
         metrics.recordConcurrencySkip('POLL_SKIPPED_POLL_ACTIVE', clinicId);
         return { ran: false, skipReason: 'POLL_SKIPPED_POLL_ACTIVE' };
     }
@@ -48,7 +45,7 @@ async function runDoctoraliaPoll(
         return { ran: true };
     } finally {
         metrics.trackPollEnd(clinicId, pollExecutionId);
-        guard.release(clinicId, 'POLLING');
+        guard.release(clinicId, 'NOTIFICATION_POLL');
     }
 }
 
@@ -127,23 +124,22 @@ describe('Task 119 — pollClinic Doctoralia × ClinicConcurrencyGuard', () => {
         expect((await pollA).ran).toBe(true);
     });
 
-    // Cenário 5: sweep ativo bloqueia o polling Doctoralia da mesma clínica
-    it('cenário 5 — poll é SKIP quando Safety Sweep da mesma clínica está ativo', async () => {
+    // Cenário 5: sweep ativo NÃO bloqueia o polling de notifications
+    it('cenário 5 — poll de notifications executa com Safety Sweep da mesma clínica ativo', async () => {
         guard.tryAcquire('clinic-A', 'SAFETY_SWEEP');
 
         const body = jest.fn(async () => {});
         const res = await runDoctoraliaPoll(guard, metrics, 'clinic-A', body);
 
-        expect(res.ran).toBe(false);
-        expect(res.skipReason).toBe('POLL_SKIPPED_SWEEP_ACTIVE');
-        expect(body).not.toHaveBeenCalled();
-        expect(metrics.getConcurrencySkipCounts().POLL_SKIPPED_SWEEP_ACTIVE).toBe(1);
+        expect(res.ran).toBe(true);
+        expect(body).toHaveBeenCalledTimes(1);
+        expect(metrics.getConcurrencySkipCounts().POLL_SKIPPED_SWEEP_ACTIVE).toBe(0);
 
         guard.release('clinic-A', 'SAFETY_SWEEP');
     });
 
-    // Cenário 6: polling Doctoralia ativo bloqueia o sweep (bidirecional)
-    it('cenário 6 — sweep é SKIP quando poll Doctoralia da mesma clínica está ativo', async () => {
+    // Cenário 6: polling de notifications NÃO bloqueia o sweep
+    it('cenário 6 — sweep executa com poll de notifications da mesma clínica ativo', async () => {
         let resolve!: () => void;
         const block = new Promise<void>(r => (resolve = r));
         const poll = runDoctoraliaPoll(guard, metrics, 'clinic-A', () => block);
@@ -151,9 +147,9 @@ describe('Task 119 — pollClinic Doctoralia × ClinicConcurrencyGuard', () => {
         const sweepBody = jest.fn(async () => {});
         const sweepRan = await runSweep(guard, metrics, 'clinic-A', sweepBody);
 
-        expect(sweepRan).toBe(false);
-        expect(sweepBody).not.toHaveBeenCalled();
-        expect(metrics.getConcurrencySkipCounts().SWEEP_SKIPPED_POLL_ACTIVE).toBe(1);
+        expect(sweepRan).toBe(true);
+        expect(sweepBody).toHaveBeenCalledTimes(1);
+        expect(metrics.getConcurrencySkipCounts().SWEEP_SKIPPED_POLL_ACTIVE).toBe(0);
 
         resolve();
         expect((await poll).ran).toBe(true);
@@ -211,8 +207,8 @@ describe('Task 119 — pollClinic Doctoralia × ClinicConcurrencyGuard', () => {
         await p1;
     });
 
-    // Cenário 12: contadores de skip incrementam com motivos distintos
-    it('cenário 12 — contadores distintos para skip por poll ativo e por sweep ativo', async () => {
+    // Cenário 12: somente o single-flight próprio gera skip
+    it('cenário 12 — apenas outro poll de notifications gera skip', async () => {
         // Skip por poll ativo
         let resolve!: () => void;
         const block = new Promise<void>(r => (resolve = r));
@@ -221,14 +217,14 @@ describe('Task 119 — pollClinic Doctoralia × ClinicConcurrencyGuard', () => {
         resolve();
         await p1;
 
-        // Skip por sweep ativo
+        // Sweep ativo não bloqueia notifications
         guard.tryAcquire('clinic-A', 'SAFETY_SWEEP');
-        await runDoctoraliaPoll(guard, metrics, 'clinic-A');
+        expect((await runDoctoraliaPoll(guard, metrics, 'clinic-A')).ran).toBe(true);
         guard.release('clinic-A', 'SAFETY_SWEEP');
 
         const counts = metrics.getConcurrencySkipCounts();
         expect(counts.POLL_SKIPPED_POLL_ACTIVE).toBe(1);
-        expect(counts.POLL_SKIPPED_SWEEP_ACTIVE).toBe(1);
+        expect(counts.POLL_SKIPPED_SWEEP_ACTIVE).toBe(0);
     });
 });
 
@@ -243,16 +239,7 @@ describe('Task 133 — poll × reserva de prioridade (GLOBAL_SYNC_PENDING)', () 
         clinicId: string,
         externalCall: () => Promise<void> = async () => {},
     ): Promise<{ ran: boolean; skipReason?: string }> {
-        if (guard.isActive(clinicId, 'SAFETY_SWEEP')) {
-            metrics.recordConcurrencySkip('POLL_SKIPPED_SWEEP_ACTIVE', clinicId);
-            return { ran: false, skipReason: 'POLL_SKIPPED_SWEEP_ACTIVE' };
-        }
-        if (!guard.tryAcquire(clinicId, 'POLLING')) {
-            const blockReason = guard.getBlockReason(clinicId);
-            if (blockReason === 'GLOBAL_SYNC_PENDING') {
-                metrics.recordConcurrencySkip('POLL_SKIPPED_GLOBAL_SYNC_PENDING', clinicId);
-                return { ran: false, skipReason: 'POLL_SKIPPED_GLOBAL_SYNC_PENDING' };
-            }
+        if (!guard.tryAcquire(clinicId, 'NOTIFICATION_POLL')) {
             metrics.recordConcurrencySkip('POLL_SKIPPED_POLL_ACTIVE', clinicId);
             return { ran: false, skipReason: 'POLL_SKIPPED_POLL_ACTIVE' };
         }
@@ -260,11 +247,11 @@ describe('Task 133 — poll × reserva de prioridade (GLOBAL_SYNC_PENDING)', () 
             await externalCall();
             return { ran: true };
         } finally {
-            guard.release(clinicId, 'POLLING');
+            guard.release(clinicId, 'NOTIFICATION_POLL');
         }
     }
 
-    it('reserva pendente → poll skipado com POLL_SKIPPED_GLOBAL_SYNC_PENDING, sem chamada externa (nunca POLL_ACTIVE)', async () => {
+    it('reserva pendente de Global Sync não bloqueia o poll de notifications', async () => {
         const guard = new ClinicConcurrencyGuard();
         const metrics = new DoctoraliaMetricsService();
         const externalCall = jest.fn(async () => {});
@@ -272,17 +259,17 @@ describe('Task 133 — poll × reserva de prioridade (GLOBAL_SYNC_PENDING)', () 
         guard.requestPriority('clinic-A', () => {});
         const result = await runPollWithBlockReason(guard, metrics, 'clinic-A', externalCall);
 
-        expect(result.ran).toBe(false);
-        expect(result.skipReason).toBe('POLL_SKIPPED_GLOBAL_SYNC_PENDING');
-        expect(externalCall).not.toHaveBeenCalled();
+        expect(result.ran).toBe(true);
+        expect(result.skipReason).toBeUndefined();
+        expect(externalCall).toHaveBeenCalledTimes(1);
         const counts = metrics.getConcurrencySkipCounts();
-        expect(counts.POLL_SKIPPED_GLOBAL_SYNC_PENDING).toBe(1);
+        expect(counts.POLL_SKIPPED_GLOBAL_SYNC_PENDING).toBe(0);
         expect(counts.POLL_SKIPPED_POLL_ACTIVE).toBe(0);
 
         // Reserva consumida pelo Global Sync → poll volta ao normal
         guard.clearPriority('clinic-A');
         const next = await runPollWithBlockReason(guard, metrics, 'clinic-A', externalCall);
         expect(next.ran).toBe(true);
-        expect(externalCall).toHaveBeenCalledTimes(1);
+        expect(externalCall).toHaveBeenCalledTimes(2);
     });
 });

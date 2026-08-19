@@ -1,8 +1,10 @@
 /**
  * WP-02 P2c + WP-04 — Guard de Concorrência por clínica
  *
- * Garante que os subsistemas POLLING, SAFETY_SWEEP, GLOBAL_SYNC e SLOT_SYNC
- * nunca executem simultaneamente para a mesma clínica. Política: SKIP (nunca WAIT).
+ * Garante que POLLING (VisMed), SAFETY_SWEEP, GLOBAL_SYNC e SLOT_SYNC nunca
+ * executem simultaneamente para a mesma clínica. O poll de notifications da
+ * Doctoralia tem um single-flight separado: exclui apenas outro poll de
+ * notifications da mesma clínica e pode coexistir com os demais subsistemas.
  *
  * - GLOBAL_SYNC = sync completo Doctoralia por clínica (processor BullMQ ou caminho
  *   direto sem Redis). O lock cobre o run INTEIRO (decisão aprovada: não reduzir à
@@ -17,7 +19,12 @@
  */
 import { Injectable, Logger } from '@nestjs/common';
 
-export type ConcurrencySubsystem = 'POLLING' | 'SAFETY_SWEEP' | 'GLOBAL_SYNC' | 'SLOT_SYNC';
+export type ConcurrencySubsystem =
+    | 'NOTIFICATION_POLL'
+    | 'POLLING'
+    | 'SAFETY_SWEEP'
+    | 'GLOBAL_SYNC'
+    | 'SLOT_SYNC';
 
 /**
  * Motivo de bloqueio exposto aos chamadores após um tryAcquire falho:
@@ -60,11 +67,19 @@ export class ClinicConcurrencyGuard {
             active = new Set();
             this.activeSubsystems.set(clinicId, active);
         }
-        // Exclusão mútua por clínica: rejeita se QUALQUER subsistema estiver
-        // ativo (não apenas o mesmo). Isso torna o tryAcquire a barreira
-        // atômica — a segurança não depende da sequência isActive() → tryAcquire()
-        // feita pelos chamadores (que serve apenas para escolher o motivo do skip).
-        if (active.size > 0) {
+
+        // Notifications têm single-flight próprio. Não participam da exclusão
+        // ampla porque uma leitura curta da Doctoralia não pode ser perdida por
+        // um poll VisMed/Global Sync/Slot Sync longo (nem bloqueá-los).
+        if (subsystem === 'NOTIFICATION_POLL') {
+            if (active.has('NOTIFICATION_POLL')) return false;
+            active.add(subsystem);
+            return true;
+        }
+
+        // Os demais subsistemas continuam em exclusão mútua total entre si,
+        // ignorando apenas o NOTIFICATION_POLL independente.
+        if ([...active].some(current => current !== 'NOTIFICATION_POLL')) {
             return false;
         }
         // Task 133: reserva de prioridade — enquanto há Global Sync aguardando,
@@ -204,6 +219,9 @@ export class ClinicConcurrencyGuard {
     getActiveSubsystem(clinicId: string): ConcurrencySubsystem | null {
         const active = this.activeSubsystems.get(clinicId);
         if (!active || active.size === 0) return null;
-        return active.values().next().value ?? null;
+        // Quando notifications coexistem com um subsistema exclusivo, o motivo
+        // de bloqueio é sempre o subsistema exclusivo (notifications não bloqueiam).
+        return [...active].find(current => current !== 'NOTIFICATION_POLL')
+            ?? (active.has('NOTIFICATION_POLL') ? 'NOTIFICATION_POLL' : null);
     }
 }

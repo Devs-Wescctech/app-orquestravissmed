@@ -165,6 +165,47 @@ describe('ClinicConcurrencyGuard — guard unitário', () => {
     });
 });
 
+describe('ClinicConcurrencyGuard — single-flight isolado de notifications', () => {
+    it('dois NOTIFICATION_POLL da mesma clínica nunca coexistem', () => {
+        const guard = makeGuard();
+        expect(guard.tryAcquire('clinic-A', 'NOTIFICATION_POLL')).toBe(true);
+        expect(guard.tryAcquire('clinic-A', 'NOTIFICATION_POLL')).toBe(false);
+        guard.release('clinic-A', 'NOTIFICATION_POLL');
+        expect(guard.tryAcquire('clinic-A', 'NOTIFICATION_POLL')).toBe(true);
+        guard.release('clinic-A', 'NOTIFICATION_POLL');
+    });
+
+    it.each(['POLLING', 'SAFETY_SWEEP', 'GLOBAL_SYNC', 'SLOT_SYNC'] as const)(
+        'NOTIFICATION_POLL pode coexistir com %s na mesma clínica',
+        (subsystem) => {
+            const guard = makeGuard();
+            expect(guard.tryAcquire('clinic-A', subsystem)).toBe(true);
+            expect(guard.tryAcquire('clinic-A', 'NOTIFICATION_POLL')).toBe(true);
+            expect(guard.isActive('clinic-A', subsystem)).toBe(true);
+            expect(guard.isActive('clinic-A', 'NOTIFICATION_POLL')).toBe(true);
+            guard.release('clinic-A', 'NOTIFICATION_POLL');
+            guard.release('clinic-A', subsystem);
+        },
+    );
+
+    it('reserva GLOBAL_SYNC_PENDING não bloqueia NOTIFICATION_POLL', () => {
+        const guard = makeGuard();
+        guard.requestPriority('clinic-A', () => {});
+        expect(guard.tryAcquire('clinic-A', 'NOTIFICATION_POLL')).toBe(true);
+        guard.release('clinic-A', 'NOTIFICATION_POLL');
+        guard.clearPriority('clinic-A');
+    });
+
+    it('NOTIFICATION_POLL ativo não bloqueia um subsistema exclusivo', () => {
+        const guard = makeGuard();
+        expect(guard.tryAcquire('clinic-A', 'NOTIFICATION_POLL')).toBe(true);
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(true);
+        expect(guard.getBlockReason('clinic-A')).toBe('POLLING');
+        guard.release('clinic-A', 'POLLING');
+        guard.release('clinic-A', 'NOTIFICATION_POLL');
+    });
+});
+
 describe('ClinicConcurrencyGuard — integração Polling × Polling', () => {
     // Cenário 3: Segundo Polling não faz nenhuma chamada Doctoralia
     it('cenário 3 — segundo poll (mesma clínica) não executa o corpo', async () => {

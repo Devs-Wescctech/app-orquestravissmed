@@ -231,7 +231,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
 
         // WP-01: poll execution tracking + context propagation (apenas quando o poll efetivamente executa)
         const pollExecutionId = randomUUID();
-        try { getDoctoraliaMetricsService()?.trackPollStart(conn.clinicId, pollExecutionId); } catch (_e) {}
+        try { getDoctoraliaMetricsService()?.trackPollStart(conn.clinicId, pollExecutionId, 'VISMED'); } catch (_e) {}
 
         try {
         await runWithDoctoraliaContext({ origin: 'POLLING', clinicId: conn.clinicId, pollExecutionId }, async () => {
@@ -2607,34 +2607,24 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         const conn = await this.getEligibleConnection(staleConn.clinicId, 'doctoralia');
         if (!conn || !conn.clientId || !conn.clientSecret) return;
 
-        // Task 119: Guard de concorrência — SKIP imediato se o Safety Sweep estiver ativo
-        if (this.concurrencyGuard.isActive(conn.clinicId, 'SAFETY_SWEEP')) {
-            this.logger.warn(`[POLL] POLL_SKIPPED_SWEEP_ACTIVE clinicId=${conn.clinicId} — Safety Sweep em andamento, poll descartado`);
-            try { getDoctoraliaMetricsService()?.recordConcurrencySkip('POLL_SKIPPED_SWEEP_ACTIVE', conn.clinicId); } catch (_e) {}
-            return;
-        }
-        // SKIP imediato se outro subsistema já estiver ativo para a mesma clínica
-        // (Polling, Global Sync ou Slot Sync — WP-04). A aquisição ocorre ANTES de
-        // qualquer chamada externa (inclusive rateLimiter), então um poll skipado
-        // não consome nenhuma chamada Doctoralia.
-        if (!this.concurrencyGuard.tryAcquire(conn.clinicId, 'POLLING')) {
-            // Task 133: motivo inequívoco — reserva de prioridade do Global Sync
-            // NUNCA é reportada com fallback enganoso tipo "POLLING ativo".
-            const blockReason = this.concurrencyGuard.getBlockReason(conn.clinicId);
-            if (blockReason === 'GLOBAL_SYNC_PENDING') {
-                this.logger.warn(`[POLL] POLL_SKIPPED_GLOBAL_SYNC_PENDING clinicId=${conn.clinicId} — Global Sync aguardando prioridade, poll descartado`);
-                try { getDoctoraliaMetricsService()?.recordConcurrencySkip('POLL_SKIPPED_GLOBAL_SYNC_PENDING', conn.clinicId); } catch (_e) {}
-                return;
-            }
-            const blocker = concurrencyActorOf(blockReason ?? 'POLLING');
-            this.logger.warn(`[POLL] POLL_SKIPPED_${blocker}_ACTIVE clinicId=${conn.clinicId} — ${blocker} já em andamento, poll descartado`);
-            try { getDoctoraliaMetricsService()?.recordConcurrencySkip(`POLL_SKIPPED_${blocker}_ACTIVE`, conn.clinicId); } catch (_e) {}
+        // Single-flight dedicado: notifications só excluem outro poll de
+        // notifications da mesma clínica. Poll VisMed, Global Sync, Slot Sync e
+        // Safety Sweep podem coexistir sem contornar rate limiter/fila/breaker.
+        if (!this.concurrencyGuard.tryAcquire(conn.clinicId, 'NOTIFICATION_POLL')) {
+            this.logger.warn(
+                `[POLL] NOTIFICATION_POLL_SINGLE_FLIGHT clinicId=${conn.clinicId} — outro poll de notifications já está em andamento`,
+            );
+            try {
+                const metrics = getDoctoraliaMetricsService();
+                metrics?.recordNotificationPollSingleFlight(conn.clinicId);
+                metrics?.recordConcurrencySkip('POLL_SKIPPED_POLL_ACTIVE', conn.clinicId);
+            } catch (_e) {}
             return;
         }
 
         // Poll execution tracking + context propagation (apenas quando o poll efetivamente executa)
         const pollExecutionId = randomUUID();
-        try { getDoctoraliaMetricsService()?.trackPollStart(conn.clinicId, pollExecutionId); } catch (_e) {}
+        try { getDoctoraliaMetricsService()?.trackPollStart(conn.clinicId, pollExecutionId, 'NOTIFICATIONS'); } catch (_e) {}
 
         try {
         // WP-01: propagate POLLING context with clinicId for notification polling calls
@@ -2650,21 +2640,6 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
 
             const res = await client.getNotifications(100);
             const notifications = res?._items || (Array.isArray(res) ? res : []);
-
-            // Observabilidade do caminho de notificações: resumo por ciclo. Ciclos vazios
-            // logam em debug, mas um heartbeat periódico em nível log confirma que o polling
-            // está vivo (ajuda a diagnosticar "notificações não chegam").
-            if (notifications.length === 0) {
-                const count = (this.pollCycleCount.get(conn.clinicId) || 0) + 1;
-                this.pollCycleCount.set(conn.clinicId, count);
-                if (count % 20 === 0) {
-                    this.logger.log(`[POLL] Clinic ${conn.clinicId}: polling ativo — 0 notificações nos últimos ${count} ciclos.`);
-                }
-                this.logger.debug(`[POLL] No notifications for clinic ${conn.clinicId}`);
-                return;
-            }
-            this.pollCycleCount.set(conn.clinicId, 0);
-
             const jobs = notifications
                 .filter((n: any) => ['slot-booked', 'booking-canceled', 'booking-moved'].includes(n?.name))
                 .map((n: any) => {
@@ -2677,12 +2652,73 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                         dedupKey: bookingId ? `${conn.clinicId}:${n.name}:${bookingId}` : undefined,
                     };
                 });
+            const rejected = notifications.length - jobs.length;
 
-            this.logger.log(`[POLL] Clinic ${conn.clinicId}: ${notifications.length} notificação(ões) recebida(s), ${jobs.length} enfileirada(s).`);
-
-            if (jobs.length > 0) {
-                await this.queueService.enqueueBatch(jobs);
+            // Observabilidade do caminho de notificações: resumo por ciclo. Ciclos vazios
+            // logam em debug, mas um heartbeat periódico em nível log confirma que o polling
+            // está vivo (ajuda a diagnosticar "notificações não chegam").
+            if (notifications.length === 0) {
+                const count = (this.pollCycleCount.get(conn.clinicId) || 0) + 1;
+                this.pollCycleCount.set(conn.clinicId, count);
+                if (count % 20 === 0) {
+                    this.logger.log(`[POLL] Clinic ${conn.clinicId}: polling ativo — 0 notificações nos últimos ${count} ciclos.`);
+                }
+                this.logger.debug(`[POLL] No notifications for clinic ${conn.clinicId}`);
+                try {
+                    getDoctoraliaMetricsService()?.recordNotificationPollCycle(
+                        conn.clinicId,
+                        pollExecutionId,
+                        { received: 0, accepted: 0, rejected: 0, inserted: 0, deduplicated: 0, enqueueErrors: 0 },
+                    );
+                } catch (_e) {}
+                return;
             }
+            this.pollCycleCount.set(conn.clinicId, 0);
+
+            let inserted = 0;
+            if (jobs.length > 0) {
+                try {
+                    const enqueueResult: any = await this.queueService.enqueueBatch(jobs);
+                    inserted = typeof enqueueResult?.count === 'number' ? enqueueResult.count : jobs.length;
+                } catch (enqueueErr: any) {
+                    try {
+                        getDoctoraliaMetricsService()?.recordNotificationPollCycle(
+                            conn.clinicId,
+                            pollExecutionId,
+                            {
+                                received: notifications.length,
+                                accepted: jobs.length,
+                                rejected,
+                                inserted: 0,
+                                deduplicated: 0,
+                                enqueueErrors: 1,
+                            },
+                        );
+                    } catch (_e) {}
+                    this.logger.error(
+                        `[POLL] NOTIFICATION_ENQUEUE_ERROR clinicId=${conn.clinicId} received=${notifications.length} accepted=${jobs.length} rejected=${rejected} errorCode=${enqueueErr?.code || 'UNKNOWN'}`,
+                    );
+                    throw enqueueErr;
+                }
+            }
+            const deduplicated = Math.max(0, jobs.length - inserted);
+            try {
+                getDoctoraliaMetricsService()?.recordNotificationPollCycle(
+                    conn.clinicId,
+                    pollExecutionId,
+                    {
+                        received: notifications.length,
+                        accepted: jobs.length,
+                        rejected,
+                        inserted,
+                        deduplicated,
+                        enqueueErrors: 0,
+                    },
+                );
+            } catch (_e) {}
+            this.logger.log(
+                `[POLL] NOTIFICATION_CYCLE clinicId=${conn.clinicId} received=${notifications.length} accepted=${jobs.length} rejected=${rejected} inserted=${inserted} deduplicated=${deduplicated} enqueueErrors=0`,
+            );
         } catch (err: any) {
             // WP-08A: circuito Doctoralia aberto → skip controlado do ciclo, sem marcar
             // a integração error/disconnected; alerta único na transição para OPEN.
@@ -2696,7 +2732,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         } finally {
             try { getDoctoraliaMetricsService()?.trackPollEnd(conn.clinicId, pollExecutionId); } catch (_e) {}
             // Task 119: liberar guard em qualquer cenário (sucesso, erro ou exception)
-            this.concurrencyGuard.release(conn.clinicId, 'POLLING');
+            this.concurrencyGuard.release(conn.clinicId, 'NOTIFICATION_POLL');
         }
     }
 
@@ -2829,7 +2865,10 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                     update: { processedAt: new Date() },
                 });
             } catch (err: any) {
-                this.logger.debug(`[SLOT-BOOKED] Upsert conflict for integration booking ${bookingIdStr} (idempotent)`);
+                if (!(await this.isConfirmedIdempotentBookingConflict(clinicId, bookingIdStr, err))) {
+                    throw err;
+                }
+                this.logger.debug(`[SLOT-BOOKED] Confirmed idempotent conflict for integration booking ${bookingIdStr}`);
             }
             return { processed: true, action: 'skipped_integration_booking' };
         }
@@ -2842,8 +2881,11 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 update: {},
             });
         } catch (err: any) {
-            this.logger.debug(`[SLOT-BOOKED] Booking ${bookingIdStr} already being processed (race avoided)`);
-            return { processed: false, reason: 'already_synced' };
+            if (await this.isConfirmedIdempotentBookingConflict(clinicId, bookingIdStr, err)) {
+                this.logger.debug(`[SLOT-BOOKED] Booking ${bookingIdStr} already reserved (confirmed idempotent conflict)`);
+                return { processed: false, reason: 'already_synced' };
+            }
+            throw err;
         }
 
         const isRetry = reserved.status === 'FAILED';
@@ -2975,6 +3017,47 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         }
 
         return { processed: true, action: 'slot_booked', vismedCreated: !!vismedAppointmentId };
+    }
+
+    /**
+     * Um erro do primeiro upsert só é idempotência quando o Prisma reporta P2002
+     * e o registro com a mesma chave realmente existe. Falhas de conexão,
+     * timeout, permissão ou qualquer outro erro precisam chegar ao retry.
+     */
+    private async isConfirmedIdempotentBookingConflict(
+        clinicId: string,
+        bookingId: string,
+        err: any,
+    ): Promise<boolean> {
+        const code = typeof err?.code === 'string' ? err.code : 'UNKNOWN';
+        if (code !== 'P2002') {
+            try { getDoctoraliaMetricsService()?.recordBookingReservationError(code); } catch (_e) {}
+            this.logger.error(
+                `[SLOT-BOOKED] BOOKING_RESERVATION_ERROR clinicId=${clinicId} errorCode=${code}`,
+            );
+            return false;
+        }
+
+        try {
+            const existing = await this.prisma.bookingSync.findUnique({
+                where: { doctoraliaBookingId: bookingId },
+                select: { id: true },
+            });
+            if (existing) return true;
+        } catch (lookupErr: any) {
+            const lookupCode = typeof lookupErr?.code === 'string' ? lookupErr.code : 'UNKNOWN';
+            try { getDoctoraliaMetricsService()?.recordBookingReservationError(lookupCode); } catch (_e) {}
+            this.logger.error(
+                `[SLOT-BOOKED] BOOKING_RESERVATION_VERIFY_ERROR clinicId=${clinicId} errorCode=${lookupCode}`,
+            );
+            throw lookupErr;
+        }
+
+        try { getDoctoraliaMetricsService()?.recordBookingReservationError(code); } catch (_e) {}
+        this.logger.error(
+            `[SLOT-BOOKED] BOOKING_RESERVATION_CONFLICT_UNCONFIRMED clinicId=${clinicId} errorCode=${code}`,
+        );
+        return false;
     }
 
     /**

@@ -30,6 +30,17 @@ import { isDoctoraliaCircuitOpenError } from '../integrations/doctoralia-circuit
 
 const SWEEP_STARTUP_DELAY_MS = 60 * 1000; // deixa o boot/polling normal assentar primeiro
 const SWEEP_STAGGER_PER_CLINIC_MS = 15 * 1000;
+const SWEEP_RETRY_BASE_MS = 5 * 1000;
+const SWEEP_RETRY_MAX_MS = 60 * 1000;
+
+type SweepSource = 'automatic' | 'manual';
+
+interface PendingSweepRetry {
+    conn: any;
+    timer: NodeJS.Timeout;
+    attempt: number;
+    sources: Set<SweepSource>;
+}
 
 function envInt(name: string, def: number, min: number, max: number): number {
     const raw = parseInt(process.env[name] || '', 10);
@@ -52,6 +63,8 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
     private startupTimer: NodeJS.Timeout | null = null;
     private isRunning = false;
     private isShuttingDown = false;
+    /** No máximo um timer de retry coalescido por clínica. */
+    private readonly pendingSweepRetries = new Map<string, PendingSweepRetry>();
 
     constructor(
         private readonly prisma: PrismaService,
@@ -81,10 +94,137 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
         this.isShuttingDown = true;
         if (this.startupTimer) clearTimeout(this.startupTimer);
         if (this.timer) clearInterval(this.timer);
+        for (const pending of this.pendingSweepRetries.values()) {
+            clearTimeout(pending.timer);
+        }
+        this.pendingSweepRetries.clear();
     }
 
     private sleep(ms: number): Promise<void> {
         return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    private takePendingSweepRetry(clinicId: string): PendingSweepRetry | null {
+        const pending = this.pendingSweepRetries.get(clinicId);
+        if (!pending) return null;
+        clearTimeout(pending.timer);
+        this.pendingSweepRetries.delete(clinicId);
+        return pending;
+    }
+
+    private scheduleSweepRetry(
+        conn: any,
+        sources: Set<SweepSource>,
+        attempt: number,
+    ): void {
+        const clinicId = String(conn.clinicId);
+        const existing = this.pendingSweepRetries.get(clinicId);
+        if (existing) {
+            existing.conn = conn;
+            for (const source of sources) existing.sources.add(source);
+            try { getDoctoraliaMetricsService()?.recordSafetySweepRetry('coalesced', clinicId); } catch (_e) {}
+            this.logger.log(
+                `[SAFETY-SWEEP] SWEEP_RETRY_COALESCED clinicId=${clinicId} attempt=${existing.attempt}`,
+            );
+            return;
+        }
+
+        const boundedAttempt = Math.max(1, attempt);
+        const delayMs = Math.min(
+            SWEEP_RETRY_MAX_MS,
+            SWEEP_RETRY_BASE_MS * Math.pow(2, boundedAttempt - 1),
+        );
+        const pending = {} as PendingSweepRetry;
+        pending.conn = conn;
+        pending.attempt = boundedAttempt;
+        pending.sources = new Set(sources);
+        pending.timer = setTimeout(() => {
+            if (this.isShuttingDown || this.pendingSweepRetries.get(clinicId) !== pending) return;
+            this.pendingSweepRetries.delete(clinicId);
+            void this.runPendingSweepRetry(pending);
+        }, delayMs);
+        pending.timer.unref?.();
+        this.pendingSweepRetries.set(clinicId, pending);
+        try { getDoctoraliaMetricsService()?.recordSafetySweepRetry('deferred', clinicId); } catch (_e) {}
+        this.logger.warn(
+            `[SAFETY-SWEEP] SWEEP_DEFERRED clinicId=${clinicId} attempt=${boundedAttempt} backoffMs=${delayMs}`,
+        );
+    }
+
+    private async runPendingSweepRetry(pending: PendingSweepRetry): Promise<void> {
+        if (this.isShuttingDown) return;
+        const clinicId = String(pending.conn.clinicId);
+        try { getDoctoraliaMetricsService()?.recordSafetySweepRetry('attempted', clinicId); } catch (_e) {}
+        this.logger.log(
+            `[SAFETY-SWEEP] SWEEP_RETRY_ATTEMPT clinicId=${clinicId} attempt=${pending.attempt}`,
+        );
+        await this.executeSweepForClinic(pending.conn, pending.sources, pending.attempt, true);
+    }
+
+    private recordSweepConflict(clinicId: string): void {
+        const blockReason = this.concurrencyGuard.getBlockReason(clinicId);
+        if (blockReason === 'GLOBAL_SYNC_PENDING') {
+            this.logger.warn(
+                `[SAFETY-SWEEP] SWEEP_SKIPPED_GLOBAL_SYNC_PENDING clinicId=${clinicId} — retry será agendado`,
+            );
+            try { getDoctoraliaMetricsService()?.recordConcurrencySkip('SWEEP_SKIPPED_GLOBAL_SYNC_PENDING', clinicId); } catch (_e) {}
+            return;
+        }
+        const blocker = concurrencyActorOf(blockReason ?? 'SAFETY_SWEEP');
+        this.logger.warn(
+            `[SAFETY-SWEEP] SWEEP_SKIPPED_${blocker}_ACTIVE clinicId=${clinicId} — retry será agendado`,
+        );
+        try { getDoctoraliaMetricsService()?.recordConcurrencySkip(`SWEEP_SKIPPED_${blocker}_ACTIVE`, clinicId); } catch (_e) {}
+    }
+
+    private finishManualSweep(clinicId: string, result: { enqueued?: number; error?: string }): void {
+        const current = this.manualSweeps.get(clinicId);
+        if (!current) return;
+        this.manualSweeps.set(clinicId, {
+            running: false,
+            startedAt: current.startedAt,
+            finishedAt: new Date().toISOString(),
+            ...result,
+        });
+    }
+
+    private async executeSweepForClinic(
+        conn: any,
+        sources: Set<SweepSource>,
+        retryAttempt: number,
+        recovering: boolean,
+    ): Promise<{ ran: boolean; enqueued: number }> {
+        const clinicId = String(conn.clinicId);
+        if (!this.concurrencyGuard.tryAcquire(clinicId, 'SAFETY_SWEEP')) {
+            this.recordSweepConflict(clinicId);
+            this.scheduleSweepRetry(conn, sources, retryAttempt + 1);
+            return { ran: false, enqueued: 0 };
+        }
+
+        try {
+            const enqueued = await DocplannerClient.runWithPriority(() => this.sweepClinic(conn));
+            if (recovering) {
+                try { getDoctoraliaMetricsService()?.recordSafetySweepRetry('recovered', clinicId); } catch (_e) {}
+                this.logger.log(
+                    `[SAFETY-SWEEP] SWEEP_RECOVERED clinicId=${clinicId} attempt=${retryAttempt} enqueued=${enqueued}`,
+                );
+            }
+            if (sources.has('manual')) {
+                this.finishManualSweep(clinicId, { enqueued });
+                this.logger.log(
+                    `[SAFETY-SWEEP] [MANUAL] Varredura da clínica ${clinicId} concluída: ${enqueued} booking(s) enfileirado(s).`,
+                );
+            }
+            return { ran: true, enqueued };
+        } catch (err: any) {
+            this.logger.warn(`[SAFETY-SWEEP] Falha na clínica ${clinicId}: ${err?.message}`);
+            if (sources.has('manual')) {
+                this.finishManualSweep(clinicId, { error: err?.message || 'Erro inesperado na verificação' });
+            }
+            return { ran: false, enqueued: 0 };
+        } finally {
+            this.concurrencyGuard.release(clinicId, 'SAFETY_SWEEP');
+        }
     }
 
     async runSweepAllClinics(): Promise<{ clinics: number; enqueued: number }> {
@@ -106,38 +246,24 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
                 // Staggering entre clínicas para diluir a carga (30 clínicas × médicos vinculados).
                 if (i > 0) await this.sleep(SWEEP_STAGGER_PER_CLINIC_MS);
                 const clinicId = connections[i].clinicId;
-                try {
-                    // WP-02 P2c: Guard de concorrência — SKIP se Polling ativo para esta clínica
-                    if (this.concurrencyGuard.isActive(clinicId, 'POLLING')) {
-                        this.logger.warn(`[SAFETY-SWEEP] SWEEP_SKIPPED_POLL_ACTIVE clinicId=${clinicId} — Polling em andamento, varredura descartada`);
-                        try { getDoctoraliaMetricsService()?.recordConcurrencySkip('SWEEP_SKIPPED_POLL_ACTIVE', clinicId); } catch (_e) {}
-                        continue;
-                    }
-                    if (!this.concurrencyGuard.tryAcquire(clinicId, 'SAFETY_SWEEP')) {
-                        // Task 133: reserva de prioridade do Global Sync tem motivo próprio
-                        const blockReason = this.concurrencyGuard.getBlockReason(clinicId);
-                        if (blockReason === 'GLOBAL_SYNC_PENDING') {
-                            this.logger.warn(`[SAFETY-SWEEP] SWEEP_SKIPPED_GLOBAL_SYNC_PENDING clinicId=${clinicId} — Global Sync aguardando prioridade, varredura descartada`);
-                            try { getDoctoraliaMetricsService()?.recordConcurrencySkip('SWEEP_SKIPPED_GLOBAL_SYNC_PENDING', clinicId); } catch (_e) {}
-                            continue;
-                        }
-                        const blocker = concurrencyActorOf(blockReason ?? 'SAFETY_SWEEP');
-                        this.logger.warn(`[SAFETY-SWEEP] SWEEP_SKIPPED_${blocker}_ACTIVE clinicId=${clinicId} — ${blocker} já em andamento, varredura descartada`);
-                        try { getDoctoraliaMetricsService()?.recordConcurrencySkip(`SWEEP_SKIPPED_${blocker}_ACTIVE`, clinicId); } catch (_e) {}
-                        continue;
-                    }
-                    try {
-                        // Prioridade na fila de vazão: as ~dezenas de chamadas da varredura passam
-                        // na frente das milhares do sync global (o teto de 400/5min é o mesmo).
-                        const enqueued = await DocplannerClient.runWithPriority(() => this.sweepClinic(connections[i]));
-                        totalEnqueued += enqueued;
-                        clinicsSwept++;
-                    } finally {
-                        // WP-02 P2c: liberar guard em qualquer cenário
-                        this.concurrencyGuard.release(clinicId, 'SAFETY_SWEEP');
-                    }
-                } catch (err: any) {
-                    this.logger.warn(`[SAFETY-SWEEP] Falha na clínica ${clinicId}: ${err?.message}`);
+                const pending = this.takePendingSweepRetry(clinicId);
+                const sources = pending?.sources ?? new Set<SweepSource>();
+                sources.add('automatic');
+                if (pending) {
+                    try { getDoctoraliaMetricsService()?.recordSafetySweepRetry('attempted', clinicId); } catch (_e) {}
+                    this.logger.log(
+                        `[SAFETY-SWEEP] SWEEP_RETRY_ATTEMPT clinicId=${clinicId} attempt=${pending.attempt} trigger=periodic`,
+                    );
+                }
+                const result = await this.executeSweepForClinic(
+                    connections[i],
+                    sources,
+                    pending?.attempt ?? 0,
+                    !!pending,
+                );
+                if (result.ran) {
+                    totalEnqueued += result.enqueued;
+                    clinicsSwept++;
                 }
             }
 
@@ -173,61 +299,14 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
         this.logger.log(`[SAFETY-SWEEP] [MANUAL] Varredura em background iniciada para clínica ${clinicId}`);
 
         // Fire-and-forget com try/catch abrangente: NENHUMA falha aqui pode virar 500 na requisição.
-        (async () => {
-            // WP-02 P2c: Guard de concorrência — SKIP se Polling ativo para esta clínica
-            if (this.concurrencyGuard.isActive(clinicId, 'POLLING')) {
-                this.logger.warn(`[SAFETY-SWEEP] [MANUAL] SWEEP_SKIPPED_POLL_ACTIVE clinicId=${clinicId} — Polling em andamento, varredura manual descartada`);
-                try { getDoctoraliaMetricsService()?.recordConcurrencySkip('SWEEP_SKIPPED_POLL_ACTIVE', clinicId); } catch (_e) {}
-                this.manualSweeps.set(clinicId, {
-                    running: false,
-                    startedAt: this.manualSweeps.get(clinicId)?.startedAt || new Date().toISOString(),
-                    finishedAt: new Date().toISOString(),
-                    error: 'Polling em andamento para esta clínica — varredura manual descartada (tente novamente em instantes)',
-                });
-                return;
+        void (async () => {
+            const pending = this.takePendingSweepRetry(clinicId);
+            const sources = pending?.sources ?? new Set<SweepSource>();
+            sources.add('manual');
+            if (pending) {
+                try { getDoctoraliaMetricsService()?.recordSafetySweepRetry('attempted', clinicId); } catch (_e) {}
             }
-            if (!this.concurrencyGuard.tryAcquire(clinicId, 'SAFETY_SWEEP')) {
-                // Pode ocorrer quando o sweep automático adquiriu o guard entre o início do
-                // fire-and-forget e esta linha. Resetar o estado para que a UI não fique travada.
-                // Task 133: reserva de prioridade do Global Sync tem motivo próprio.
-                const blockReason = this.concurrencyGuard.getBlockReason(clinicId);
-                if (blockReason === 'GLOBAL_SYNC_PENDING') {
-                    this.logger.warn(`[SAFETY-SWEEP] [MANUAL] SWEEP_SKIPPED_GLOBAL_SYNC_PENDING clinicId=${clinicId} — Global Sync aguardando prioridade, varredura manual descartada`);
-                    try { getDoctoraliaMetricsService()?.recordConcurrencySkip('SWEEP_SKIPPED_GLOBAL_SYNC_PENDING', clinicId); } catch (_e) {}
-                } else {
-                    const blocker = concurrencyActorOf(blockReason ?? 'SAFETY_SWEEP');
-                    this.logger.warn(`[SAFETY-SWEEP] [MANUAL] SWEEP_SKIPPED_${blocker}_ACTIVE clinicId=${clinicId} — ${blocker} em andamento, varredura manual descartada`);
-                    try { getDoctoraliaMetricsService()?.recordConcurrencySkip(`SWEEP_SKIPPED_${blocker}_ACTIVE`, clinicId); } catch (_e) {}
-                }
-                this.manualSweeps.set(clinicId, {
-                    running: false,
-                    startedAt: this.manualSweeps.get(clinicId)?.startedAt || new Date().toISOString(),
-                    finishedAt: new Date().toISOString(),
-                    error: 'Outra execução em andamento para esta clínica — tente novamente em instantes',
-                });
-                return;
-            }
-            try {
-                const enqueued = await DocplannerClient.runWithPriority(() => this.sweepClinic(conn));
-                this.manualSweeps.set(clinicId, {
-                    running: false,
-                    startedAt: this.manualSweeps.get(clinicId)?.startedAt || new Date().toISOString(),
-                    finishedAt: new Date().toISOString(),
-                    enqueued,
-                });
-                this.logger.log(`[SAFETY-SWEEP] [MANUAL] Varredura da clínica ${clinicId} concluída: ${enqueued} booking(s) enfileirado(s).`);
-            } catch (err: any) {
-                this.logger.error(`[SAFETY-SWEEP] [MANUAL] Varredura da clínica ${clinicId} falhou: ${err?.message}`, err?.stack);
-                this.manualSweeps.set(clinicId, {
-                    running: false,
-                    startedAt: this.manualSweeps.get(clinicId)?.startedAt || new Date().toISOString(),
-                    finishedAt: new Date().toISOString(),
-                    error: err?.message || 'Erro inesperado na verificação',
-                });
-            } finally {
-                // WP-02 P2c: liberar guard em qualquer cenário
-                this.concurrencyGuard.release(clinicId, 'SAFETY_SWEEP');
-            }
+            await this.executeSweepForClinic(conn, sources, pending?.attempt ?? 0, !!pending);
         })();
 
         return { started: true };
@@ -319,7 +398,7 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
                     // Booking existe na Doctoralia mas NUNCA chegou via webhook/notificações —
                     // forte indício de que o caminho de notificações está quebrado.
                     this.logger.warn(
-                        `[SAFETY-SWEEP] ⚠️ NOTIFICAÇÃO PERDIDA: booking ${bid} (médico ${pair.doctorId}, ${booking.start_at}, paciente "${booking?.patient?.name || '?'}") existe na Doctoralia mas não chegou via webhook/polling. Enfileirando criação na VisMed.`,
+                        `[SAFETY-SWEEP] NOTIFICATION_MISSED clinicId=${conn.clinicId} bookingId=${bid} doctorId=${pair.doctorId} — booking existe na Doctoralia mas não chegou via webhook/polling; enfileirando criação na VisMed`,
                     );
 
                     const data = {
@@ -403,7 +482,7 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
                 },
             });
             this.logger.log(
-                `[SAFETY-SWEEP] Nome do paciente completado retroativamente no booking ${bookingId}: "${`${patient.name} ${patient.surname || ''}`.trim()}"`,
+                `[SAFETY-SWEEP] PATIENT_DATA_BACKFILLED bookingId=${bookingId}`,
             );
         } catch (err: any) {
             this.logger.warn(`[SAFETY-SWEEP] Falha ao completar paciente do booking ${bookingId}: ${err?.message}`);

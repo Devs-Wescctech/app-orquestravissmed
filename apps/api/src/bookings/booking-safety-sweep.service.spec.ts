@@ -147,10 +147,10 @@ describe('BookingSafetySweepService', () => {
         expect(result.enqueued).toBe(1);
     });
 
-    it('runSweepAllClinics pula clínica cujo SAFETY_SWEEP já está ativo (guard adquirido externamente)', async () => {
+    it('runSweepAllClinics adia e recupera a clínica cujo SAFETY_SWEEP já está ativo', async () => {
+        jest.useFakeTimers();
         client.getBookings.mockResolvedValue({ _items: [newBooking('666')] });
 
-        // Simula sweep automático já em andamento: adquire o guard antes de chamar runSweepAllClinics
         concurrencyGuard.tryAcquire('clinic-1', 'SAFETY_SWEEP');
         try {
             const result = await service.runSweepAllClinics();
@@ -158,12 +158,18 @@ describe('BookingSafetySweepService', () => {
             expect(result.enqueued).toBe(0);
             expect(client.getBookings).not.toHaveBeenCalled();
             expect(getDoctoraliaMetricsService()!.getConcurrencySkipCounts().SWEEP_SKIPPED_SWEEP_ACTIVE).toBe(1);
-        } finally {
             concurrencyGuard.release('clinic-1', 'SAFETY_SWEEP');
+            await jest.advanceTimersByTimeAsync(5_000);
+            expect(client.getBookings).toHaveBeenCalledTimes(1);
+            expect((getDoctoraliaMetricsService()!.getBaseline() as any).safetySweepRetry.recovered).toBe(1);
+        } finally {
+            service.onModuleDestroy();
+            jest.useRealTimers();
         }
     });
 
-    it('runSweepAllClinics pula clínica com POLLING ativo e registra SWEEP_SKIPPED_POLL_ACTIVE', async () => {
+    it('runSweepAllClinics adia durante POLLING VisMed e executa um retry quando liberar', async () => {
+        jest.useFakeTimers();
         client.getBookings.mockResolvedValue({ _items: [newBooking('777')] });
 
         concurrencyGuard.tryAcquire('clinic-1', 'POLLING');
@@ -173,12 +179,18 @@ describe('BookingSafetySweepService', () => {
             expect(result.enqueued).toBe(0);
             expect(client.getBookings).not.toHaveBeenCalled();
             expect(getDoctoraliaMetricsService()!.getConcurrencySkipCounts().SWEEP_SKIPPED_POLL_ACTIVE).toBe(1);
-        } finally {
             concurrencyGuard.release('clinic-1', 'POLLING');
+            await jest.advanceTimersByTimeAsync(5_000);
+            expect(client.getBookings).toHaveBeenCalledTimes(1);
+            expect((service as any).pendingSweepRetries.size).toBe(0);
+        } finally {
+            service.onModuleDestroy();
+            jest.useRealTimers();
         }
     });
 
-    it('Task 133: runSweepAllClinics pula com SWEEP_SKIPPED_GLOBAL_SYNC_PENDING quando há reserva de prioridade (nunca fallback enganoso)', async () => {
+    it('Task 133: runSweepAllClinics adia com GLOBAL_SYNC_PENDING e recupera após liberar a reserva', async () => {
+        jest.useFakeTimers();
         client.getBookings.mockResolvedValue({ _items: [newBooking('888')] });
 
         // Reserva pendente, NENHUM subsistema ativo
@@ -192,64 +204,77 @@ describe('BookingSafetySweepService', () => {
             expect(counts.SWEEP_SKIPPED_GLOBAL_SYNC_PENDING).toBe(1);
             expect(counts.SWEEP_SKIPPED_SWEEP_ACTIVE).toBe(0);
             expect(counts.SWEEP_SKIPPED_POLL_ACTIVE).toBe(0);
-        } finally {
             concurrencyGuard.clearPriority('clinic-1');
+            await jest.advanceTimersByTimeAsync(5_000);
+            expect(client.getBookings).toHaveBeenCalledTimes(1);
+        } finally {
+            service.onModuleDestroy();
+            jest.useRealTimers();
         }
     });
 
-    it('Task 133: startManualSweep descartada com SWEEP_SKIPPED_GLOBAL_SYNC_PENDING quando há reserva de prioridade', async () => {
+    it('Task 133: startManualSweep fica adiada com GLOBAL_SYNC_PENDING e conclui após liberar', async () => {
+        jest.useFakeTimers();
         concurrencyGuard.requestPriority('clinic-1', () => {});
         try {
             service.startManualSweep(conn);
-            await new Promise(res => setImmediate(res));
-            await new Promise(res => setImmediate(res));
-            const status = service.getManualSweepStatus('clinic-1') as any;
-            expect(status.running).toBe(false);
+            await Promise.resolve();
+            const deferred = service.getManualSweepStatus('clinic-1') as any;
+            expect(deferred.running).toBe(true);
             expect(client.getBookings).not.toHaveBeenCalled();
             const counts = getDoctoraliaMetricsService()!.getConcurrencySkipCounts();
             expect(counts.SWEEP_SKIPPED_GLOBAL_SYNC_PENDING).toBe(1);
             expect(counts.SWEEP_SKIPPED_SWEEP_ACTIVE).toBe(0);
-        } finally {
             concurrencyGuard.clearPriority('clinic-1');
+            await jest.advanceTimersByTimeAsync(5_000);
+            const recovered = service.getManualSweepStatus('clinic-1') as any;
+            expect(recovered.running).toBe(false);
+            expect(recovered.enqueued).toBe(0);
+            expect(client.getBookings).toHaveBeenCalledTimes(1);
+        } finally {
+            service.onModuleDestroy();
+            jest.useRealTimers();
         }
     });
 
-    it('startManualSweep redefine running=false quando o SAFETY_SWEEP guard já está adquirido (sweep automático ativo)', async () => {
-        // Adquire o guard externamente (simula sweep automático em andamento)
+    it('startManualSweep mantém um único retry pendente quando o sweep automático está ativo', async () => {
+        jest.useFakeTimers();
         concurrencyGuard.tryAcquire('clinic-1', 'SAFETY_SWEEP');
         try {
             const started = service.startManualSweep(conn);
-            expect(started.started).toBe(true); // resposta imediata à UI
-
-            // Aguarda o fire-and-forget detectar o conflito
-            await new Promise(resolve => setTimeout(resolve, 20));
-
-            const status = service.getManualSweepStatus('clinic-1');
-            // Estado NÃO deve ficar travado em running=true
-            expect(status.running).toBe(false);
-            expect(status.error).toBeDefined();
-            // Nenhuma chamada à Doctoralia deve ter sido feita
+            expect(started.started).toBe(true);
+            await Promise.resolve();
+            expect(service.getManualSweepStatus('clinic-1').running).toBe(true);
             expect(client.getBookings).not.toHaveBeenCalled();
             expect(getDoctoraliaMetricsService()!.getConcurrencySkipCounts().SWEEP_SKIPPED_SWEEP_ACTIVE).toBe(1);
-        } finally {
+            expect((service as any).pendingSweepRetries.size).toBe(1);
+
             concurrencyGuard.release('clinic-1', 'SAFETY_SWEEP');
+            await jest.advanceTimersByTimeAsync(5_000);
+            expect(service.getManualSweepStatus('clinic-1').running).toBe(false);
+            expect((service as any).pendingSweepRetries.size).toBe(0);
+        } finally {
+            service.onModuleDestroy();
+            jest.useRealTimers();
         }
     });
 
-    it('startManualSweep redefine running=false quando o POLLING está ativo para a clínica', async () => {
+    it('startManualSweep adiada por POLLING conclui automaticamente após o conflito', async () => {
+        jest.useFakeTimers();
         concurrencyGuard.tryAcquire('clinic-1', 'POLLING');
         try {
             const started = service.startManualSweep(conn);
             expect(started.started).toBe(true);
-
-            await new Promise(resolve => setTimeout(resolve, 20));
-
-            const status = service.getManualSweepStatus('clinic-1');
-            expect(status.running).toBe(false);
-            expect(status.error).toBeDefined();
+            await Promise.resolve();
+            expect(service.getManualSweepStatus('clinic-1').running).toBe(true);
             expect(client.getBookings).not.toHaveBeenCalled();
-        } finally {
             concurrencyGuard.release('clinic-1', 'POLLING');
+            await jest.advanceTimersByTimeAsync(5_000);
+            expect(service.getManualSweepStatus('clinic-1').running).toBe(false);
+            expect(client.getBookings).toHaveBeenCalledTimes(1);
+        } finally {
+            service.onModuleDestroy();
+            jest.useRealTimers();
         }
     });
 });

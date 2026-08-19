@@ -76,11 +76,27 @@ describe('P1a — deduplicação atômica', () => {
 
     it('chave repetida dentro do MESMO batch → 1 job', async () => {
         const k = key('intra-batch');
-        await svc.enqueueBatch([
+        const result = await svc.enqueueBatch([
             { clinicId: CLINIC, type: 't', payload: { n: 1 }, dedupKey: k },
             { clinicId: CLINIC, type: 't', payload: { n: 2 }, dedupKey: k },
         ]);
+        expect(result).toEqual({ count: 1 });
         expect(await countByKey(k)).toBe(1);
+    });
+
+    it('enqueueBatch reporta inseridos versus deduplicados sem alterar a dedupKey', async () => {
+        const existingKey = key('batch-count-existing');
+        const newKey = key('batch-count-new');
+        await svc.enqueue(CLINIC, 't', {}, { dedupKey: existingKey });
+
+        const result = await svc.enqueueBatch([
+            { clinicId: CLINIC, type: 't', payload: { n: 1 }, dedupKey: existingKey },
+            { clinicId: CLINIC, type: 't', payload: { n: 2 }, dedupKey: newKey },
+        ]);
+
+        expect(result).toEqual({ count: 1 });
+        expect(await countByKey(existingKey)).toBe(1);
+        expect(await countByKey(newKey)).toBe(1);
     });
 
     it('PENDING bloqueia duplicata (enqueue e batch)', async () => {

@@ -48,14 +48,23 @@ export interface RateLimiterEvent {
     recordedAt: number;
 }
 
+export type PollKind = 'GENERIC' | 'NOTIFICATIONS' | 'VISMED';
+
 export interface PollExecution {
     pollExecutionId: string;
     clinicId: string;
+    kind: PollKind;
     startedAt: number;
     endedAt?: number;
     doctoraliaCallCount: number;
     vismedCallCount: number;
     reconciliationCount: number;
+    notificationsReceived: number;
+    notificationsAccepted: number;
+    notificationsRejected: number;
+    jobsInserted: number;
+    jobsDeduplicated: number;
+    enqueueErrors: number;
 }
 
 export interface OverlapEvent {
@@ -147,8 +156,10 @@ export function emptyConcurrencySkipCounts(): Record<ConcurrencySkipType, number
 }
 
 /** Mapeia o subsistema do guard para o rótulo do contador. */
-export function concurrencyActorOf(subsystem: 'POLLING' | 'SAFETY_SWEEP' | 'GLOBAL_SYNC' | 'SLOT_SYNC'): ConcurrencyActor {
-    if (subsystem === 'POLLING') return 'POLL';
+export function concurrencyActorOf(
+    subsystem: 'NOTIFICATION_POLL' | 'POLLING' | 'SAFETY_SWEEP' | 'GLOBAL_SYNC' | 'SLOT_SYNC',
+): ConcurrencyActor {
+    if (subsystem === 'NOTIFICATION_POLL' || subsystem === 'POLLING') return 'POLL';
     if (subsystem === 'SAFETY_SWEEP') return 'SWEEP';
     return subsystem;
 }
@@ -204,6 +215,18 @@ export class DoctoraliaMetricsService {
 
     // WP-02 P2c + WP-04: Contadores de bloqueio por concorrência (todos os cruzamentos)
     private concurrencySkipCounts: Record<ConcurrencySkipType, number> = emptyConcurrencySkipCounts();
+    // Ingestão de notifications/Sweep/reserva de booking (somente contagens, sem PII).
+    private notificationPollSingleFlightSkips = 0;
+    private safetySweepRetryStats = {
+        deferred: 0,
+        coalesced: 0,
+        attempted: 0,
+        recovered: 0,
+    };
+    private bookingReservationErrorStats = {
+        total: 0,
+        byCode: {} as Record<string, number>,
+    };
 
     // WP-05: GETs que se juntaram a um voo idêntico já em andamento (dedup in-flight)
     private dedupedGetCount = 0;
@@ -330,6 +353,14 @@ export class DoctoraliaMetricsService {
             this.rateSnapshots.length = 0;
             // WP-02 P2c + WP-04
             this.concurrencySkipCounts = emptyConcurrencySkipCounts();
+            this.notificationPollSingleFlightSkips = 0;
+            this.safetySweepRetryStats = {
+                deferred: 0,
+                coalesced: 0,
+                attempted: 0,
+                recovered: 0,
+            };
+            this.bookingReservationErrorStats = { total: 0, byCode: {} };
             // WP-05
             this.dedupedGetCount = 0;
             // WP-07
@@ -377,6 +408,61 @@ export class DoctoraliaMetricsService {
 
     getConcurrencySkipCounts(): Record<ConcurrencySkipType, number> {
         return { ...this.concurrencySkipCounts };
+    }
+
+    recordNotificationPollSingleFlight(clinicId?: string): void {
+        try {
+            this.notificationPollSingleFlightSkips++;
+            this.logger.debug(`[METRICS] NOTIFICATION_POLL_SINGLE_FLIGHT clinicId=${clinicId ?? 'unknown'}`);
+        } catch (err: any) {
+            this.logger.debug(`[METRICS] recordNotificationPollSingleFlight() error (non-fatal): ${err?.message}`);
+        }
+    }
+
+    recordNotificationPollCycle(
+        clinicId: string,
+        pollExecutionId: string,
+        stats: {
+            received: number;
+            accepted: number;
+            rejected: number;
+            inserted: number;
+            deduplicated: number;
+            enqueueErrors: number;
+        },
+    ): void {
+        try {
+            const poll = this.activePolls.get(clinicId)?.get(pollExecutionId);
+            if (!poll) return;
+            poll.notificationsReceived += stats.received;
+            poll.notificationsAccepted += stats.accepted;
+            poll.notificationsRejected += stats.rejected;
+            poll.jobsInserted += stats.inserted;
+            poll.jobsDeduplicated += stats.deduplicated;
+            poll.enqueueErrors += stats.enqueueErrors;
+        } catch (err: any) {
+            this.logger.debug(`[METRICS] recordNotificationPollCycle() error (non-fatal): ${err?.message}`);
+        }
+    }
+
+    recordSafetySweepRetry(event: keyof typeof this.safetySweepRetryStats, clinicId?: string): void {
+        try {
+            this.safetySweepRetryStats[event]++;
+            this.logger.debug(`[METRICS] SAFETY_SWEEP_RETRY_${event.toUpperCase()} clinicId=${clinicId ?? 'unknown'}`);
+        } catch (err: any) {
+            this.logger.debug(`[METRICS] recordSafetySweepRetry() error (non-fatal): ${err?.message}`);
+        }
+    }
+
+    recordBookingReservationError(code?: string): void {
+        try {
+            const safeCode = code && /^[A-Z0-9_]+$/.test(code) ? code : 'UNKNOWN';
+            this.bookingReservationErrorStats.total++;
+            this.bookingReservationErrorStats.byCode[safeCode] =
+                (this.bookingReservationErrorStats.byCode[safeCode] ?? 0) + 1;
+        } catch (err: any) {
+            this.logger.debug(`[METRICS] recordBookingReservationError() error (non-fatal): ${err?.message}`);
+        }
     }
 
     // ─────────── WP-05: contador de GETs deduplicados (fail-safe, aditivo) ───
@@ -623,7 +709,11 @@ export class DoctoraliaMetricsService {
 
     // ────────────────── Poll tracking ───────────────────────────────────────
 
-    trackPollStart(clinicId: string, pollExecutionId: string): OverlapEvent | null {
+    trackPollStart(
+        clinicId: string,
+        pollExecutionId: string,
+        kind: PollKind = 'GENERIC',
+    ): OverlapEvent | null {
         try {
             if (!this.activePolls.has(clinicId)) {
                 this.activePolls.set(clinicId, new Map());
@@ -631,17 +721,18 @@ export class DoctoraliaMetricsService {
             const clinicPolls = this.activePolls.get(clinicId)!;
 
             let overlapEvent: OverlapEvent | null = null;
-            if (clinicPolls.size > 0) {
+            const sameKindPolls = [...clinicPolls.values()].filter(p => p.kind === kind);
+            if (sameKindPolls.length > 0) {
                 const now = Date.now();
-                const activePollIds = [...clinicPolls.keys()];
-                const activeDurations = [...clinicPolls.values()].map(p => now - p.startedAt);
+                const activePollIds = sameKindPolls.map(p => p.pollExecutionId);
+                const activeDurations = sameKindPolls.map(p => now - p.startedAt);
                 overlapEvent = {
                     clinicId,
                     newPollExecutionId: pollExecutionId,
                     activePollExecutionIds: activePollIds,
                     activePollDurations: activeDurations,
                     startedAt: now,
-                    concurrency: clinicPolls.size + 1,
+                    concurrency: sameKindPolls.length + 1,
                 };
                 this.overlapEvents.push(overlapEvent);
                 this.totalOverlapCount++;
@@ -674,10 +765,17 @@ export class DoctoraliaMetricsService {
             clinicPolls.set(pollExecutionId, {
                 pollExecutionId,
                 clinicId,
+                kind,
                 startedAt: Date.now(),
                 doctoraliaCallCount: 0,
                 vismedCallCount: 0,
                 reconciliationCount: 0,
+                notificationsReceived: 0,
+                notificationsAccepted: 0,
+                notificationsRejected: 0,
+                jobsInserted: 0,
+                jobsDeduplicated: 0,
+                enqueueErrors: 0,
             });
 
             return overlapEvent;
@@ -1016,6 +1114,30 @@ export class DoctoraliaMetricsService {
                 OVERLAPPING_POLL_COUNT: this.totalOverlapCount,
                 MAX_CONCURRENT_POLLS: this.maxConcurrentPolls,
                 recentOverlaps: this.overlapEvents.slice(-10),
+                notificationIngestion: {
+                    received: this.completedPolls.reduce((sum, p) => sum + p.notificationsReceived, 0),
+                    accepted: this.completedPolls.reduce((sum, p) => sum + p.notificationsAccepted, 0),
+                    rejected: this.completedPolls.reduce((sum, p) => sum + p.notificationsRejected, 0),
+                    inserted: this.completedPolls.reduce((sum, p) => sum + p.jobsInserted, 0),
+                    deduplicated: this.completedPolls.reduce((sum, p) => sum + p.jobsDeduplicated, 0),
+                    enqueueErrors: this.completedPolls.reduce((sum, p) => sum + p.enqueueErrors, 0),
+                    singleFlightSkips: this.notificationPollSingleFlightSkips,
+                    recentCycles: this.completedPolls
+                        .filter(p => p.kind === 'NOTIFICATIONS')
+                        .slice(-20)
+                        .map(p => ({
+                            pollExecutionId: p.pollExecutionId,
+                            clinicId: p.clinicId,
+                            startedAt: p.startedAt,
+                            endedAt: p.endedAt,
+                            received: p.notificationsReceived,
+                            accepted: p.notificationsAccepted,
+                            rejected: p.notificationsRejected,
+                            inserted: p.jobsInserted,
+                            deduplicated: p.jobsDeduplicated,
+                            enqueueErrors: p.enqueueErrors,
+                        })),
+                },
             },
             appointments: {
                 totalRequests: uiEvents.length,
@@ -1038,6 +1160,11 @@ export class DoctoraliaMetricsService {
             },
             // WP-02 P2c + WP-04: Guard de concorrência por clínica (todos os cruzamentos)
             concurrencyGuard: { ...this.concurrencySkipCounts },
+            safetySweepRetry: { ...this.safetySweepRetryStats },
+            bookingReservationErrors: {
+                total: this.bookingReservationErrorStats.total,
+                byCode: { ...this.bookingReservationErrorStats.byCode },
+            },
             // WP-14: retries transitórios (WP-07) — seção aditiva, nada renomeado.
             retry: this.getTransientRetryStats(),
             // WP-14: backpressure da fila HIGH/LOW (WP-08B) — seção aditiva.
@@ -1068,6 +1195,10 @@ export class DoctoraliaMetricsService {
 
     getMaxConcurrentPolls(): number {
         return this.maxConcurrentPolls;
+    }
+
+    getCompletedPolls(): readonly PollExecution[] {
+        return this.completedPolls;
     }
 
     /** Sanitiza endpoint: substitui IDs numéricos por :id. Exposto para uso do client. */
