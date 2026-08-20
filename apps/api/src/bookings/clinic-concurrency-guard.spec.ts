@@ -1,7 +1,8 @@
 /**
- * WP-02 P2c — Guard de Concorrência entre Polling e Safety Sweep
+ * WP-02 P2c + Task 223 — Guard de Concorrência entre Polling e Safety Sweep
  *
- * Cobre os 12 cenários obrigatórios da especificação.
+ * Task 223: POLLING e SAFETY_SWEEP podem coexistir em qualquer ordem.
+ * Duplicata do mesmo ator bloqueia. GLOBAL_SYNC/SLOT_SYNC conflitam com tudo.
  */
 import { ClinicConcurrencyGuard } from './clinic-concurrency-guard';
 import { DoctoraliaMetricsService, getDoctoraliaMetricsService } from '../metrics/doctoralia-metrics.service';
@@ -19,16 +20,14 @@ function makeMetrics() {
 }
 
 /**
- * Simula pollVismedClinic com o guard integrado:
- * retorna true se o poll executou, false se foi descartado.
- * `body` é assíncrono para permitir simular delays/exceptions.
+ * Simula pollVismedClinic com o guard integrado.
+ * Task 223: sem pre-check isActive(SAFETY_SWEEP) — polling e sweep podem coexistir.
  */
 async function runPoll(
     guard: ClinicConcurrencyGuard,
     clinicId: string,
     body: () => Promise<void> = async () => {},
 ): Promise<boolean> {
-    if (guard.isActive(clinicId, 'SAFETY_SWEEP')) return false;
     if (!guard.tryAcquire(clinicId, 'POLLING')) return false;
     try {
         await body();
@@ -39,15 +38,14 @@ async function runPoll(
 }
 
 /**
- * Simula a execução de sweepClinic dentro do laço de runSweepAllClinics:
- * retorna true se o sweep executou, false se foi descartado.
+ * Simula a execução de sweepClinic dentro do laço de runSweepAllClinics.
+ * Task 223: sem pre-check isActive(POLLING) — polling e sweep podem coexistir.
  */
 async function runSweep(
     guard: ClinicConcurrencyGuard,
     clinicId: string,
     body: () => Promise<void> = async () => {},
 ): Promise<boolean> {
-    if (guard.isActive(clinicId, 'POLLING')) return false;
     if (!guard.tryAcquire(clinicId, 'SAFETY_SWEEP')) return false;
     try {
         await body();
@@ -113,28 +111,101 @@ describe('ClinicConcurrencyGuard — guard unitário', () => {
         expect(() => guard.release('clinic-A', 'POLLING')).not.toThrow();
     });
 
-    // Exclusão cruzada — POLLING ativo bloqueia SAFETY_SWEEP
-    it('exclusão cruzada — tryAcquire SAFETY_SWEEP retorna false com POLLING ativo', () => {
+    // Task 223: POLLING e SAFETY_SWEEP podem COEXISTIR
+    it('Task 223 — POLLING e SAFETY_SWEEP podem coexistir (tryAcquire SAFETY_SWEEP com POLLING ativo retorna true)', () => {
         const guard = makeGuard();
         expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(true);
-        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(false);
+        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(true);
+        expect(guard.isActive('clinic-A', 'POLLING')).toBe(true);
+        expect(guard.isActive('clinic-A', 'SAFETY_SWEEP')).toBe(true);
+        guard.release('clinic-A', 'POLLING');
+        guard.release('clinic-A', 'SAFETY_SWEEP');
+    });
+
+    it('Task 223 — SAFETY_SWEEP e POLLING podem coexistir (tryAcquire POLLING com SWEEP ativo retorna true)', () => {
+        const guard = makeGuard();
+        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(true);
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(true);
+        expect(guard.isActive('clinic-A', 'SAFETY_SWEEP')).toBe(true);
+        expect(guard.isActive('clinic-A', 'POLLING')).toBe(true);
+        guard.release('clinic-A', 'SAFETY_SWEEP');
         guard.release('clinic-A', 'POLLING');
     });
 
-    // Exclusão cruzada — SAFETY_SWEEP ativo bloqueia POLLING
-    it('exclusão cruzada — tryAcquire POLLING retorna false com SAFETY_SWEEP ativo', () => {
+    // Duplicata do mesmo ator ainda bloqueia
+    it('duplicata — segundo POLLING bloqueia com POLLING ativo (mesma clínica)', () => {
         const guard = makeGuard();
-        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(true);
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(true);
         expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(false);
-        guard.release('clinic-A', 'SAFETY_SWEEP');
+        guard.release('clinic-A', 'POLLING');
     });
 
-    // Dois Safety Sweeps — segundo retorna false
-    it('segundo tryAcquire SAFETY_SWEEP na mesma clínica retorna false (SKIP)', () => {
+    it('duplicata — segundo SAFETY_SWEEP bloqueia com SAFETY_SWEEP ativo (mesma clínica)', () => {
         const guard = makeGuard();
         expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(true);
         expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(false);
         guard.release('clinic-A', 'SAFETY_SWEEP');
+    });
+
+    // Task 223: terceiro SWEEP com [POLLING+SWEEP] ativos é bloqueado por SWEEP (duplicata)
+    it('Task 223 — terceiro SWEEP com [POLLING+SWEEP] ativos é bloqueado (getBlockReason = SAFETY_SWEEP)', () => {
+        const guard = makeGuard();
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(true);
+        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(true);
+        // Terceiro: sweep duplicado
+        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(false);
+        expect(guard.getBlockReason('clinic-A', 'SAFETY_SWEEP')).toBe('SAFETY_SWEEP');
+        guard.release('clinic-A', 'POLLING');
+        guard.release('clinic-A', 'SAFETY_SWEEP');
+    });
+
+    // Task 223: terceiro POLL com [POLLING+SWEEP] ativos é bloqueado por POLLING (duplicata)
+    it('Task 223 — terceiro POLL com [POLLING+SWEEP] ativos é bloqueado (getBlockReason = POLLING)', () => {
+        const guard = makeGuard();
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(true);
+        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(true);
+        // Terceiro: poll duplicado
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(false);
+        expect(guard.getBlockReason('clinic-A', 'POLLING')).toBe('POLLING');
+        guard.release('clinic-A', 'POLLING');
+        guard.release('clinic-A', 'SAFETY_SWEEP');
+    });
+
+    it('Task 223 — ordem SWEEP→POLL também reporta POLLING para o terceiro poll', () => {
+        const guard = makeGuard();
+        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(true);
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(true);
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(false);
+        expect(guard.getBlockReason('clinic-A', 'POLLING')).toBe('POLLING');
+        guard.release('clinic-A', 'POLLING');
+        guard.release('clinic-A', 'SAFETY_SWEEP');
+    });
+
+    // Release parcial: ao liberar apenas um dos coexistentes, o outro continua
+    it('Task 223 — release de POLLING com SWEEP ainda ativo: SWEEP permanece ativo', () => {
+        const guard = makeGuard();
+        guard.tryAcquire('clinic-A', 'POLLING');
+        guard.tryAcquire('clinic-A', 'SAFETY_SWEEP');
+        guard.release('clinic-A', 'POLLING');
+        expect(guard.isActive('clinic-A', 'POLLING')).toBe(false);
+        expect(guard.isActive('clinic-A', 'SAFETY_SWEEP')).toBe(true);
+        // Após liberar POLLING, novo POLLING pode entrar (SWEEP não bloqueia POLLING)
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(true);
+        guard.release('clinic-A', 'POLLING');
+        guard.release('clinic-A', 'SAFETY_SWEEP');
+    });
+
+    it('Task 223 — release de SAFETY_SWEEP com POLLING ainda ativo: POLLING permanece ativo', () => {
+        const guard = makeGuard();
+        guard.tryAcquire('clinic-A', 'POLLING');
+        guard.tryAcquire('clinic-A', 'SAFETY_SWEEP');
+        guard.release('clinic-A', 'SAFETY_SWEEP');
+        expect(guard.isActive('clinic-A', 'SAFETY_SWEEP')).toBe(false);
+        expect(guard.isActive('clinic-A', 'POLLING')).toBe(true);
+        // Novo SWEEP pode entrar
+        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(true);
+        guard.release('clinic-A', 'SAFETY_SWEEP');
+        guard.release('clinic-A', 'POLLING');
     });
 
     // Release de POLLING → SAFETY_SWEEP pode adquirir depois
@@ -245,36 +316,64 @@ describe('ClinicConcurrencyGuard — integração Polling × Polling', () => {
     });
 });
 
-describe('ClinicConcurrencyGuard — integração Polling × Safety Sweep', () => {
-    // Cenário 5: Safety Sweep é SKIP quando Polling ativo
-    it('cenário 5 — sweep é SKIP quando polling da mesma clínica está ativo', async () => {
+describe('ClinicConcurrencyGuard — integração Polling × Safety Sweep (Task 223: coexistência)', () => {
+    // Task 223: Sweep pode rodar mesmo com Polling ativo
+    it('Task 223 — sweep EXECUTA (não é SKIP) quando polling da mesma clínica está ativo', async () => {
         const guard = makeGuard();
         guard.tryAcquire('clinic-A', 'POLLING');
 
         const body = jest.fn(async () => {});
         const ran = await runSweep(guard, 'clinic-A', body);
 
-        expect(ran).toBe(false);
-        expect(body).not.toHaveBeenCalled();
+        expect(ran).toBe(true);
+        expect(body).toHaveBeenCalledTimes(1);
 
         guard.release('clinic-A', 'POLLING');
     });
 
-    // Cenário 6: Polling é SKIP quando Safety Sweep ativo
-    it('cenário 6 — polling é SKIP quando sweep da mesma clínica está ativo', async () => {
+    // Task 223: Poll pode rodar mesmo com Sweep ativo
+    it('Task 223 — polling EXECUTA (não é SKIP) quando sweep da mesma clínica está ativo', async () => {
         const guard = makeGuard();
         guard.tryAcquire('clinic-A', 'SAFETY_SWEEP');
 
         const body = jest.fn(async () => {});
         const ran = await runPoll(guard, 'clinic-A', body);
 
-        expect(ran).toBe(false);
-        expect(body).not.toHaveBeenCalled();
+        expect(ran).toBe(true);
+        expect(body).toHaveBeenCalledTimes(1);
 
         guard.release('clinic-A', 'SAFETY_SWEEP');
     });
 
-    // Cenário 7: Safety Sweep de outra clínica continua funcionando
+    // Task 223: Poll e Sweep coexistem concorrentemente
+    it('Task 223 — poll e sweep executam simultaneamente (ambos ran=true)', async () => {
+        const guard = makeGuard();
+        let resolvePoll!: () => void;
+        let resolveSweep!: () => void;
+        const pollBlock = new Promise<void>(res => (resolvePoll = res));
+        const sweepBlock = new Promise<void>(res => (resolveSweep = res));
+
+        const pollBody = jest.fn(() => pollBlock);
+        const sweepBody = jest.fn(() => sweepBlock);
+
+        const pollPromise = runPoll(guard, 'clinic-A', pollBody);
+        const sweepPromise = runSweep(guard, 'clinic-A', sweepBody);
+
+        // Ambos devem estar ativos simultaneamente
+        expect(guard.isActive('clinic-A', 'POLLING')).toBe(true);
+        expect(guard.isActive('clinic-A', 'SAFETY_SWEEP')).toBe(true);
+
+        resolvePoll();
+        resolveSweep();
+        const pollRan = await pollPromise;
+        const sweepRan = await sweepPromise;
+        expect(pollRan).toBe(true);
+        expect(sweepRan).toBe(true);
+        expect(pollBody).toHaveBeenCalledTimes(1);
+        expect(sweepBody).toHaveBeenCalledTimes(1);
+    });
+
+    // Cenário 5 (atualizado Task 223): Safety Sweep de outra clínica continua funcionando
     it('cenário 7 — sweep de clínica B executa normalmente enquanto clínica A tem polling ativo', async () => {
         const guard = makeGuard();
         guard.tryAcquire('clinic-A', 'POLLING');
@@ -328,6 +427,21 @@ describe('ClinicConcurrencyGuard — liberação em exceção', () => {
         const ran = await runSweep(guard, 'clinic-A', bodyNext);
         expect(ran).toBe(true);
         expect(bodyNext).toHaveBeenCalledTimes(1);
+    });
+
+    // Task 223: exception em poll não afeta sweep coexistente
+    it('Task 223 — exception em poll com sweep coexistente: sweep continua ativo e poll é liberado', async () => {
+        const guard = makeGuard();
+        guard.tryAcquire('clinic-A', 'SAFETY_SWEEP');
+
+        await expect(
+            runPoll(guard, 'clinic-A', async () => { throw new Error('poll crashed'); }),
+        ).rejects.toThrow('poll crashed');
+
+        expect(guard.isActive('clinic-A', 'POLLING')).toBe(false);
+        expect(guard.isActive('clinic-A', 'SAFETY_SWEEP')).toBe(true);
+
+        guard.release('clinic-A', 'SAFETY_SWEEP');
     });
 });
 
@@ -403,50 +517,67 @@ describe('ClinicConcurrencyGuard — métricas', () => {
     });
 });
 
-// Cenário 12 (corrigido): POLLING e SAFETY_SWEEP NÃO podem coexistir na mesma clínica
-describe('cenário 12 — exclusão mútua total: POLLING e SAFETY_SWEEP nunca coexistem na mesma clínica', () => {
-    it('segundo subsistema NÃO adquire enquanto o primeiro está ativo', () => {
+// Task 223 (cenário 12 atualizado): POLLING e SAFETY_SWEEP PODEM coexistir;
+// GLOBAL_SYNC e SLOT_SYNC conflitam com tudo.
+describe('cenário 12 — Task 223: POLLING e SAFETY_SWEEP coexistem; GLOBAL_SYNC/SLOT_SYNC conflitam com tudo', () => {
+    it('POLLING + SAFETY_SWEEP coexistem (ambos podem adquirir)', () => {
         const guard = makeGuard();
 
         expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(true);
-        // ANTES este cenário permitia a coexistência — agora deve ser rejeitada.
-        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(false);
+        // Task 223: SAFETY_SWEEP pode adquirir com POLLING ativo
+        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(true);
 
         expect(guard.isActive('clinic-A', 'POLLING')).toBe(true);
-        expect(guard.isActive('clinic-A', 'SAFETY_SWEEP')).toBe(false);
+        expect(guard.isActive('clinic-A', 'SAFETY_SWEEP')).toBe(true);
 
         guard.release('clinic-A', 'POLLING');
         expect(guard.isActive('clinic-A', 'POLLING')).toBe(false);
+        expect(guard.isActive('clinic-A', 'SAFETY_SWEEP')).toBe(true);
 
-        // Após o release, o outro subsistema adquire normalmente.
-        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(true);
         guard.release('clinic-A', 'SAFETY_SWEEP');
         expect(guard.isActive('clinic-A', 'SAFETY_SWEEP')).toBe(false);
     });
 
-    it('WP-04: guard cobre também GLOBAL_SYNC e SLOT_SYNC (Global Sync deixou de ficar fora do guard)', () => {
-        // ANTES (WP-02 P2c) o Global Sync ficava explicitamente fora do guard.
-        // Agora GLOBAL_SYNC e SLOT_SYNC fazem parte do union e da exclusão mútua.
+    it('WP-04: GLOBAL_SYNC e SLOT_SYNC conflitam com POLLING, SAFETY_SWEEP e entre si', () => {
         const guard = makeGuard();
         expect(guard.tryAcquire('clinic-A', 'GLOBAL_SYNC')).toBe(true);
         expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(false);
         expect(guard.tryAcquire('clinic-A', 'SLOT_SYNC')).toBe(false);
+        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(false);
         guard.release('clinic-A', 'GLOBAL_SYNC');
+
         expect(guard.tryAcquire('clinic-A', 'SLOT_SYNC')).toBe(true);
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(false);
+        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(false);
+        expect(guard.tryAcquire('clinic-A', 'GLOBAL_SYNC')).toBe(false);
         guard.release('clinic-A', 'SLOT_SYNC');
+    });
+
+    it('GLOBAL_SYNC bloqueia com [POLLING+SWEEP] coexistindo', () => {
+        const guard = makeGuard();
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(true);
+        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(true);
+        // GLOBAL_SYNC conflita com tudo — não pode entrar
+        expect(guard.tryAcquire('clinic-A', 'GLOBAL_SYNC')).toBe(false);
+        guard.release('clinic-A', 'POLLING');
+        guard.release('clinic-A', 'SAFETY_SWEEP');
+    });
+
+    it('SLOT_SYNC bloqueia com [POLLING+SWEEP] coexistindo', () => {
+        const guard = makeGuard();
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(true);
+        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(true);
+        expect(guard.tryAcquire('clinic-A', 'SLOT_SYNC')).toBe(false);
+        guard.release('clinic-A', 'POLLING');
+        guard.release('clinic-A', 'SAFETY_SWEEP');
     });
 });
 
-// Cenário 14: reprodução explícita da race isActive() → tryAcquire()
-describe('race condition — aquisições concorrentes de subsistemas diferentes na mesma clínica', () => {
-    it('somente UM subsistema obtém o guard mesmo quando ambos passam pelo isActive() antes de qualquer tryAcquire()', async () => {
+// Cenário 14 (atualizado Task 223): com nova matriz, POLLING+SWEEP podem coexistir
+describe('Task 223 — aquisições concorrentes POLLING × SWEEP na mesma clínica', () => {
+    it('POLLING e SWEEP concorrentes: ambos passam pelo tryAcquire com sucesso (coexistência)', async () => {
         const guard = makeGuard();
 
-        // Reproduz a interleaving da auditoria:
-        // 1. Polling verifica isActive(SAFETY_SWEEP) → false
-        // 2. Sweep verifica isActive(POLLING) → false
-        // 3. Polling chama tryAcquire(POLLING)
-        // 4. Sweep chama tryAcquire(SAFETY_SWEEP)
         const pollSawSweepActive = guard.isActive('clinic-A', 'SAFETY_SWEEP');
         const sweepSawPollActive = guard.isActive('clinic-A', 'POLLING');
         expect(pollSawSweepActive).toBe(false);
@@ -455,15 +586,15 @@ describe('race condition — aquisições concorrentes de subsistemas diferentes
         const pollAcquired = guard.tryAcquire('clinic-A', 'POLLING');
         const sweepAcquired = guard.tryAcquire('clinic-A', 'SAFETY_SWEEP');
 
-        // Barreira atômica: exatamente um dos dois obtém o guard.
+        // Task 223: ambos adquirem (coexistência)
         expect(pollAcquired).toBe(true);
-        expect(sweepAcquired).toBe(false);
-        expect([pollAcquired, sweepAcquired].filter(Boolean)).toHaveLength(1);
+        expect(sweepAcquired).toBe(true);
 
         guard.release('clinic-A', 'POLLING');
+        guard.release('clinic-A', 'SAFETY_SWEEP');
     });
 
-    it('duas execuções concorrentes (poll × sweep) na mesma clínica — somente uma executa o corpo', async () => {
+    it('duas execuções concorrentes (poll × sweep) na mesma clínica — AMBAS executam o corpo (Task 223)', async () => {
         const guard = makeGuard();
         let resolvePoll!: () => void;
         const pollBlock = new Promise<void>(res => (resolvePoll = res));
@@ -475,14 +606,25 @@ describe('race condition — aquisições concorrentes de subsistemas diferentes
         const pollPromise = runPoll(guard, 'clinic-A', pollBody);
         const sweepPromise = runSweep(guard, 'clinic-A', sweepBody);
 
+        // Sweep não precisa esperar poll terminar
         const sweepRan = await sweepPromise;
-        expect(sweepRan).toBe(false);
-        expect(sweepBody).not.toHaveBeenCalled();
+        expect(sweepRan).toBe(true);
+        expect(sweepBody).toHaveBeenCalledTimes(1);
 
         resolvePoll();
         const pollRan = await pollPromise;
         expect(pollRan).toBe(true);
         expect(pollBody).toHaveBeenCalledTimes(1);
+    });
+
+    it('duplicata POLLING com [POLLING+SWEEP] ativos: apenas o duplicado é rejeitado', async () => {
+        const guard = makeGuard();
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(true);
+        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(true);
+        // Terceiro: POLLING duplicado é bloqueado
+        expect(guard.tryAcquire('clinic-A', 'POLLING')).toBe(false);
+        guard.release('clinic-A', 'POLLING');
+        guard.release('clinic-A', 'SAFETY_SWEEP');
     });
 });
 
@@ -518,6 +660,21 @@ describe('Task 133 — reserva de prioridade do Global Sync', () => {
         // Motivo inequívoco: reserva, não subsistema ativo
         expect(guard.getActiveSubsystem('clinic-A')).toBeNull();
         expect(guard.getBlockReason('clinic-A')).toBe('GLOBAL_SYNC_PENDING');
+    });
+
+    it('Task 223 + Task 133: GLOBAL_SYNC_PENDING bloqueia POLLING/SWEEP mesmo com par compatível ativo', () => {
+        const guard = makeGuard();
+        // POLLING ativo (coexistente com SWEEP)
+        guard.tryAcquire('clinic-A', 'POLLING');
+        // Reserva Global Sync registrada enquanto POLLING está ativo
+        guard.requestPriority('clinic-A', () => {});
+
+        // SAFETY_SWEEP tenta entrar: bloqueado pela reserva (não pelo POLLING)
+        expect(guard.tryAcquire('clinic-A', 'SAFETY_SWEEP')).toBe(false);
+        expect(guard.getBlockReason('clinic-A', 'SAFETY_SWEEP')).toBe('GLOBAL_SYNC_PENDING');
+
+        guard.release('clinic-A', 'POLLING');
+        guard.clearPriority('clinic-A');
     });
 
     it('getBlockReason prioriza o subsistema ativo sobre a reserva', () => {
@@ -756,5 +913,25 @@ describe('Task 133 — reserva de prioridade do Global Sync', () => {
         metrics.reset();
         expect(metrics.getConcurrencySkipCounts().POLL_SKIPPED_GLOBAL_SYNC_PENDING).toBe(0);
         expect(metrics.getConcurrencySkipCounts().GLOBAL_SYNC_RESERVATION_EXPIRED).toBe(0);
+    });
+
+    // Task 223: callback de reserva com POLLING+SWEEP ativos dispara quando AMBOS terminam
+    it('Task 223 + Task 133: callback de reserva dispara quando último exclusivo (SWEEP) termina com POLLING já liberado', async () => {
+        const guard = makeGuard();
+        const cb = jest.fn();
+
+        guard.tryAcquire('clinic-A', 'POLLING');
+        guard.tryAcquire('clinic-A', 'SAFETY_SWEEP');
+        guard.requestPriority('clinic-A', cb);
+
+        // Libera POLLING — SWEEP ainda ativo, callback NÃO dispara ainda
+        guard.release('clinic-A', 'POLLING');
+        await flushImmediates();
+        expect(cb).not.toHaveBeenCalled();
+
+        // Libera SWEEP — agora sem exclusivos ativos, callback dispara
+        guard.release('clinic-A', 'SAFETY_SWEEP');
+        await flushImmediates();
+        expect(cb).toHaveBeenCalledTimes(1);
     });
 });

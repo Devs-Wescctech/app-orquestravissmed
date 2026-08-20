@@ -49,17 +49,16 @@ async function runDoctoraliaPoll(
     }
 }
 
-/** Espelha o laço do Safety Sweep para exclusão mútua bidirecional. */
+/**
+ * Espelha o laço do Safety Sweep pós-Task 223.
+ * Sem pre-check isActive(POLLING): POLLING e SAFETY_SWEEP podem coexistir.
+ */
 async function runSweep(
     guard: ClinicConcurrencyGuard,
     metrics: DoctoraliaMetricsService,
     clinicId: string,
     body: () => Promise<void> = async () => {},
 ): Promise<boolean> {
-    if (guard.isActive(clinicId, 'POLLING')) {
-        metrics.recordConcurrencySkip('SWEEP_SKIPPED_POLL_ACTIVE', clinicId);
-        return false;
-    }
     if (!guard.tryAcquire(clinicId, 'SAFETY_SWEEP')) {
         metrics.recordConcurrencySkip('SWEEP_SKIPPED_SWEEP_ACTIVE', clinicId);
         return false;

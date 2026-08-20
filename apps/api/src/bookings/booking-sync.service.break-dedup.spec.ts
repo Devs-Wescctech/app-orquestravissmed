@@ -121,6 +121,8 @@ function buildService(overrides: {
         null as any, // queueService
         rateLimiter as any,
         null as any, // matchingEngine
+        null as any, // concurrencyGuard
+        null as any, // bookingClaimService
     );
 
     return { service, prisma, client, addCalendarBreak, getCalendarBreaks, getCalendarBreak, moveCalendarBreak };

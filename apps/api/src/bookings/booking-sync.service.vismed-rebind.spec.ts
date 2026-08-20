@@ -20,6 +20,7 @@ const originalRecord = (extra: any = {}) => ({
     lastMoveAt: null,
     lastMoveTargetStartAt: null,
     createdAt: new Date(Date.now() - 60_000),
+    updatedAt: new Date('2026-08-20T11:59:00.000Z'),
     ...extra,
 });
 
@@ -65,6 +66,7 @@ function buildService(options: {
     confirmationError?: Error;
     transactionError?: Error;
     transactionCandidate?: any;
+    fenceReads?: any[];
 } = {}) {
     const original = options.original ?? originalRecord();
     const candidates = options.candidates ?? [];
@@ -90,8 +92,13 @@ function buildService(options: {
         findMany: jest.fn()
             .mockResolvedValueOnce([original])
             .mockResolvedValueOnce(candidates),
+        findUnique: jest.fn(),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
     };
+    const fenceReads = options.fenceReads ? [...options.fenceReads] : null;
+    bookingSync.findUnique.mockImplementation(() =>
+        Promise.resolve(fenceReads ? (fenceReads.shift() ?? null) : original),
+    );
     const prisma = {
         bookingSync,
         $transaction: options.transactionError
@@ -107,6 +114,7 @@ function buildService(options: {
         prisma,
         null as any,
         vismedService as any,
+        null as any,
         null as any,
         null as any,
         null as any,
@@ -150,7 +158,12 @@ describe('BookingSyncService — rebind seguro de ID VisMed desaparecido', () =>
         expect(tx.$queryRaw.mock.invocationCallOrder[0])
             .toBeLessThan(tx.bookingSync.findUnique.mock.invocationCallOrder[0]);
         expect(tx.bookingSync.update).toHaveBeenCalledWith({
-            where: { id: 'original-sync' },
+            where: expect.objectContaining({
+                id: 'original-sync',
+                vismedAppointmentId: '4073225',
+                status: 'BOOKED',
+                updatedAt: originalRecord().updatedAt,
+            }),
             data: expect.objectContaining({
                 vismedAppointmentId: '4073305',
                 status: 'BOOKED',
@@ -378,5 +391,99 @@ describe('BookingSyncService — rebind seguro de ID VisMed desaparecido', () =>
 
         expect(prisma.$transaction).not.toHaveBeenCalled();
         expect(cancellationCalls(bookingSync)).toHaveLength(1);
+    });
+
+    it('registro alterado depois do snapshot não entra no rebind nem no cancelamento', async () => {
+        const original = originalRecord();
+        const changed = originalRecord({
+            updatedAt: new Date(original.updatedAt.getTime() + 1_000),
+        });
+        const { service, bookingSync, prisma, propagate, syncBreak } = buildService({
+            original,
+            candidates: [replacementRecord()],
+            confirmation: [confirmedAppointment()],
+            fenceReads: [changed],
+        });
+
+        await reconcile(service);
+
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+        expect(cancellationCalls(bookingSync)).toHaveLength(0);
+        expect(propagate).not.toHaveBeenCalled();
+        expect(syncBreak).not.toHaveBeenCalled();
+    });
+
+    it('alteração entre a seleção de replacement e a mutação destrutiva adia o ciclo', async () => {
+        const original = originalRecord();
+        const changed = originalRecord({
+            status: 'CONFIRMED',
+            updatedAt: new Date(original.updatedAt.getTime() + 2_000),
+        });
+        const { service, bookingSync, propagate, syncBreak } = buildService({
+            original,
+            confirmation: [],
+            fenceReads: [original, changed],
+        });
+
+        await reconcile(service);
+
+        expect(cancellationCalls(bookingSync)).toHaveLength(0);
+        expect(propagate).not.toHaveBeenCalled();
+        expect(syncBreak).not.toHaveBeenCalled();
+    });
+
+    it('fence atômico que perde a corrida não propaga cancelamento nem remove break', async () => {
+        const { service, bookingSync, propagate, syncBreak } = buildService();
+        bookingSync.updateMany.mockResolvedValueOnce({ count: 0 });
+
+        await reconcile(service);
+
+        expect(cancellationCalls(bookingSync)).toHaveLength(1);
+        expect(propagate).not.toHaveBeenCalled();
+        expect(syncBreak).not.toHaveBeenCalled();
+    });
+
+    it('snapshot vazio exclui registro criado depois do boundary', async () => {
+        const { service, bookingSync, propagate, syncBreak } = buildService();
+
+        await (service as any).reconcileDisappearedFromVismed(
+            'clinic-1',
+            new Set<string>(),
+            new Date('2026-08-19T00:00:00.000Z'),
+            new Date('2026-08-21T23:59:59.999Z'),
+            [{ vismedId: 1 }],
+            undefined,
+            '19/08/2026',
+            '21/08/2026',
+            [],
+        );
+
+        expect(bookingSync.findMany).not.toHaveBeenCalled();
+        expect(cancellationCalls(bookingSync)).toHaveLength(0);
+        expect(propagate).not.toHaveBeenCalled();
+        expect(syncBreak).not.toHaveBeenCalled();
+    });
+
+    it('captura o universo destrutivo com createdAt/updatedAt anteriores ao boundary', async () => {
+        const { service, bookingSync } = buildService();
+        const boundary = new Date('2026-08-20T11:30:00.000Z');
+        bookingSync.findMany.mockReset().mockResolvedValue([originalRecord()]);
+
+        await (service as any).captureVismedDisappearanceSnapshot(
+            'clinic-1',
+            new Date('2026-08-19T00:00:00.000Z'),
+            new Date('2026-08-21T23:59:59.999Z'),
+            boundary,
+        );
+
+        expect(bookingSync.findMany).toHaveBeenCalledWith({
+            where: expect.objectContaining({
+                clinicId: 'clinic-1',
+                createdAt: { lte: boundary },
+                updatedAt: { lte: boundary },
+                vismedAppointmentId: { not: null },
+                status: { in: ['BOOKED', 'CONFIRMED'] },
+            }),
+        });
     });
 });

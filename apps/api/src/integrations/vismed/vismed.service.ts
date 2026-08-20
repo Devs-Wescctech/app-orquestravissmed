@@ -14,6 +14,14 @@ export class VismedTimeoutError extends Error {
     }
 }
 
+export class VismedRequestAbortedError extends Error {
+    readonly code = 'VISMED_REQUEST_ABORTED';
+    constructor() {
+        super('VisMed HTTP request aborted because the booking claim session was lost');
+        this.name = 'VismedRequestAbortedError';
+    }
+}
+
 // Timeouts padrão (sempre muito menores que o lease de 5min da fila).
 const DEFAULT_READ_TIMEOUT_MS = 30_000;
 const DEFAULT_WRITE_TIMEOUT_MS = 60_000;
@@ -69,8 +77,20 @@ export class VismedService {
         return `${base}/api/v1.0/${path}`;
     }
 
-    private requestData(path: string, baseUrl?: string): Promise<any> {
+    private bindAbortSignal(req: http.ClientRequest, signal?: AbortSignal): void {
+        if (!signal) return;
+        const abort = () => req.destroy(new VismedRequestAbortedError());
+        if (signal.aborted) {
+            abort();
+            return;
+        }
+        signal.addEventListener('abort', abort, { once: true });
+        req.once('close', () => signal.removeEventListener('abort', abort));
+    }
+
+    private requestData(path: string, baseUrl?: string, signal?: AbortSignal): Promise<any> {
         return new Promise((resolve, reject) => {
+            if (signal?.aborted) return reject(new VismedRequestAbortedError());
             const url = this.buildApiUrl(path, baseUrl);
             this.logger.log(`[VISMED-API] GET ${url}`);
 
@@ -97,6 +117,7 @@ export class VismedService {
             req.on('error', (e) => {
                 reject(e);
             });
+            this.bindAbortSignal(req, signal);
             this.applyTimeout(req, url, this.readTimeoutMs);
         });
     }
@@ -149,8 +170,9 @@ export class VismedService {
         });
     }
 
-    private postData(path: string, body: Record<string, any>, baseUrl?: string): Promise<any> {
+    private postData(path: string, body: Record<string, any>, baseUrl?: string, signal?: AbortSignal): Promise<any> {
         return new Promise((resolve, reject) => {
+            if (signal?.aborted) return reject(new VismedRequestAbortedError());
             const url = this.buildApiUrl(path, baseUrl);
             const postBody = JSON.stringify(body);
             this.logger.log(`[VISMED-API] POST ${url}`);
@@ -184,6 +206,7 @@ export class VismedService {
             });
 
             req.on('error', (e) => { reject(e); });
+            this.bindAbortSignal(req, signal);
             this.applyTimeout(req, url, this.writeTimeoutMs);
             req.write(postBody);
             req.end();
@@ -287,7 +310,11 @@ export class VismedService {
         }
     }
 
-    async getAgendamentos(unidade: number, baseUrl?: string, options?: { dataini?: string; datafim?: string; profissional?: number }): Promise<any[]> {
+    async getAgendamentos(
+        unidade: number,
+        baseUrl?: string,
+        options?: { dataini?: string; datafim?: string; profissional?: number; signal?: AbortSignal },
+    ): Promise<any[]> {
         try {
             let path = `get-agendamento-filtros?unidade=${unidade}`;
             if (options?.dataini) path += `&dataini=${encodeURIComponent(options.dataini)}`;
@@ -296,7 +323,7 @@ export class VismedService {
             this.logger.log(`Buscando agendamentos VisMed: unidade=${unidade}`);
 
             const actualBase = baseUrl || 'https://app.vissmed.com.br/api-vissmed-4';
-            return await this.requestData(path, actualBase);
+            return await this.requestData(path, actualBase, options?.signal);
         } catch (error) {
             this.logger.error(`Erro ao buscar agendamentos VisMed: ${error.message}`);
             throw error;
@@ -332,10 +359,10 @@ export class VismedService {
         cpf?: string;
         data_nascimento?: string;
         sexo?: number;
-    }, baseUrl?: string): Promise<any> {
+    }, baseUrl?: string, signal?: AbortSignal): Promise<any> {
         try {
             this.logger.log(`Criando agendamento VisMed para ${payload.nome} em ${payload.data_agendamento} às ${payload.horarios_profissional}`);
-            return await this.postData('schedule/online/schedule/pacient', payload, baseUrl);
+            return await this.postData('schedule/online/schedule/pacient', payload, baseUrl, signal);
         } catch (error) {
             this.logger.error(`Erro ao criar agendamento VisMed: ${error.message}`);
             throw error;

@@ -162,7 +162,9 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
     }
 
     private recordSweepConflict(clinicId: string): void {
-        const blockReason = this.concurrencyGuard.getBlockReason(clinicId);
+        // Task 223: passa 'SAFETY_SWEEP' como contexto para obter o verdadeiro
+        // ator conflitante (ex.: [POLLING+SWEEP] ativos → motivo é SWEEP, não POLL).
+        const blockReason = this.concurrencyGuard.getBlockReason(clinicId, 'SAFETY_SWEEP');
         if (blockReason === 'GLOBAL_SYNC_PENDING') {
             this.logger.warn(
                 `[SAFETY-SWEEP] SWEEP_SKIPPED_GLOBAL_SYNC_PENDING clinicId=${clinicId} — retry será agendado`,
@@ -199,6 +201,14 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
             this.recordSweepConflict(clinicId);
             this.scheduleSweepRetry(conn, sources, retryAttempt + 1);
             return { ran: false, enqueued: 0 };
+        }
+
+        // Task 223: POLLING e SAFETY_SWEEP podem coexistir. Registra evento técnico
+        // quando a varredura inicia enquanto o polling VisMed está ativo (observabilidade).
+        if (this.concurrencyGuard.isActive(clinicId, 'POLLING')) {
+            this.logger.log(
+                `[SAFETY-SWEEP] SWEEP_STARTED_DURING_POLL clinicId=${clinicId} — varredura iniciada com polling VisMed ativo (coexistência permitida, Task 223)`,
+            );
         }
 
         try {

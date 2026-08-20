@@ -8,11 +8,12 @@ import { QueueService } from './queue.service';
 import { RateLimiterService } from './rate-limiter.service';
 import { ClinicConcurrencyGuard } from './clinic-concurrency-guard';
 import { WebhookController, BookingSyncController } from './webhook.controller';
+import { BookingClaimService } from './booking-claim.service';
 
 @Module({
     imports: [PrismaModule, IntegrationsModule, MappingsModule],
     controllers: [WebhookController, BookingSyncController],
-    providers: [BookingSyncService, BookingSafetySweepService, QueueService, RateLimiterService, ClinicConcurrencyGuard],
-    exports: [BookingSyncService, QueueService, ClinicConcurrencyGuard, RateLimiterService],
+    providers: [BookingSyncService, BookingSafetySweepService, BookingClaimService, QueueService, RateLimiterService, ClinicConcurrencyGuard],
+    exports: [BookingSyncService, BookingClaimService, QueueService, ClinicConcurrencyGuard, RateLimiterService],
 })
 export class BookingsModule {}

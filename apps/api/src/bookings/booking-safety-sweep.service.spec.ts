@@ -168,25 +168,74 @@ describe('BookingSafetySweepService', () => {
         }
     });
 
-    it('runSweepAllClinics adia durante POLLING VisMed e executa um retry quando liberar', async () => {
-        jest.useFakeTimers();
+    // Task 223: POLLING VisMed já NÃO bloqueia o sweep — sweep executa concorrentemente
+    it('Task 223: runSweepAllClinics executa concorrentemente com POLLING VisMed ativo (não adia)', async () => {
         client.getBookings.mockResolvedValue({ _items: [newBooking('777')] });
 
+        // POLLING ativo — sob Task 223, o sweep PODE rodar em paralelo
         concurrencyGuard.tryAcquire('clinic-1', 'POLLING');
         try {
             const result = await service.runSweepAllClinics();
-            expect(result.clinics).toBe(0);
-            expect(result.enqueued).toBe(0);
-            expect(client.getBookings).not.toHaveBeenCalled();
-            expect(getDoctoraliaMetricsService()!.getConcurrencySkipCounts().SWEEP_SKIPPED_POLL_ACTIVE).toBe(1);
-            concurrencyGuard.release('clinic-1', 'POLLING');
-            await jest.advanceTimersByTimeAsync(5_000);
+            // Sweep executa com POLLING ativo (coexistência Task 223)
+            expect(result.clinics).toBe(1);
+            expect(result.enqueued).toBe(1);
             expect(client.getBookings).toHaveBeenCalledTimes(1);
+            // Sem retry agendado — não houve conflito
             expect((service as any).pendingSweepRetries.size).toBe(0);
+            // Nenhum skip de POLL por SWEEP ou vice-versa
+            const counts = getDoctoraliaMetricsService()!.getConcurrencySkipCounts();
+            expect(counts.SWEEP_SKIPPED_POLL_ACTIVE).toBe(0);
+            expect(counts.POLL_SKIPPED_SWEEP_ACTIVE).toBe(0);
         } finally {
-            service.onModuleDestroy();
-            jest.useRealTimers();
+            concurrencyGuard.release('clinic-1', 'POLLING');
         }
+    });
+
+    // Task 223: log técnico "start-during-poll" quando sweep inicia com polling ativo
+    it('Task 223: sweep loga SWEEP_STARTED_DURING_POLL quando POLLING VisMed está ativo', async () => {
+        client.getBookings.mockResolvedValue({ _items: [] });
+
+        const logSpy = jest.spyOn((service as any).logger, 'log');
+
+        concurrencyGuard.tryAcquire('clinic-1', 'POLLING');
+        try {
+            await service.runSweepAllClinics();
+            const duringPollLog = logSpy.mock.calls.find(
+                call => typeof call[0] === 'string' && call[0].includes('SWEEP_STARTED_DURING_POLL'),
+            );
+            expect(duringPollLog).toBeDefined();
+        } finally {
+            concurrencyGuard.release('clinic-1', 'POLLING');
+        }
+    });
+
+    // Task 223: latch test — sweep descobre e enfileira bookings enquanto polling está ativo
+    it('Task 223 (latch): sweep descobre e enfileira bookings enquanto POLLING VisMed está ativo', async () => {
+        client.getBookings.mockResolvedValue({ _items: [newBooking('LATCH-001')] });
+
+        let sweepResult!: { ran: boolean; enqueued: number };
+        let pollRelease!: () => void;
+        const pollDone = new Promise<void>(res => { pollRelease = res; });
+
+        // Simula POLLING em andamento (não-finalizado) durante toda a varredura
+        concurrencyGuard.tryAcquire('clinic-1', 'POLLING');
+
+        // Inicia o sweep concorrentemente (Task 223: não precisa esperar o poll)
+        const sweepPromise = service.runSweepAllClinics();
+        // Enquanto o poll ainda está "rodando", o sweep pode completar
+        sweepResult = await sweepPromise;
+
+        // O booking foi descoberto e enfileirado mesmo com polling ativo
+        expect(sweepResult.clinics).toBe(1);
+        expect(sweepResult.enqueued).toBe(1);
+        expect(queue.enqueueBatch).toHaveBeenCalledTimes(1);
+        const jobs = queue.enqueueBatch.mock.calls[0][0];
+        expect(jobs[0].dedupKey).toBe('clinic-1:slot-booked:LATCH-001');
+
+        // Poll pode terminar depois sem problemas
+        concurrencyGuard.release('clinic-1', 'POLLING');
+        pollRelease();
+        await pollDone;
     });
 
     it('Task 133: runSweepAllClinics adia com GLOBAL_SYNC_PENDING e recupera após liberar a reserva', async () => {
@@ -259,22 +308,79 @@ describe('BookingSafetySweepService', () => {
         }
     });
 
-    it('startManualSweep adiada por POLLING conclui automaticamente após o conflito', async () => {
-        jest.useFakeTimers();
+    // Task 223: startManualSweep executa imediatamente com POLLING ativo (não adia)
+    it('Task 223: startManualSweep executa imediatamente com POLLING ativo (coexistência)', async () => {
+        client.getBookings.mockResolvedValue({ _items: [newBooking('MANUAL-001')] });
+
         concurrencyGuard.tryAcquire('clinic-1', 'POLLING');
         try {
             const started = service.startManualSweep(conn);
             expect(started.started).toBe(true);
+            // Processa a tarefa fire-and-forget
+            await new Promise(resolve => setImmediate(resolve));
             await Promise.resolve();
-            expect(service.getManualSweepStatus('clinic-1').running).toBe(true);
-            expect(client.getBookings).not.toHaveBeenCalled();
-            concurrencyGuard.release('clinic-1', 'POLLING');
-            await jest.advanceTimersByTimeAsync(5_000);
-            expect(service.getManualSweepStatus('clinic-1').running).toBe(false);
-            expect(client.getBookings).toHaveBeenCalledTimes(1);
+            await Promise.resolve();
+            // O sweep pode rodar concorrentemente com POLLING
+            // Aguarda completar (o sweep é rápido pois não há bloqueio)
+            await new Promise(resolve => setTimeout(resolve, 50));
+            // Sem retry agendado — não houve conflito
+            expect((service as any).pendingSweepRetries.size).toBe(0);
         } finally {
-            service.onModuleDestroy();
-            jest.useRealTimers();
+            concurrencyGuard.release('clinic-1', 'POLLING');
+        }
+    });
+
+    // Cenário grande: ~3000 bookings conhecidos — idempotência funciona em escala
+    it('Task 223 (large known set): ~3000 bookings conhecidos — nenhum é re-enfileirado', async () => {
+        const KNOWN_COUNT = 3000;
+        const knownIds = Array.from({ length: KNOWN_COUNT }, (_, i) => `booking-${i}`);
+        const knownRecords = knownIds.map(id => ({
+            doctoraliaBookingId: id,
+            origin: 'DOCTORALIA',
+            patientName: 'Paciente',
+        }));
+
+        prisma.bookingSync.findMany.mockResolvedValue(knownRecords);
+        // API retorna todos os 3000 bookings conhecidos + 1 novo
+        client.getBookings.mockResolvedValue({
+            _items: [
+                ...knownIds.map(id => newBooking(id)),
+                newBooking('booking-NEW'),
+            ],
+        });
+
+        const enqueued = await service.sweepClinic(conn);
+
+        // Apenas o booking novo é enfileirado
+        expect(enqueued).toBe(1);
+        expect(queue.enqueueBatch).toHaveBeenCalledTimes(1);
+        const jobs = queue.enqueueBatch.mock.calls[0][0];
+        expect(jobs).toHaveLength(1);
+        expect(jobs[0].dedupKey).toBe('clinic-1:slot-booked:booking-NEW');
+    });
+
+    // Task 223: com ~3000 conhecidos e polling ativo, sweep ainda descobre bookings novos
+    it('Task 223 + large set: sweep descobre booking novo com 3000 conhecidos e POLLING ativo', async () => {
+        const KNOWN_COUNT = 3000;
+        const knownIds = Array.from({ length: KNOWN_COUNT }, (_, i) => `known-${i}`);
+        prisma.bookingSync.findMany.mockResolvedValue(
+            knownIds.map(id => ({ doctoraliaBookingId: id, origin: 'DOCTORALIA', patientName: 'X' })),
+        );
+        client.getBookings.mockResolvedValue({
+            _items: [
+                ...knownIds.map(id => newBooking(id)),
+                newBooking('NEW-DURING-POLL'),
+            ],
+        });
+
+        concurrencyGuard.tryAcquire('clinic-1', 'POLLING');
+        try {
+            const result = await service.runSweepAllClinics();
+            expect(result.enqueued).toBe(1);
+            const jobs = queue.enqueueBatch.mock.calls[0][0];
+            expect(jobs[0].dedupKey).toBe('clinic-1:slot-booked:NEW-DURING-POLL');
+        } finally {
+            concurrencyGuard.release('clinic-1', 'POLLING');
         }
     });
 });

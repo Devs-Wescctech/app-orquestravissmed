@@ -1,7 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { EventEmitter } from 'events';
 import * as https from 'https';
-import { VismedService, VismedTimeoutError } from './vismed.service';
+import { VismedRequestAbortedError, VismedService, VismedTimeoutError } from './vismed.service';
 
 jest.mock('https', () => ({
   get: jest.fn(),
@@ -198,6 +198,29 @@ describe('VismedService', () => {
         return req as any;
       });
       await expect((service as any).postData('x', {})).rejects.toThrow('socket hang up');
+    });
+
+    it('AbortSignal destrói a request em voo e rejeita com erro tipado', async () => {
+      const req = new FakeReq();
+      requestSpy.mockImplementation(() => req as any);
+      const controller = new AbortController();
+      const pending = (service as any).postData('x', {}, undefined, controller.signal);
+
+      controller.abort();
+
+      await expect(pending).rejects.toBeInstanceOf(VismedRequestAbortedError);
+      await expect(pending).rejects.toMatchObject({ code: 'VISMED_REQUEST_ABORTED' });
+      expect(req.destroyed).toBe(true);
+    });
+
+    it('AbortSignal já cancelado faz zero request HTTP', async () => {
+      const controller = new AbortController();
+      controller.abort();
+
+      await expect(
+        (service as any).postData('x', {}, undefined, controller.signal),
+      ).rejects.toBeInstanceOf(VismedRequestAbortedError);
+      expect(requestSpy).not.toHaveBeenCalled();
     });
   });
 
