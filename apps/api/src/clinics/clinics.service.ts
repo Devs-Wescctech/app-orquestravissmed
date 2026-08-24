@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { DocplannerService } from '../integrations/docplanner.service';
 import { VismedService } from '../integrations/vismed/vismed.service';
@@ -12,6 +12,20 @@ export class ClinicsService {
         private docplanner: DocplannerService,
         private vismed: VismedService,
     ) { }
+
+    private assertAppointmentFeedModeIsNotOperationallyManaged(integrationArgs: any) {
+        if (
+            integrationArgs
+            && Object.prototype.hasOwnProperty.call(
+                integrationArgs,
+                'vismedAppointmentFeedMode',
+            )
+        ) {
+            throw new BadRequestException(
+                'O modo do feed de agendamentos VisMed ainda não pode ser alterado por API.',
+            );
+        }
+    }
 
     async findAll() {
         return this.prisma.clinic.findMany({
@@ -61,6 +75,7 @@ export class ClinicsService {
 
     async create(data: any) {
         const { integrationArgs, ...clinicData } = data;
+        this.assertAppointmentFeedModeIsNotOperationallyManaged(integrationArgs);
         const clinic = await this.prisma.clinic.create({
             data: { ...clinicData },
         });
@@ -76,6 +91,7 @@ export class ClinicsService {
 
     async update(id: string, data: any) {
         const { integrationArgs, ...clinicData } = data;
+        this.assertAppointmentFeedModeIsNotOperationallyManaged(integrationArgs);
 
         // Filter out relation fields that Prisma won't accept
         const { users, integrations, ...safeData } = clinicData;

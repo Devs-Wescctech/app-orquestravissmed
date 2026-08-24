@@ -81,6 +81,9 @@ model IntegrationConnection {
   // para que UMA autenticação bem-sucedida por dia baste mesmo sob desafio do WAF.
   cachedToken    String?
   tokenExpiresAt DateTime?
+  // Contrato de get-agendamento-filtros por clínica. NULL preserva LEGACY;
+  // somente INCREMENTAL explícito é interpretado pelo polling de agendamentos.
+  vismedAppointmentFeedMode String?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 }

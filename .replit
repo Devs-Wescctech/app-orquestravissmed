@@ -17,6 +17,14 @@ author = "agent"
 task = "workflow.run"
 args = "Start application"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "api-schema-build"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "vismed-feed-regression"
+
 [[workflows.workflow]]
 name = "Start application"
 author = "agent"
@@ -28,6 +36,28 @@ outputType = "webview"
 task = "shell.exec"
 args = "cd apps/api && node dist/main.js & cd apps/web && npm run dev"
 waitForPort = 5000
+
+[[workflows.workflow]]
+name = "api-schema-build"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "cd apps/api && npx prisma validate --schema prisma/schema.prisma && npm run build"
+
+[workflows.workflow.metadata]
+isValidation = true
+
+[[workflows.workflow]]
+name = "vismed-feed-regression"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "cd apps/api && npm test -- --runInBand src/bookings/booking-sync.service.vismed-feed-mode.spec.ts src/clinics/clinics.service.vismed-feed-mode.spec.ts src/bookings/booking-sync.service.vismed-rebind.spec.ts src/bookings/booking-sync.doctoralia-ingestion.spec.ts src/bookings/booking-safety-sweep.service.spec.ts src/bookings/doctoralia-poll-concurrency.spec.ts src/bookings/clinic-concurrency-guard.spec.ts src/bookings/wp04-global-slot-sync-concurrency.spec.ts src/bookings/booking-sync.service.break-dedup.spec.ts src/bookings/integration-status-gate.spec.ts src/bookings/booking-sync.empresa-guard.spec.ts src/bookings/booking-claim.service.spec.ts src/bookings/queue.vismed-timeout.spec.ts"
+
+[workflows.workflow.metadata]
+isValidation = true
 
 [[ports]]
 localPort = 3000

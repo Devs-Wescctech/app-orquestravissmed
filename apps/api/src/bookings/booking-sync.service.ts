@@ -12,6 +12,7 @@ import { isDoctoraliaCircuitOpenError } from '../integrations/doctoralia-circuit
 import { isDoctoraliaQueueError } from '../integrations/doctoralia-queue.errors';
 import { randomUUID } from 'crypto';
 import { BookingClaimService, ClaimDeferError } from './booking-claim.service';
+import { normalizeVismedAppointmentFeedMode } from './vismed-appointment-feed-mode';
 
 const POLL_BASE_INTERVAL_MS = 30 * 1000;
 const STAGGER_PER_CLINIC_MS = 2000;
@@ -227,6 +228,8 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
     async pollVismedClinic(staleConn: any) {
         const conn = await this.getEligibleConnection(staleConn.clinicId, 'vismed');
         if (!conn || !conn.clientId) return;
+        const feedModeResolution = normalizeVismedAppointmentFeedMode(conn.vismedAppointmentFeedMode);
+        const feedMode = feedModeResolution.mode;
 
         // Aquisição atômica segundo a matriz do guard. Safety Sweep é o único
         // par compatível; todos os demais conflitos continuam bloqueando.
@@ -246,7 +249,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         }
         // Boundary lógico do snapshot destrutivo: qualquer BookingSync criado ou
         // alterado depois deste instante fica fora das decisões deste poll.
-        const pollBoundaryAt = new Date();
+        const pollBoundaryAt = feedMode === 'LEGACY' ? new Date() : null;
 
         // WP-01: poll execution tracking + context propagation (apenas quando o poll efetivamente executa)
         const pollExecutionId = randomUUID();
@@ -255,6 +258,12 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         try {
         await runWithDoctoraliaContext({ origin: 'POLLING', clinicId: conn.clinicId, pollExecutionId }, async () => {
         try {
+            if (feedModeResolution.invalidConfiguration) {
+                this.logger.warn(
+                    `[VISMED-POLL] INVALID_APPOINTMENT_FEED_MODE clinicId=${conn.clinicId} — using LEGACY`,
+                );
+            }
+            this.logger.log(`[VISMED-POLL] Clinic ${conn.clinicId}: mode=${feedMode}`);
             const idEmpresaGestora = Number(conn.clientId);
             if (!idEmpresaGestora) {
                 this.logger.warn(`[VISMED-POLL] Invalid idEmpresaGestora for clinic ${conn.clinicId}`);
@@ -280,20 +289,23 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             const dataini = fmt(start);
             const datafim = fmt(end);
             let disappearanceSnapshot: any[] | null = null;
-            try {
-                disappearanceSnapshot = await this.captureVismedDisappearanceSnapshot(
-                    conn.clinicId,
-                    start,
-                    end,
-                    pollBoundaryAt,
-                );
-            } catch (snapshotErr: any) {
-                this.logger.warn(
-                    `[VISMED-POLL] SNAPSHOT_FENCE_DEFERRED clinicId=${conn.clinicId} stage=capture errorCode=${snapshotErr?.code || 'UNKNOWN'} — reconciliação destrutiva desativada neste ciclo`,
-                );
+            if (feedMode === 'LEGACY') {
+                try {
+                    disappearanceSnapshot = await this.captureVismedDisappearanceSnapshot(
+                        conn.clinicId,
+                        start,
+                        end,
+                        pollBoundaryAt!,
+                    );
+                } catch (snapshotErr: any) {
+                    this.logger.warn(
+                        `[VISMED-POLL] SNAPSHOT_FENCE_DEFERRED clinicId=${conn.clinicId} stage=capture errorCode=${snapshotErr?.code || 'UNKNOWN'} — reconciliação destrutiva desativada neste ciclo`,
+                    );
+                }
             }
 
             let totalUpserts = 0;
+            let totalReceived = 0;
             const seenVismedIds = new Set<string>();
             let fetchSuccess = true;
 
@@ -310,11 +322,15 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                         fetchSuccess = false;
                         continue;
                     }
+                    totalReceived += agendamentos.length;
 
                     for (const a of agendamentos) {
                         const vid = a?.idpacienteagendamento ? String(a.idpacienteagendamento) : null;
-                        if (vid) seenVismedIds.add(vid);
+                        if (feedMode === 'LEGACY' && vid) seenVismedIds.add(vid);
                         try {
+                            // Ponto de extensão da futura recuperação/reentrega: itens
+                            // recuperados devem entrar aqui e reutilizar este mesmo upsert
+                            // idempotente. A Fase 1 não cria ACK, retry ou replay local.
                             const upserted = await this.upsertVismedAppointment(conn.clinicId, a, { idEmpresaGestora, baseUrl });
                             if (upserted) totalUpserts++;
                         } catch (innerErr: any) {
@@ -327,14 +343,16 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 }
             }
 
-            this.logger.log(`[VISMED-POLL] Clinic ${conn.clinicId}: processed ${totalUpserts} VisMed appointments`);
+            this.logger.log(
+                `[VISMED-POLL] Clinic ${conn.clinicId}: mode=${feedMode} received=${totalReceived} processed=${totalUpserts} fetchComplete=${fetchSuccess}`,
+            );
 
             // Antes exigíamos seenVismedIds.size > 0, mas isso QUEBRAVA o caso legítimo de
             // "excluí o último agendamento da janela": a unidade volta vazia ([] com HTTP 200) e
             // o cancelamento nunca era propagado — o registro ficava BOOKED para sempre. Agora
             // basta que TODOS os fetches tenham tido sucesso (fetchSuccess). A re-confirmação
             // dentro do reconcile protege contra glitch de API que retorne lista vazia/parcial.
-            if (fetchSuccess && disappearanceSnapshot) {
+            if (feedMode === 'LEGACY' && fetchSuccess && disappearanceSnapshot) {
                 await runWithDoctoraliaContext({ origin: 'RECONCILIATION', clinicId: conn.clinicId, reconciliationSubtype: 'reconcileDisappearedFromVismed', pollExecutionId }, () =>
                     this.reconcileDisappearedFromVismed(
                         conn.clinicId,
@@ -349,6 +367,12 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                     ).catch(err =>
                         this.logger.warn(`[RECONCILE-DISAPPEARED] Error: ${err.message}`),
                     ),
+                );
+            } else if (feedMode === 'INCREMENTAL') {
+                // O retorno incremental contém apenas pendências. Ausência nele não
+                // prova cancelamento e jamais pode alimentar a reconciliação destrutiva.
+                this.logger.log(
+                    `[VISMED-POLL] DISAPPEARANCE_RECONCILIATION_SUPPRESSED clinicId=${conn.clinicId} mode=INCREMENTAL`,
                 );
             }
 
