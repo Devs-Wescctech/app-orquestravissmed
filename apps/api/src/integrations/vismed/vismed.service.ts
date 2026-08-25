@@ -88,7 +88,12 @@ export class VismedService {
         req.once('close', () => signal.removeEventListener('abort', abort));
     }
 
-    private requestData(path: string, baseUrl?: string, signal?: AbortSignal): Promise<any> {
+    private requestData(
+        path: string,
+        baseUrl?: string,
+        signal?: AbortSignal,
+        requireHttp200 = false,
+    ): Promise<any> {
         return new Promise((resolve, reject) => {
             if (signal?.aborted) return reject(new VismedRequestAbortedError());
             const url = this.buildApiUrl(path, baseUrl);
@@ -102,7 +107,10 @@ export class VismedService {
                 });
 
                 res.on('end', () => {
-                    if (res.statusCode && res.statusCode >= 400) {
+                    if (
+                        (requireHttp200 && res.statusCode !== 200)
+                        || (!requireHttp200 && res.statusCode && res.statusCode >= 400)
+                    ) {
                         return reject(new Error(`HTTP ${res.statusCode}: ${data}`));
                     }
                     try {
@@ -170,7 +178,13 @@ export class VismedService {
         });
     }
 
-    private postData(path: string, body: Record<string, any>, baseUrl?: string, signal?: AbortSignal): Promise<any> {
+    private postData(
+        path: string,
+        body: Record<string, any>,
+        baseUrl?: string,
+        signal?: AbortSignal,
+        requireHttp200 = false,
+    ): Promise<any> {
         return new Promise((resolve, reject) => {
             if (signal?.aborted) return reject(new VismedRequestAbortedError());
             const url = this.buildApiUrl(path, baseUrl);
@@ -193,7 +207,10 @@ export class VismedService {
                 let data = '';
                 res.on('data', (chunk) => { data += chunk; });
                 res.on('end', () => {
-                    if (res.statusCode && res.statusCode >= 400) {
+                    if (
+                        (requireHttp200 && res.statusCode !== 200)
+                        || (!requireHttp200 && res.statusCode && res.statusCode >= 400)
+                    ) {
                         return reject(new Error(`HTTP ${res.statusCode}: ${data}`));
                     }
                     try {
@@ -328,6 +345,50 @@ export class VismedService {
             this.logger.error(`Erro ao buscar agendamentos VisMed: ${error.message}`);
             throw error;
         }
+    }
+
+    /**
+     * Consulta oficial não destrutiva por ID. Ao contrário do feed incremental,
+     * esta rota não altera ultimasincronizacaodoctoralia.
+     */
+    async getAgendamentoById(
+        idAgendamento: string,
+        baseUrl?: string,
+        signal?: AbortSignal,
+    ): Promise<unknown> {
+        const id = String(idAgendamento).trim();
+        return this.requestData(
+            `get-agendamento-by-id?idagendamento=${encodeURIComponent(id)}`,
+            baseUrl,
+            signal,
+            true,
+        );
+    }
+
+    /**
+     * Solicita a reentrega no feed normal. HTTP 200 confirma apenas que a
+     * solicitação foi aceita; o processamento final continua observável pelo
+     * polling e upsert existentes.
+     */
+    async requestRedelivery(
+        vismedAppointmentIds: readonly string[],
+        baseUrl?: string,
+        signal?: AbortSignal,
+    ): Promise<void> {
+        const ids = vismedAppointmentIds.map(id => String(id).trim());
+        if (
+            ids.length === 0
+            || ids.some(id => !id || /[,\u0000-\u001f\u007f]/.test(id))
+        ) {
+            throw new Error('Invalid VisMed appointment ID for comma-delimited recovery request');
+        }
+        await this.postData(
+            'reenviar-para-docctoralia',
+            { idagendamento: ids.join(',') },
+            baseUrl,
+            signal,
+            true,
+        );
     }
 
     async cancelarAgendamento(idPacienteAgendamento: number | string, baseUrl?: string): Promise<any> {

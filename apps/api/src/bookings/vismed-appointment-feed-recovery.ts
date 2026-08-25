@@ -1,18 +1,15 @@
 /**
- * Fronteira para a futura rota VisMed que recoloca agendamentos no feed.
- *
- * A VisMed confirmou somente que a recuperação recebe IDs em lote e redefine
- * sua marca de sincronização. Endpoint, método, payload completo e resposta
- * ainda não foram fornecidos; portanto este contrato NÃO tem implementação
- * HTTP nem é chamado pelo polling.
+ * Fronteira da rota oficial que recoloca agendamentos no feed incremental.
+ * O aceite da solicitação não é ACK de processamento: os itens retornam ao
+ * polling normal e percorrem o mesmo upsert.
  */
 export interface VismedAppointmentFeedRecoveryClient {
     requestRedelivery(vismedAppointmentIds: readonly string[]): Promise<void>;
 }
 
 /**
- * Mantém somente IDs identificáveis e elimina repetições antes da futura
- * chamada em lote. Não persiste ACK, fila ou estado de retry.
+ * Mantém somente IDs identificáveis e elimina repetições antes da chamada em
+ * lote. Não persiste ACK, fila ou estado de retry.
  */
 export function normalizeVismedAppointmentRecoveryIds(ids: Iterable<unknown>): string[] {
     const normalized = new Set<string>();
@@ -21,7 +18,9 @@ export function normalizeVismedAppointmentRecoveryIds(ids: Iterable<unknown>): s
         if (typeof id !== 'string' && typeof id !== 'number') continue;
         if (typeof id === 'number' && !Number.isFinite(id)) continue;
         const value = String(id).trim();
-        if (value) normalized.add(value);
+        // A API recebe CSV sem mecanismo de escape. Vírgulas ou controles
+        // poderiam transformar um candidato em IDs adicionais.
+        if (value && !/[,\u0000-\u001f\u007f]/.test(value)) normalized.add(value);
     }
 
     return [...normalized];

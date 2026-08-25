@@ -133,6 +133,35 @@ describe('VismedService', () => {
     });
   });
 
+  describe('contrato oficial de consulta por ID', () => {
+    it('usa a rota e query oficiais com timeout de leitura', async () => {
+      const req = new FakeReq();
+      getSpy.mockImplementation((url: any, cb: any) => {
+        expect(String(url)).toBe(
+          'https://vismed.test/api/v1.0/get-agendamento-by-id?idagendamento=id%20com%20espa%C3%A7o',
+        );
+        setImmediate(() => respond(req, cb, 200, '[{"idpacienteagendamento":"id com espaço"}]'));
+        return req as any;
+      });
+
+      await expect(service.getAgendamentoById(
+        'id com espaço',
+        'https://vismed.test/api/v1.0/',
+      )).resolves.toEqual([{ idpacienteagendamento: 'id com espaço' }]);
+      expect(req.timeoutMs).toBe(30_000);
+    });
+
+    it.each([204, 301, 404, 500])('rejeita status HTTP %s', async statusCode => {
+      const req = new FakeReq();
+      getSpy.mockImplementation((_url: any, cb: any) => {
+        setImmediate(() => respond(req, cb, statusCode, '[]'));
+        return req as any;
+      });
+
+      await expect(service.getAgendamentoById('123')).rejects.toThrow(`HTTP ${statusCode}`);
+    });
+  });
+
   describe('postFormData (escrita)', () => {
     it('resposta normal intacta e timeout de 60s aplicado', async () => {
       const req = new FakeReq();
@@ -220,6 +249,68 @@ describe('VismedService', () => {
       await expect(
         (service as any).postData('x', {}, undefined, controller.signal),
       ).rejects.toBeInstanceOf(VismedRequestAbortedError);
+      expect(requestSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('contrato oficial de recovery incremental', () => {
+    it('serializa IDs separados por vírgula e aceita exclusivamente HTTP 200', async () => {
+      const req = new FakeReq();
+      requestSpy.mockImplementation((opts: any, cb: any) => {
+        expect(opts.path).toBe('/api/v1.0/reenviar-para-docctoralia');
+        setImmediate(() => respond(req, cb, 200, '{"accepted":true}'));
+        return req as any;
+      });
+
+      await expect(service.requestRedelivery(
+        ['appt-1', '42'],
+        'https://vismed.test',
+      )).resolves.toBeUndefined();
+      expect(req.written).toEqual([
+        JSON.stringify({ idagendamento: 'appt-1,42' }),
+      ]);
+      expect(req.timeoutMs).toBe(60_000);
+    });
+
+    it.each([201, 204, 301, 400, 500])('rejeita status HTTP %s sem inventar sucesso', async statusCode => {
+      const req = new FakeReq();
+      requestSpy.mockImplementation((_opts: any, cb: any) => {
+        setImmediate(() => respond(req, cb, statusCode, '{}'));
+        return req as any;
+      });
+
+      await expect(service.requestRedelivery(['123'])).rejects.toThrow(
+        `HTTP ${statusCode}`,
+      );
+    });
+
+    it('propaga timeout e falha de transporte', async () => {
+      const timeoutReq = new FakeReq();
+      requestSpy.mockImplementationOnce(() => {
+        setImmediate(() => timeoutReq.timeoutCb!());
+        return timeoutReq as any;
+      });
+      await expect(service.requestRedelivery(['123']))
+        .rejects.toBeInstanceOf(VismedTimeoutError);
+
+      const transportReq = new FakeReq();
+      requestSpy.mockImplementationOnce(() => {
+        setImmediate(() => transportReq.emit('error', new Error('ECONNRESET')));
+        return transportReq as any;
+      });
+      await expect(service.requestRedelivery(['123']))
+        .rejects.toThrow('ECONNRESET');
+    });
+
+    it.each([
+      { ids: [] },
+      { ids: [''] },
+      { ids: ['authorized-1,unauthorized-2'] },
+      { ids: ['line\nbreak'] },
+    ])('rejeita lote inválido $ids antes de emitir request', async ({ ids }) => {
+      await expect(service.requestRedelivery(ids)).rejects.toThrow(
+        'Invalid VisMed appointment ID',
+      );
       expect(requestSpy).not.toHaveBeenCalled();
     });
   });

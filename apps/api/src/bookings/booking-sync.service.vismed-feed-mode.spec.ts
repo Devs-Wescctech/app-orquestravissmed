@@ -34,18 +34,26 @@ function buildService(options: {
         vismedUnit: {
             findMany: jest.fn().mockResolvedValue([{ vismedId: 11 }]),
         },
+        vismedDoctor: {
+            findUnique: jest.fn().mockResolvedValue({ vismedId: 123 }),
+        },
     } as any;
     const vismedService = {
         getAgendamentos: jest.fn().mockResolvedValue(
             options.response === undefined ? [appointment()] : options.response,
         ),
+        getAgendamentoById: jest.fn(),
+        requestRedelivery: jest.fn().mockResolvedValue(undefined),
+    };
+    const rateLimiter = {
+        acquire: jest.fn().mockResolvedValue(undefined),
     };
     const service = new BookingSyncService(
         prisma,
         {} as any,
         vismedService as any,
         {} as any,
-        {} as any,
+        rateLimiter as any,
         {} as any,
         new ClinicConcurrencyGuard(),
         {} as any,
@@ -117,6 +125,8 @@ describe('normalizeVismedAppointmentRecoveryIds', () => {
             Number.NaN,
             Number.POSITIVE_INFINITY,
             { id: 'not-an-id' },
+            'appt-2,appt-3',
+            'appt-\n4',
             'appt-1',
             42,
         ])).toEqual(['appt-1', '42']);
@@ -226,9 +236,9 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
         expect(syncBreak).not.toHaveBeenCalled();
     });
 
-    it('deduplica falhas de itens identificáveis como candidatos à futura reentrega, sem segundo pipeline', async () => {
+    it('deduplica falhas identificáveis e solicita reentrega em um único lote, sem segundo pipeline', async () => {
         const {
-            service, conn, upsert, logger,
+            service, conn, upsert, logger, vismedService,
         } = buildService({
             feedMode: 'INCREMENTAL',
             response: [appointment('retryable-1'), appointment('retryable-1')],
@@ -238,9 +248,13 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
         await service.pollVismedClinic(conn);
 
         expect(upsert).toHaveBeenCalledTimes(2);
-        expect(logger.warn).toHaveBeenCalledTimes(1);
+        expect(vismedService.requestRedelivery).toHaveBeenCalledTimes(1);
+        expect(vismedService.requestRedelivery).toHaveBeenCalledWith(
+            ['retryable-1'],
+            'https://vismed.test',
+        );
         expect(logger.warn).toHaveBeenCalledWith(
-            expect.stringContaining('FUTURE_RECOVERY_CANDIDATE'),
+            expect.stringContaining('RECOVERY_CANDIDATE'),
         );
         expect(logger.warn).toHaveBeenCalledWith(
             expect.stringContaining('vismedAppointmentId=retryable-1'),
@@ -249,7 +263,7 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
 
     it('também coleta item identificável rejeitado pelo upsert sem exceção', async () => {
         const {
-            service, conn, upsert, logger,
+            service, conn, upsert, logger, vismedService,
         } = buildService({
             feedMode: 'INCREMENTAL',
             response: [appointment('invalid-payload-1')],
@@ -261,11 +275,29 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
         expect(logger.warn).toHaveBeenCalledWith(
             expect.stringContaining('vismedAppointmentId=invalid-payload-1'),
         );
+        expect(vismedService.requestRedelivery).toHaveBeenCalledWith(
+            ['invalid-payload-1'],
+            'https://vismed.test',
+        );
+    });
+
+    it('não envia recovery para ID que poderia injetar outro item no CSV', async () => {
+        const {
+            service, conn, upsert, vismedService,
+        } = buildService({
+            feedMode: 'INCREMENTAL',
+            response: [appointment('authorized-1,unauthorized-2')],
+        });
+        upsert.mockRejectedValue(new Error('processing failed'));
+
+        await service.pollVismedClinic(conn);
+
+        expect(vismedService.requestRedelivery).not.toHaveBeenCalled();
     });
 
     it('não introduz candidatos de recovery no caminho LEGACY', async () => {
         const {
-            service, conn, upsert, logger,
+            service, conn, upsert, logger, vismedService,
         } = buildService({
             feedMode: 'LEGACY',
             response: [appointment('legacy-failure-1')],
@@ -275,8 +307,31 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
         await service.pollVismedClinic(conn);
 
         expect(logger.warn).not.toHaveBeenCalledWith(
-            expect.stringContaining('FUTURE_RECOVERY_CANDIDATE'),
+            expect.stringContaining('RECOVERY_CANDIDATE'),
         );
+        expect(vismedService.requestRedelivery).not.toHaveBeenCalled();
+    });
+
+    it('registra falha do recovery sem retry, ACK inventado ou interrupção do ciclo', async () => {
+        const {
+            service, conn, upsert, logger, vismedService, reconcileUnlinked,
+        } = buildService({
+            feedMode: 'INCREMENTAL',
+            response: [appointment('retry-failed-1')],
+        });
+        upsert.mockRejectedValue(new Error('processing failed'));
+        vismedService.requestRedelivery.mockRejectedValue(new Error('HTTP 503'));
+
+        await service.pollVismedClinic(conn);
+
+        expect(vismedService.requestRedelivery).toHaveBeenCalledTimes(1);
+        expect(logger.warn).toHaveBeenCalledWith(
+            expect.stringContaining('RECOVERY_REQUEST_FAILED'),
+        );
+        expect(logger.log).not.toHaveBeenCalledWith(
+            expect.stringContaining('RECOVERY_REQUEST_ACCEPTED'),
+        );
+        expect(reconcileUnlinked).toHaveBeenCalledWith(clinicId);
     });
 
     it('reentregas com o mesmo ID seguem para o mesmo upsert idempotente', async () => {
@@ -298,6 +353,33 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
             2,
             clinicId,
             appointment('replay-1'),
+            { idEmpresaGestora: 42, baseUrl: 'https://vismed.test' },
+        );
+    });
+
+    it('updates com o mesmo ID percorrem novamente o mesmo upsert do polling', async () => {
+        const original = appointment('updated-1');
+        const updated = {
+            ...appointment('updated-1'),
+            horarioagendamento: '10:00',
+            horarioagendamentofinal: '10:30',
+        };
+        const {
+            service, conn, upsert,
+        } = buildService({ feedMode: 'INCREMENTAL', response: [original, updated] });
+
+        await service.pollVismedClinic(conn);
+
+        expect(upsert).toHaveBeenNthCalledWith(
+            1,
+            clinicId,
+            original,
+            { idEmpresaGestora: 42, baseUrl: 'https://vismed.test' },
+        );
+        expect(upsert).toHaveBeenNthCalledWith(
+            2,
+            clinicId,
+            updated,
             { idEmpresaGestora: 42, baseUrl: 'https://vismed.test' },
         );
     });
@@ -332,4 +414,85 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
             expect(reconcileWithoutVismedId).toHaveBeenCalledWith(clinicId);
         },
     );
+});
+
+describe('BookingSyncService — verify VisMed por contrato de feed', () => {
+    it.each([
+        ['confirma o ID esperado', [appointment('expected-1')], 'confirmed'],
+        ['trata somente [] como ausência', [], 'not_found'],
+        ['mantém objeto fora do formato como inconclusivo', appointment('expected-1'), 'unverified'],
+        ['mantém ID divergente como inconclusivo', [appointment('other-id')], 'unverified'],
+        ['mantém item inválido como inconclusivo', [{}], 'unverified'],
+    ] as const)('%s no INCREMENTAL', async (_label, response, expected) => {
+        const { service, vismedService } = buildService({ feedMode: 'INCREMENTAL' });
+        vismedService.getAgendamentoById.mockResolvedValue(response);
+
+        await expect((service as any).verifyVismedAppointmentExists(
+            clinicId,
+            'doctor-uuid',
+            'expected-1',
+            { start_at: '2026-08-20T12:00:00.000Z' },
+        )).resolves.toBe(expected);
+
+        expect(vismedService.getAgendamentoById).toHaveBeenCalledWith(
+            'expected-1',
+            'https://vismed.test',
+            undefined,
+        );
+        expect(vismedService.getAgendamentos).not.toHaveBeenCalled();
+    });
+
+    it('converte timeout ou falha de comunicação em unverified, nunca not_found', async () => {
+        const { service, vismedService } = buildService({ feedMode: 'INCREMENTAL' });
+        vismedService.getAgendamentoById.mockRejectedValue(new Error('timeout'));
+
+        await expect((service as any).verifyVismedAppointmentExists(
+            clinicId,
+            'doctor-uuid',
+            'expected-1',
+            { start_at: '2026-08-20T12:00:00.000Z' },
+        )).resolves.toBe('unverified');
+        expect(vismedService.getAgendamentos).not.toHaveBeenCalled();
+    });
+
+    it('preserva exatamente a consulta ao feed e a interpretação LEGACY', async () => {
+        const { service, vismedService } = buildService({
+            feedMode: 'LEGACY',
+            response: [appointment('legacy-1')],
+        });
+
+        await expect((service as any).verifyVismedAppointmentExists(
+            clinicId,
+            'doctor-uuid',
+            'legacy-1',
+            { start_at: '2026-08-20T12:00:00.000Z' },
+        )).resolves.toBe('confirmed');
+
+        expect(vismedService.getAgendamentos).toHaveBeenCalledTimes(1);
+        expect(vismedService.getAgendamentoById).not.toHaveBeenCalled();
+    });
+});
+
+describe('BookingSyncService — gate do preflight incremental', () => {
+    it('permanece fail-closed sem ler o feed nem autorizar POST', async () => {
+        const { service, vismedService } = buildService({ feedMode: 'INCREMENTAL' });
+
+        await expect((service as any).preflightVismedAppointment(
+            clinicId,
+            'doctor-uuid',
+            {
+                start_at: '2026-08-20T12:00:00.000Z',
+                patient: { name: 'Paciente', surname: 'Teste' },
+            },
+            'booking-sync-id',
+            new AbortController().signal,
+        )).resolves.toEqual({
+            state: 'unknown',
+            reason: 'incremental_preflight_contract_blocked',
+        });
+
+        expect(vismedService.getAgendamentos).not.toHaveBeenCalled();
+        expect(vismedService.getAgendamentoById).not.toHaveBeenCalled();
+        expect(vismedService.requestRedelivery).not.toHaveBeenCalled();
+    });
 });

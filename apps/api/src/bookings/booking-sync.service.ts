@@ -367,6 +367,20 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 `[VISMED-POLL] Clinic ${conn.clinicId}: mode=${feedMode} received=${totalReceived} processed=${totalUpserts} fetchComplete=${fetchSuccess}`,
             );
 
+            if (feedMode === 'INCREMENTAL' && recoveryCandidateVismedIds.size > 0) {
+                const recoveryIds = normalizeVismedAppointmentRecoveryIds(recoveryCandidateVismedIds);
+                try {
+                    await this.vismedService.requestRedelivery(recoveryIds, baseUrl);
+                    this.logger.log(
+                        `[VISMED-POLL] RECOVERY_REQUEST_ACCEPTED clinicId=${conn.clinicId} count=${recoveryIds.length} — awaiting normal feed redelivery`,
+                    );
+                } catch (recoveryErr: any) {
+                    this.logger.warn(
+                        `[VISMED-POLL] RECOVERY_REQUEST_FAILED clinicId=${conn.clinicId} count=${recoveryIds.length} error=${recoveryErr?.message || 'UNKNOWN'}`,
+                    );
+                }
+            }
+
             // Antes exigíamos seenVismedIds.size > 0, mas isso QUEBRAVA o caso legítimo de
             // "excluí o último agendamento da janela": a unidade volta vazia ([] com HTTP 200) e
             // o cancelamento nunca era propagado — o registro ficava BOOKED para sempre. Agora
@@ -3903,6 +3917,8 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 return this.verifyVismedAppointmentByOfficialIdContract(
                     clinicId,
                     vismedAppointmentId,
+                    conn.domain || undefined,
+                    signal,
                 );
             }
             const vismedDoctor = await this.prisma.vismedDoctor.findUnique({ where: { id: vismedDoctorUuid } });
@@ -3954,31 +3970,48 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
     }
 
     /**
-     * Único ponto reservado à futura consulta não destrutiva por
-     * idpacienteagendamento. É exclusivo da verificação pós-POST: ele não
+     * Consulta oficial não destrutiva por idpacienteagendamento. É exclusiva
+     * da verificação pós-POST: ela não
      * resolve o preflight, que ainda não possui necessariamente esse ID.
-     *
-     * BLOQUEADO POR CONTRATO VISSMED — até endpoint, método, request e response
-     * oficiais existirem, não emite requisição e jamais transforma ausência do
-     * feed incremental em "not_found".
      */
     private async verifyVismedAppointmentByOfficialIdContract(
         clinicId: string,
         vismedAppointmentId: string,
+        baseUrl?: string,
+        signal?: AbortSignal,
     ): Promise<'confirmed' | 'not_found' | 'unverified'> {
-        if (!vismedAppointmentId || !vismedAppointmentId.trim()) {
+        const expectedId = String(vismedAppointmentId || '').trim();
+        if (!expectedId) {
             return 'unverified';
         }
-        this.logger.warn(
-            `[VISMED-VERIFY] CONTRACT_BLOCKED clinicId=${clinicId} mode=INCREMENTAL id=${vismedAppointmentId} — unverified without feed read`,
-        );
-        return 'unverified';
+        try {
+            const response = await this.vismedService.getAgendamentoById(expectedId, baseUrl, signal);
+            if (!Array.isArray(response)) {
+                this.logger.warn(
+                    `[VISMED-VERIFY] OFFICIAL_ID_INVALID_RESPONSE clinicId=${clinicId} mode=INCREMENTAL id=${expectedId}`,
+                );
+                return 'unverified';
+            }
+            if (response.length === 0) return 'not_found';
+
+            const validMatchingResponse = response.every(item => {
+                if (!item || typeof item !== 'object') return false;
+                const returnedId = String((item as any).idpacienteagendamento || '').trim();
+                return returnedId === expectedId;
+            });
+            return validMatchingResponse ? 'confirmed' : 'unverified';
+        } catch (err: any) {
+            this.logger.warn(
+                `[VISMED-VERIFY] OFFICIAL_ID_UNVERIFIED clinicId=${clinicId} mode=INCREMENTAL id=${expectedId} error=${err?.message || 'UNKNOWN'}`,
+            );
+            return 'unverified';
+        }
     }
 
     /**
-     * Registra no log o candidato deduplicado para a futura recuperação.
-     * Sem o contrato HTTP oficial, o candidato não é enviado nem persistido:
-     * uma reentrega futura voltará obrigatoriamente ao upsert do polling.
+     * Registra o candidato deduplicado para recuperação ao fim deste poll.
+     * O lote não é persistido: a reentrega volta obrigatoriamente ao upsert do
+     * polling normal.
      */
     private recordVismedFeedRecoveryCandidate(
         clinicId: string,
@@ -3992,7 +4025,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
 
         candidates.add(vismedAppointmentId);
         this.logger.warn(
-            `[VISMED-POLL] FUTURE_RECOVERY_CANDIDATE clinicId=${clinicId} vismedAppointmentId=${vismedAppointmentId} contract=BLOCKED`,
+            `[VISMED-POLL] RECOVERY_CANDIDATE clinicId=${clinicId} vismedAppointmentId=${vismedAppointmentId}`,
         );
     }
 
