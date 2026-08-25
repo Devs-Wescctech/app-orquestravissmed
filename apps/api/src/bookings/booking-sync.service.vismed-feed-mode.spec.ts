@@ -1,6 +1,7 @@
 import { BookingSyncService } from './booking-sync.service';
 import { ClinicConcurrencyGuard } from './clinic-concurrency-guard';
 import { normalizeVismedAppointmentFeedMode } from './vismed-appointment-feed-mode';
+import { normalizeVismedAppointmentRecoveryIds } from './vismed-appointment-feed-recovery';
 
 const clinicId = 'clinic-feed-mode';
 
@@ -105,6 +106,23 @@ describe('normalizeVismedAppointmentFeedMode', () => {
     });
 });
 
+describe('normalizeVismedAppointmentRecoveryIds', () => {
+    it('aceita apenas IDs identificáveis e deduplica o lote da futura reentrega', () => {
+        expect(normalizeVismedAppointmentRecoveryIds([
+            ' appt-1 ',
+            42,
+            '',
+            null,
+            undefined,
+            Number.NaN,
+            Number.POSITIVE_INFINITY,
+            { id: 'not-an-id' },
+            'appt-1',
+            42,
+        ])).toEqual(['appt-1', '42']);
+    });
+});
+
 describe('BookingSyncService — polling VisMed por contrato de feed', () => {
     it('mantém LEGACY sem configuração: captura snapshot, agrega IDs e reconcilia após processar', async () => {
         const {
@@ -206,6 +224,82 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
         expect(reconcileDisappeared).not.toHaveBeenCalled();
         expect(propagateCancellation).not.toHaveBeenCalled();
         expect(syncBreak).not.toHaveBeenCalled();
+    });
+
+    it('deduplica falhas de itens identificáveis como candidatos à futura reentrega, sem segundo pipeline', async () => {
+        const {
+            service, conn, upsert, logger,
+        } = buildService({
+            feedMode: 'INCREMENTAL',
+            response: [appointment('retryable-1'), appointment('retryable-1')],
+        });
+        upsert.mockRejectedValue(new Error('transient processing error'));
+
+        await service.pollVismedClinic(conn);
+
+        expect(upsert).toHaveBeenCalledTimes(2);
+        expect(logger.warn).toHaveBeenCalledTimes(1);
+        expect(logger.warn).toHaveBeenCalledWith(
+            expect.stringContaining('FUTURE_RECOVERY_CANDIDATE'),
+        );
+        expect(logger.warn).toHaveBeenCalledWith(
+            expect.stringContaining('vismedAppointmentId=retryable-1'),
+        );
+    });
+
+    it('também coleta item identificável rejeitado pelo upsert sem exceção', async () => {
+        const {
+            service, conn, upsert, logger,
+        } = buildService({
+            feedMode: 'INCREMENTAL',
+            response: [appointment('invalid-payload-1')],
+        });
+        upsert.mockResolvedValue(false);
+
+        await service.pollVismedClinic(conn);
+
+        expect(logger.warn).toHaveBeenCalledWith(
+            expect.stringContaining('vismedAppointmentId=invalid-payload-1'),
+        );
+    });
+
+    it('não introduz candidatos de recovery no caminho LEGACY', async () => {
+        const {
+            service, conn, upsert, logger,
+        } = buildService({
+            feedMode: 'LEGACY',
+            response: [appointment('legacy-failure-1')],
+        });
+        upsert.mockRejectedValue(new Error('legacy processing error'));
+
+        await service.pollVismedClinic(conn);
+
+        expect(logger.warn).not.toHaveBeenCalledWith(
+            expect.stringContaining('FUTURE_RECOVERY_CANDIDATE'),
+        );
+    });
+
+    it('reentregas com o mesmo ID seguem para o mesmo upsert idempotente', async () => {
+        const {
+            service, conn, upsert,
+        } = buildService({ feedMode: 'INCREMENTAL', response: [appointment('replay-1')] });
+
+        await service.pollVismedClinic(conn);
+        await service.pollVismedClinic(conn);
+
+        expect(upsert).toHaveBeenCalledTimes(2);
+        expect(upsert).toHaveBeenNthCalledWith(
+            1,
+            clinicId,
+            appointment('replay-1'),
+            { idEmpresaGestora: 42, baseUrl: 'https://vismed.test' },
+        );
+        expect(upsert).toHaveBeenNthCalledWith(
+            2,
+            clinicId,
+            appointment('replay-1'),
+            { idEmpresaGestora: 42, baseUrl: 'https://vismed.test' },
+        );
     });
 
     it.each([

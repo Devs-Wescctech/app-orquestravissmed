@@ -520,6 +520,46 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
             );
             expect(err?.name).toBe('VismedPreflightUnknownError');
         });
+
+        it('INCREMENTAL usa o gate real no fluxo slot-booked: zero leitura do feed, zero POST e zero FAILED', async () => {
+            const { service, prisma } = buildService();
+            const body = notification();
+            const reservedRec = {
+                id: 'sync-incremental-contract-blocked',
+                status: 'PROCESSING',
+                vismedAttemptAt: null,
+            };
+            prisma.bookingSync.upsert.mockResolvedValue(reservedRec);
+            prisma.bookingSync.findUnique.mockResolvedValue(reservedRec);
+            prisma.mapping.findFirst.mockResolvedValue({
+                id: 'map-incremental',
+                vismedId: 'vdoc-incremental',
+            });
+            prisma.integrationConnection.findFirst.mockResolvedValue({
+                clinicId: conn.clinicId,
+                provider: 'vismed',
+                domain: 'https://vismed.invalid',
+                vismedAppointmentFeedMode: 'INCREMENTAL',
+            });
+            const getAgendamentos = jest.fn();
+            const createAppointment = jest.fn();
+            (service as any).vismedService = { getAgendamentos, createAppointment };
+
+            await expect(
+                (service as any).handleSlotBooked(conn.clinicId, body.data, body),
+            ).rejects.toMatchObject({
+                name: 'VismedPreflightUnknownError',
+                code: 'VISMED_PREFLIGHT_UNKNOWN',
+            });
+
+            expect(getAgendamentos).not.toHaveBeenCalled();
+            expect(createAppointment).not.toHaveBeenCalled();
+            expect(prisma.bookingSync.update).not.toHaveBeenCalledWith(
+                expect.objectContaining({
+                    data: expect.objectContaining({ status: 'FAILED' }),
+                }),
+            );
+        });
     });
 
     describe('FAILED without vismedAttemptAt → preserves retry/create without preflight', () => {
@@ -945,6 +985,63 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
                 'sync-original',
                 new AbortController().signal,
             )).resolves.toEqual({ state: 'unknown', reason: 'multiple_matches' });
+        });
+
+        it('no INCREMENTAL bloqueia o preflight sem consumir get-agendamento-filtros ou autorizar POST', async () => {
+            const { service, prisma, getAgendamentos } = setupActualPreflight([[]]);
+            prisma.integrationConnection.findFirst.mockResolvedValue({
+                clinicId: conn.clinicId,
+                provider: 'vismed',
+                domain: 'https://vismed.invalid',
+                vismedAppointmentFeedMode: 'INCREMENTAL',
+            });
+
+            await expect((service as any).preflightVismedAppointment(
+                conn.clinicId,
+                'vdoc-uuid',
+                notification().data.visit_booking,
+                'sync-original',
+                new AbortController().signal,
+            )).resolves.toEqual({
+                state: 'unknown',
+                reason: 'incremental_preflight_contract_blocked',
+            });
+
+            expect(getAgendamentos).not.toHaveBeenCalled();
+        });
+
+        it('no INCREMENTAL mantém a verificação pós-POST como unverified sem consumir o feed', async () => {
+            const { service, prisma, getAgendamentos } = setupActualPreflight([[]]);
+            prisma.integrationConnection.findFirst.mockResolvedValue({
+                clinicId: conn.clinicId,
+                provider: 'vismed',
+                domain: 'https://vismed.invalid',
+                vismedAppointmentFeedMode: 'INCREMENTAL',
+            });
+
+            await expect((service as any).verifyVismedAppointmentExists(
+                conn.clinicId,
+                'vdoc-uuid',
+                'created-id-1',
+                notification().data.visit_booking,
+                new AbortController().signal,
+            )).resolves.toBe('unverified');
+
+            expect(getAgendamentos).not.toHaveBeenCalled();
+        });
+
+        it('no LEGACY preserva a leitura completa do feed para confirmar ausência pós-POST', async () => {
+            const { service, getAgendamentos } = setupActualPreflight([[]]);
+
+            await expect((service as any).verifyVismedAppointmentExists(
+                conn.clinicId,
+                'vdoc-uuid',
+                'missing-legacy-id',
+                notification().data.visit_booking,
+                new AbortController().signal,
+            )).resolves.toBe('not_found');
+
+            expect(getAgendamentos).toHaveBeenCalledTimes(1);
         });
     });
 });

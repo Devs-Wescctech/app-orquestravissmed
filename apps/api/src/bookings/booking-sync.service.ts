@@ -13,6 +13,7 @@ import { isDoctoraliaQueueError } from '../integrations/doctoralia-queue.errors'
 import { randomUUID } from 'crypto';
 import { BookingClaimService, ClaimDeferError } from './booking-claim.service';
 import { normalizeVismedAppointmentFeedMode } from './vismed-appointment-feed-mode';
+import { normalizeVismedAppointmentRecoveryIds } from './vismed-appointment-feed-recovery';
 
 const POLL_BASE_INTERVAL_MS = 30 * 1000;
 const STAGGER_PER_CLINIC_MS = 2000;
@@ -307,6 +308,10 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             let totalUpserts = 0;
             let totalReceived = 0;
             const seenVismedIds = new Set<string>();
+            // Candidatos vivem somente durante este poll: a futura rota da
+            // VisMed fará a reentrega no feed, que volta ao mesmo upsert abaixo.
+            // Não criamos ACK, fila externa, persistência ou pipeline paralelo.
+            const recoveryCandidateVismedIds = new Set<string>();
             let fetchSuccess = true;
 
             for (const u of units) {
@@ -332,8 +337,23 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                             // recuperados devem entrar aqui e reutilizar este mesmo upsert
                             // idempotente. A Fase 1 não cria ACK, retry ou replay local.
                             const upserted = await this.upsertVismedAppointment(conn.clinicId, a, { idEmpresaGestora, baseUrl });
-                            if (upserted) totalUpserts++;
+                            if (upserted) {
+                                totalUpserts++;
+                            } else if (feedMode === 'INCREMENTAL') {
+                                this.recordVismedFeedRecoveryCandidate(
+                                    conn.clinicId,
+                                    a?.idpacienteagendamento,
+                                    recoveryCandidateVismedIds,
+                                );
+                            }
                         } catch (innerErr: any) {
+                            if (feedMode === 'INCREMENTAL') {
+                                this.recordVismedFeedRecoveryCandidate(
+                                    conn.clinicId,
+                                    a?.idpacienteagendamento,
+                                    recoveryCandidateVismedIds,
+                                );
+                            }
                             this.logger.debug(`[VISMED-POLL] Skipping appointment: ${innerErr.message}`);
                         }
                     }
@@ -3365,6 +3385,15 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             where: { clinicId, provider: 'vismed' },
         });
         if (!conn) return { state: 'unknown', reason: 'missing_connection' };
+        if (normalizeVismedAppointmentFeedMode(conn.vismedAppointmentFeedMode).mode === 'INCREMENTAL') {
+            // BLOQUEADO POR CONTRATO VISSMED: o get-agendamento-filtros pode ser
+            // destrutivo e não existe busca não destrutiva para localizar um
+            // agendamento antes do POST (ainda não há ID para consultar).
+            this.logger.warn(
+                `[VISMED-PREFLIGHT] CONTRACT_BLOCKED clinicId=${clinicId} mode=INCREMENTAL — zero feed reads and zero POST`,
+            );
+            return { state: 'unknown', reason: 'incremental_preflight_contract_blocked' };
+        }
 
         const vismedDoctor = await this.prisma.vismedDoctor.findUnique({ where: { id: vismedDoctorId } });
         if (!vismedDoctor?.vismedId) return { state: 'unknown', reason: 'missing_doctor' };
@@ -3870,6 +3899,12 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 where: { clinicId, provider: 'vismed' },
             });
             if (!conn) return 'unverified';
+            if (normalizeVismedAppointmentFeedMode(conn.vismedAppointmentFeedMode).mode === 'INCREMENTAL') {
+                return this.verifyVismedAppointmentByOfficialIdContract(
+                    clinicId,
+                    vismedAppointmentId,
+                );
+            }
             const vismedDoctor = await this.prisma.vismedDoctor.findUnique({ where: { id: vismedDoctorUuid } });
             if (!vismedDoctor?.vismedId) return 'unverified';
 
@@ -3916,6 +3951,49 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             this.logger.warn(`[VISMED-VERIFY] Erro inesperado na verificação: ${err?.message}`);
             return 'unverified';
         }
+    }
+
+    /**
+     * Único ponto reservado à futura consulta não destrutiva por
+     * idpacienteagendamento. É exclusivo da verificação pós-POST: ele não
+     * resolve o preflight, que ainda não possui necessariamente esse ID.
+     *
+     * BLOQUEADO POR CONTRATO VISSMED — até endpoint, método, request e response
+     * oficiais existirem, não emite requisição e jamais transforma ausência do
+     * feed incremental em "not_found".
+     */
+    private async verifyVismedAppointmentByOfficialIdContract(
+        clinicId: string,
+        vismedAppointmentId: string,
+    ): Promise<'confirmed' | 'not_found' | 'unverified'> {
+        if (!vismedAppointmentId || !vismedAppointmentId.trim()) {
+            return 'unverified';
+        }
+        this.logger.warn(
+            `[VISMED-VERIFY] CONTRACT_BLOCKED clinicId=${clinicId} mode=INCREMENTAL id=${vismedAppointmentId} — unverified without feed read`,
+        );
+        return 'unverified';
+    }
+
+    /**
+     * Registra no log o candidato deduplicado para a futura recuperação.
+     * Sem o contrato HTTP oficial, o candidato não é enviado nem persistido:
+     * uma reentrega futura voltará obrigatoriamente ao upsert do polling.
+     */
+    private recordVismedFeedRecoveryCandidate(
+        clinicId: string,
+        rawVismedAppointmentId: unknown,
+        candidates: Set<string>,
+    ): void {
+        const [vismedAppointmentId] = normalizeVismedAppointmentRecoveryIds([
+            rawVismedAppointmentId,
+        ]);
+        if (!vismedAppointmentId || candidates.has(vismedAppointmentId)) return;
+
+        candidates.add(vismedAppointmentId);
+        this.logger.warn(
+            `[VISMED-POLL] FUTURE_RECOVERY_CANDIDATE clinicId=${clinicId} vismedAppointmentId=${vismedAppointmentId} contract=BLOCKED`,
+        );
     }
 
     private async createVismedAppointment(
