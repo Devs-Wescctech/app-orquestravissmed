@@ -21,6 +21,15 @@ const STARTUP_DELAY_MS = 5_000;
 
 type VismedReplacementResult = 'adopted' | 'absent' | 'ambiguous' | 'error' | 'deferred';
 
+function parsePositiveSafeIntegerId(value: unknown): number | null {
+    if (typeof value === 'number') {
+        return Number.isSafeInteger(value) && value > 0 ? value : null;
+    }
+    if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value)) return null;
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
 class SnapshotFenceDeferredError extends Error {
     constructor(message: string) {
         super(message);
@@ -228,7 +237,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
 
     async pollVismedClinic(staleConn: any) {
         const conn = await this.getEligibleConnection(staleConn.clinicId, 'vismed');
-        if (!conn || !conn.clientId) return;
+        if (!conn) return;
         const feedModeResolution = normalizeVismedAppointmentFeedMode(conn.vismedAppointmentFeedMode);
         const feedMode = feedModeResolution.mode;
 
@@ -265,18 +274,69 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 );
             }
             this.logger.log(`[VISMED-POLL] Clinic ${conn.clinicId}: mode=${feedMode}`);
-            const idEmpresaGestora = Number(conn.clientId);
-            if (!idEmpresaGestora) {
-                this.logger.warn(`[VISMED-POLL] Invalid idEmpresaGestora for clinic ${conn.clinicId}`);
+            const idEmpresaGestora = parsePositiveSafeIntegerId(conn.clientId);
+            if (idEmpresaGestora === null) {
+                this.logger.warn(
+                    `[VISMED-POLL] UNIT_SCOPE_RESOLUTION_ERROR clinicId=${conn.clinicId} reason=INVALID_MANAGER_ID`,
+                );
                 return;
             }
 
-            const baseUrl = conn.domain || undefined;
-            const units = await this.prisma.vismedUnit.findMany({ where: { isActive: true } });
-            if (units.length === 0) {
-                this.logger.debug(`[VISMED-POLL] No active VismedUnit for clinic ${conn.clinicId}`);
+            const baseUrl = typeof conn.domain === 'string' ? conn.domain.trim() : '';
+            try {
+                const parsedBaseUrl = new URL(baseUrl);
+                if (
+                    (parsedBaseUrl.protocol !== 'http:' && parsedBaseUrl.protocol !== 'https:')
+                    || !parsedBaseUrl.hostname
+                    || parsedBaseUrl.username
+                    || parsedBaseUrl.password
+                ) {
+                    throw new Error('unsupported URL');
+                }
+            } catch {
+                this.logger.warn(
+                    `[VISMED-POLL] UNIT_SCOPE_RESOLUTION_ERROR clinicId=${conn.clinicId} managerId=${idEmpresaGestora} reason=INVALID_BASE_URL`,
+                );
                 return;
             }
+
+            let resolvedUnits: any;
+            try {
+                resolvedUnits = await this.vismedService.getUnidades(idEmpresaGestora, baseUrl);
+            } catch (unitResolutionErr: any) {
+                this.logger.warn(
+                    `[VISMED-POLL] UNIT_SCOPE_RESOLUTION_ERROR clinicId=${conn.clinicId} managerId=${idEmpresaGestora} route=${baseUrl} reason=REQUEST_FAILED error=${unitResolutionErr?.message || 'UNKNOWN'}`,
+                );
+                return;
+            }
+            if (!Array.isArray(resolvedUnits)) {
+                this.logger.warn(
+                    `[VISMED-POLL] UNIT_SCOPE_RESOLUTION_ERROR clinicId=${conn.clinicId} managerId=${idEmpresaGestora} route=${baseUrl} reason=INVALID_RESPONSE`,
+                );
+                return;
+            }
+            if (resolvedUnits.length === 0) {
+                this.logger.log(
+                    `[VISMED-POLL] UNIT_SCOPE_EMPTY clinicId=${conn.clinicId} managerId=${idEmpresaGestora} route=${baseUrl}`,
+                );
+                return;
+            }
+
+            const unitIds = new Set<number>();
+            for (const unit of resolvedUnits) {
+                const id = parsePositiveSafeIntegerId(unit?.idunidade);
+                if (id !== null) unitIds.add(id);
+            }
+            if (unitIds.size === 0) {
+                this.logger.warn(
+                    `[VISMED-POLL] UNIT_SCOPE_RESOLUTION_ERROR clinicId=${conn.clinicId} managerId=${idEmpresaGestora} route=${baseUrl} reason=NO_VALID_UNIT_IDS received=${resolvedUnits.length}`,
+                );
+                return;
+            }
+            const units = Array.from(unitIds, vismedId => ({ vismedId }));
+            this.logger.log(
+                `[VISMED-POLL] UNIT_SCOPE_RESOLVED clinicId=${conn.clinicId} managerId=${idEmpresaGestora} route=${baseUrl} units=${units.length} discarded=${resolvedUnits.length - units.length}`,
+            );
 
             // Janela: hoje -7d até hoje +60d (formato DD/MM/YYYY exigido pela VisMed)
             const today = new Date();

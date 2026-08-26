@@ -93,6 +93,7 @@ export class VismedService {
         baseUrl?: string,
         signal?: AbortSignal,
         requireHttp200 = false,
+        preserveFalsyJson = false,
     ): Promise<any> {
         return new Promise((resolve, reject) => {
             if (signal?.aborted) return reject(new VismedRequestAbortedError());
@@ -115,7 +116,7 @@ export class VismedService {
                     }
                     try {
                         const json = JSON.parse(data);
-                        resolve(json || []);
+                        resolve(preserveFalsyJson ? json : (json || []));
                     } catch (e) {
                         reject(new Error(`Failed to parse JSON response: ${e.message}`));
                     }
@@ -233,7 +234,13 @@ export class VismedService {
     async getUnidades(idEmpresaGestora: number, baseUrl?: string): Promise<any[]> {
         try {
             this.logger.log(`Buscando unidades para empresa gestora: ${idEmpresaGestora} na Base URL: ${baseUrl || 'padrão'}`);
-            return await this.requestData(`unidade-by-idempresagestora?idempresagestora=${idEmpresaGestora}`, baseUrl);
+            return await this.requestData(
+                `unidade-by-idempresagestora?idempresagestora=${idEmpresaGestora}`,
+                baseUrl,
+                undefined,
+                false,
+                true,
+            );
         } catch (error) {
             this.logger.error(`Erro ao buscar unidades VisMed: ${error.message}`);
             throw error;

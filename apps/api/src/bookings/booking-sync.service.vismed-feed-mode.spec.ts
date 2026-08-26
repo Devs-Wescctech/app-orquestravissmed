@@ -39,6 +39,7 @@ function buildService(options: {
         },
     } as any;
     const vismedService = {
+        getUnidades: jest.fn().mockResolvedValue([{ idunidade: 11 }]),
         getAgendamentos: jest.fn().mockResolvedValue(
             options.response === undefined ? [appointment()] : options.response,
         ),
@@ -134,6 +135,125 @@ describe('normalizeVismedAppointmentRecoveryIds', () => {
 });
 
 describe('BookingSyncService — polling VisMed por contrato de feed', () => {
+    it('isola o poll ao conjunto autoritativo da empresa/base e deduplica IDs válidos', async () => {
+        const { service, conn, prisma, vismedService, reconcileDisappeared } = buildService();
+        prisma.vismedUnit.findMany.mockResolvedValue([{ vismedId: 999 }]);
+        vismedService.getUnidades.mockResolvedValue([
+            { idunidade: 11 },
+            { idunidade: '12' },
+            { idunidade: 11 },
+            { idunidade: 0 },
+            { idunidade: -1 },
+            { idunidade: 'invalid' },
+            { idunidade: true },
+            { idunidade: [13] },
+            { idunidade: '1e2' },
+            { idunidade: '01' },
+            { idunidade: 1.5 },
+            {},
+        ]);
+
+        await service.pollVismedClinic(conn);
+
+        expect(vismedService.getUnidades).toHaveBeenCalledTimes(1);
+        expect(vismedService.getUnidades).toHaveBeenCalledWith(42, 'https://vismed.test');
+        expect(vismedService.getAgendamentos).toHaveBeenCalledTimes(2);
+        expect(vismedService.getAgendamentos).toHaveBeenNthCalledWith(
+            1, 11, 'https://vismed.test', expect.any(Object),
+        );
+        expect(vismedService.getAgendamentos).toHaveBeenNthCalledWith(
+            2, 12, 'https://vismed.test', expect.any(Object),
+        );
+        expect(vismedService.getAgendamentos).not.toHaveBeenCalledWith(
+            999, expect.anything(), expect.anything(),
+        );
+        expect(prisma.vismedUnit.findMany).not.toHaveBeenCalled();
+        expect(reconcileDisappeared).toHaveBeenCalledWith(
+            clinicId,
+            expect.any(Set),
+            expect.any(Date),
+            expect.any(Date),
+            [{ vismedId: 11 }, { vismedId: 12 }],
+            'https://vismed.test',
+            expect.any(String),
+            expect.any(String),
+            expect.any(Array),
+        );
+    });
+
+    it.each([
+        ['clientId ausente', { clientId: null }, false],
+        ['clientId não numérico', { clientId: 'abc' }, false],
+        ['clientId não positivo', { clientId: '0' }, false],
+        ['clientId decimal', { clientId: '1.5' }, false],
+        ['clientId em notação exponencial', { clientId: '1e2' }, false],
+        ['clientId acima do limite seguro', { clientId: '9007199254740992' }, false],
+        ['domain ausente', { domain: null }, false],
+        ['domain inválido', { domain: 'not a URL' }, false],
+    ])('encerra fail-closed quando %s', async (_label, patch, resolvesUnits) => {
+        const { service, conn, prisma, vismedService, upsert, reconcileUnlinked } = buildService();
+        prisma.integrationConnection.findFirst.mockResolvedValue({ ...conn, ...patch });
+
+        await service.pollVismedClinic(conn);
+
+        expect(vismedService.getUnidades).toHaveBeenCalledTimes(resolvesUnits ? 1 : 0);
+        expect(vismedService.getAgendamentos).not.toHaveBeenCalled();
+        expect(upsert).not.toHaveBeenCalled();
+        expect(reconcileUnlinked).not.toHaveBeenCalled();
+        expect(prisma.vismedUnit.findMany).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ['falha de transporte', new Error('timeout'), 'REQUEST_FAILED'],
+        ['resposta não-array', { invalid: true }, 'INVALID_RESPONSE'],
+        ['resposta null', null, 'INVALID_RESPONSE'],
+        ['resposta false', false, 'INVALID_RESPONSE'],
+        ['resposta zero', 0, 'INVALID_RESPONSE'],
+        ['resposta string vazia', '', 'INVALID_RESPONSE'],
+        [
+            'array sem IDs válidos',
+            [
+                { idunidade: 0 },
+                { idunidade: 'x' },
+                { idunidade: true },
+                { idunidade: [12] },
+                { idunidade: '1e2' },
+                { idunidade: 1.5 },
+            ],
+            'NO_VALID_UNIT_IDS',
+        ],
+    ])('trata %s como erro de resolução, sem agenda nem reconciliação', async (_label, response, reason) => {
+        const { service, conn, prisma, vismedService, logger, upsert, reconcileUnlinked } = buildService();
+        if (response instanceof Error) {
+            vismedService.getUnidades.mockRejectedValue(response);
+        } else {
+            vismedService.getUnidades.mockResolvedValue(response);
+        }
+
+        await service.pollVismedClinic(conn);
+
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining(`reason=${reason}`));
+        expect(vismedService.getAgendamentos).not.toHaveBeenCalled();
+        expect(upsert).not.toHaveBeenCalled();
+        expect(reconcileUnlinked).not.toHaveBeenCalled();
+        expect(prisma.vismedUnit.findMany).not.toHaveBeenCalled();
+    });
+
+    it('distingue escopo validamente vazio e não inicia leituras ou reconciliações', async () => {
+        const { service, conn, prisma, vismedService, logger, reconcileUnlinked } = buildService();
+        vismedService.getUnidades.mockResolvedValue([]);
+
+        await service.pollVismedClinic(conn);
+
+        expect(logger.log).toHaveBeenCalledWith(expect.stringContaining('UNIT_SCOPE_EMPTY'));
+        expect(logger.warn).not.toHaveBeenCalledWith(
+            expect.stringContaining('UNIT_SCOPE_RESOLUTION_ERROR'),
+        );
+        expect(vismedService.getAgendamentos).not.toHaveBeenCalled();
+        expect(reconcileUnlinked).not.toHaveBeenCalled();
+        expect(prisma.vismedUnit.findMany).not.toHaveBeenCalled();
+    });
+
     it('mantém LEGACY sem configuração: captura snapshot, agrega IDs e reconcilia após processar', async () => {
         const {
             service, conn, capture, upsert, reconcileDisappeared, logger,
