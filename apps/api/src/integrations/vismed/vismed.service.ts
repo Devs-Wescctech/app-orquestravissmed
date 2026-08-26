@@ -330,13 +330,20 @@ export class VismedService {
     async getAgendamentos(
         unidade: number,
         baseUrl?: string,
-        options?: { dataini?: string; datafim?: string; profissional?: number; signal?: AbortSignal },
+        options?: {
+            dataini?: string;
+            datafim?: string;
+            profissional?: number;
+            nonDestructive?: boolean;
+            signal?: AbortSignal;
+        },
     ): Promise<any[]> {
         try {
             let path = `get-agendamento-filtros?unidade=${unidade}`;
             if (options?.dataini) path += `&dataini=${encodeURIComponent(options.dataini)}`;
             if (options?.datafim) path += `&datafim=${encodeURIComponent(options.datafim)}`;
             if (options?.profissional) path += `&profissional=${options.profissional}`;
+            if (options?.nonDestructive === true) path += '&sincronizar=0';
             this.logger.log(`Buscando agendamentos VisMed: unidade=${unidade}`);
 
             const actualBase = baseUrl || 'https://app.vissmed.com.br/api-vissmed-4';

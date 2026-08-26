@@ -521,11 +521,11 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
             expect(err?.name).toBe('VismedPreflightUnknownError');
         });
 
-        it('INCREMENTAL usa o gate real no fluxo slot-booked: zero leitura do feed, zero POST e zero FAILED', async () => {
+        it('INCREMENTAL fail-closed no fluxo slot-booked quando a leitura não destrutiva falha: zero POST e zero FAILED', async () => {
             const { service, prisma } = buildService();
             const body = notification();
             const reservedRec = {
-                id: 'sync-incremental-contract-blocked',
+                id: 'sync-incremental-partial-read',
                 status: 'PROCESSING',
                 vismedAttemptAt: null,
             };
@@ -541,7 +541,13 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
                 domain: 'https://vismed.invalid',
                 vismedAppointmentFeedMode: 'INCREMENTAL',
             });
-            const getAgendamentos = jest.fn();
+            prisma.vismedDoctor = {
+                findUnique: jest.fn().mockResolvedValue({ vismedId: 123 }),
+            };
+            prisma.vismedUnit = {
+                findMany: jest.fn().mockResolvedValue([{ vismedId: 11 }]),
+            };
+            const getAgendamentos = jest.fn().mockRejectedValue(new Error('timeout'));
             const createAppointment = jest.fn();
             (service as any).vismedService = { getAgendamentos, createAppointment };
 
@@ -552,7 +558,11 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
                 code: 'VISMED_PREFLIGHT_UNKNOWN',
             });
 
-            expect(getAgendamentos).not.toHaveBeenCalled();
+            expect(getAgendamentos).toHaveBeenCalledWith(
+                11,
+                'https://vismed.invalid',
+                expect.objectContaining({ nonDestructive: true }),
+            );
             expect(createAppointment).not.toHaveBeenCalled();
             expect(prisma.bookingSync.update).not.toHaveBeenCalledWith(
                 expect.objectContaining({
@@ -987,7 +997,7 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
             )).resolves.toEqual({ state: 'unknown', reason: 'multiple_matches' });
         });
 
-        it('no INCREMENTAL bloqueia o preflight sem consumir get-agendamento-filtros ou autorizar POST', async () => {
+        it('no INCREMENTAL usa leitura não destrutiva e preserva a classificação conservadora', async () => {
             const { service, prisma, getAgendamentos } = setupActualPreflight([[]]);
             prisma.integrationConnection.findFirst.mockResolvedValue({
                 clinicId: conn.clinicId,
@@ -1002,12 +1012,74 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
                 notification().data.visit_booking,
                 'sync-original',
                 new AbortController().signal,
-            )).resolves.toEqual({
-                state: 'unknown',
-                reason: 'incremental_preflight_contract_blocked',
+            )).resolves.toEqual({ state: 'confirmed_absent' });
+
+            expect(getAgendamentos).toHaveBeenCalledWith(
+                1,
+                'https://vismed.invalid',
+                expect.objectContaining({
+                    dataini: '20/08/2026',
+                    datafim: '20/08/2026',
+                    profissional: 123,
+                    nonDestructive: true,
+                }),
+            );
+        });
+
+        it('no INCREMENTAL retorna found para um único match sem consumir a pendência', async () => {
+            const { service, prisma, getAgendamentos } = setupActualPreflight([[
+                {
+                    idpacienteagendamento: 456,
+                    idprofissional: 123,
+                    dataagendamento: '2026-08-20',
+                    horarioagendamento: '09:00',
+                    nomepaciente: 'Paciente Anonimizado',
+                },
+            ]]);
+            prisma.integrationConnection.findFirst.mockResolvedValue({
+                clinicId: conn.clinicId,
+                provider: 'vismed',
+                domain: 'https://vismed.invalid',
+                vismedAppointmentFeedMode: 'INCREMENTAL',
             });
 
-            expect(getAgendamentos).not.toHaveBeenCalled();
+            await expect((service as any).preflightVismedAppointment(
+                conn.clinicId,
+                'vdoc-uuid',
+                notification().data.visit_booking,
+                'sync-original',
+                new AbortController().signal,
+            )).resolves.toEqual({
+                state: 'found',
+                vismedAppointmentId: '456',
+                orphanBookingSyncId: undefined,
+            });
+            expect(getAgendamentos).toHaveBeenCalledWith(
+                1,
+                'https://vismed.invalid',
+                expect.objectContaining({ nonDestructive: true }),
+            );
+        });
+
+        it.each([
+            ['resposta inválida', [{ invalid: true }], 'partial_read'],
+            ['timeout', [new Error('timeout')], 'partial_read'],
+        ])('no INCREMENTAL mantém %s como unknown', async (_label, responses, reason) => {
+            const { service, prisma } = setupActualPreflight(responses as Array<any[] | Error>);
+            prisma.integrationConnection.findFirst.mockResolvedValue({
+                clinicId: conn.clinicId,
+                provider: 'vismed',
+                domain: 'https://vismed.invalid',
+                vismedAppointmentFeedMode: 'INCREMENTAL',
+            });
+
+            await expect((service as any).preflightVismedAppointment(
+                conn.clinicId,
+                'vdoc-uuid',
+                notification().data.visit_booking,
+                'sync-original',
+                new AbortController().signal,
+            )).resolves.toEqual({ state: 'unknown', reason });
         });
 
         it('no INCREMENTAL mantém a verificação pós-POST como unverified sem consumir o feed', async () => {

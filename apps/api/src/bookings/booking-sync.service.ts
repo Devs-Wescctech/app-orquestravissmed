@@ -3399,15 +3399,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             where: { clinicId, provider: 'vismed' },
         });
         if (!conn) return { state: 'unknown', reason: 'missing_connection' };
-        if (normalizeVismedAppointmentFeedMode(conn.vismedAppointmentFeedMode).mode === 'INCREMENTAL') {
-            // BLOQUEADO POR CONTRATO VISSMED: o get-agendamento-filtros pode ser
-            // destrutivo e não existe busca não destrutiva para localizar um
-            // agendamento antes do POST (ainda não há ID para consultar).
-            this.logger.warn(
-                `[VISMED-PREFLIGHT] CONTRACT_BLOCKED clinicId=${clinicId} mode=INCREMENTAL — zero feed reads and zero POST`,
-            );
-            return { state: 'unknown', reason: 'incremental_preflight_contract_blocked' };
-        }
+        const feedMode = normalizeVismedAppointmentFeedMode(conn.vismedAppointmentFeedMode).mode;
 
         const vismedDoctor = await this.prisma.vismedDoctor.findUnique({ where: { id: vismedDoctorId } });
         if (!vismedDoctor?.vismedId) return { state: 'unknown', reason: 'missing_doctor' };
@@ -3438,6 +3430,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                     dataini: dataBr,
                     datafim: dataBr,
                     profissional: vismedDoctor.vismedId,
+                    ...(feedMode === 'INCREMENTAL' ? { nonDestructive: true } : {}),
                     signal,
                 });
             } catch (err: any) {

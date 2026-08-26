@@ -84,6 +84,34 @@ describe('VismedService', () => {
     expect(service).toBeDefined();
   });
 
+  describe('getAgendamentos', () => {
+    it('mantém a URL destrutiva atual por default e adiciona sincronizar=0 somente no opt-in', async () => {
+      const requestedUrls: string[] = [];
+      getSpy.mockImplementation((url: any, cb: any) => {
+        requestedUrls.push(String(url));
+        const req = new FakeReq();
+        setImmediate(() => respond(req, cb, 200, '[]'));
+        return req as any;
+      });
+
+      const filters = {
+        dataini: '20/08/2026',
+        datafim: '20/08/2026',
+        profissional: 123,
+      };
+      await service.getAgendamentos(11, 'https://vismed.test/api/v1.0', filters);
+      await service.getAgendamentos(11, 'https://vismed.test/api/v1.0', {
+        ...filters,
+        nonDestructive: true,
+      });
+
+      expect(requestedUrls).toEqual([
+        'https://vismed.test/api/v1.0/get-agendamento-filtros?unidade=11&dataini=20%2F08%2F2026&datafim=20%2F08%2F2026&profissional=123',
+        'https://vismed.test/api/v1.0/get-agendamento-filtros?unidade=11&dataini=20%2F08%2F2026&datafim=20%2F08%2F2026&profissional=123&sincronizar=0',
+      ]);
+    });
+  });
+
   describe('requestData (leitura)', () => {
     it('resposta normal intacta (JSON) e timeout de 30s aplicado', async () => {
       const req = new FakeReq();

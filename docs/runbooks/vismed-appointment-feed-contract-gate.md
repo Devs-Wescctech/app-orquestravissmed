@@ -48,8 +48,8 @@ Se qualquer item falhar, o deploy permanece bloqueado e a Fase 2 deve decidir o 
 ## Proteções já confirmadas no código
 
 - O caminho `LEGACY` mantém a leitura snapshot, preflight por profissional/data/horário/paciente, verificação pós-criação e reconciliação por desaparecimento.
-- No modo explícito `INCREMENTAL`, apenas o polling pode chamar `get-agendamento-filtros`. Um retorno vazio nesse feed não comprova cancelamento, inexistência nem criação fantasma.
-- O preflight incremental está **BLOQUEADO POR CONTRATO VISSMED**: antes do POST não há necessariamente `idpacienteagendamento`, e não existe busca não destrutiva adequada para localizar um possível agendamento.
+- No modo explícito `INCREMENTAL`, o polling chama `get-agendamento-filtros` sem `sincronizar=0` e continua consumindo as pendências. Um retorno vazio nesse feed não comprova cancelamento, inexistência nem criação fantasma.
+- O contrato do preflight incremental foi confirmado: `GET get-agendamento-filtros` com os filtros de unidade, data e profissional e `sincronizar=0` é uma leitura não destrutiva. Somente esse preflight usa a opção; leituras completas e inequívocas reutilizam a classificação conservadora do modo legado, e qualquer falha, parcialidade ou ambiguidade permanece inconclusiva.
 - A verificação incremental pós-POST usa exclusivamente `GET /api/v1.0/get-agendamento-by-id?idagendamento=...`: somente dados válidos do mesmo ID confirmam existência e somente `[]` confirma ausência; falhas e respostas ambíguas permanecem `unverified`.
 - Falhas de processamento com ID identificável são deduplicadas e enviadas a `POST /api/v1.0/reenviar-para-docctoralia` com `idagendamento` separado por vírgulas. Somente HTTP 200 aceita a solicitação; não há ACK de processamento, persistência adicional, fila ou retry paralelo.
 - Itens cuja reentrega é aceita voltam ao `get-agendamento-filtros` e percorrem o polling e o mesmo upsert idempotente. Updates com o mesmo ID seguem esse caminho único.
@@ -58,13 +58,12 @@ Se qualquer item falhar, o deploy permanece bloqueado e a Fase 2 deve decidir o 
 
 Nenhum dos itens abaixo pode ser inferido por tentativa em produção:
 
-1. **Busca pré-POST não destrutiva:** forma oficial de localizar um possível agendamento por profissional, data, horário e paciente sem consumir pendências. A consulta por ID não a substitui.
-2. **Cancelamentos incrementais:** fonte contratual para distinguir item já entregue de item removido/cancelado. A reconciliação por desaparecimento permanece deliberadamente suprimida nesse modo.
+1. **Cancelamentos incrementais:** fonte contratual para distinguir item já entregue de item removido/cancelado. A reconciliação por desaparecimento permanece deliberadamente suprimida nesse modo.
 
 ## Condições adicionais para ativação futura
 
 - [ ] Os contratos restantes foram recebidos por escrito e implementados com testes de integração em homologação não destrutiva.
-- [ ] O preflight incremental pode obter uma conclusão segura sem depender de `get-agendamento-filtros`.
+- [x] O preflight incremental usa o contrato oficial não destrutivo de `get-agendamento-filtros` com `sincronizar=0`.
 - [ ] A verificação pós-POST por ID confirma presença/ausência sem consumir outro item do feed.
 - [ ] Recovery valida IDs, envia somente lotes autorizados pelo contrato e aguarda a reentrega pelo polling; o processamento continua no mesmo upsert idempotente por `clinicId + vismedAppointmentId`.
 - [ ] A estratégia de cancelamento incremental foi aprovada sem alterar os fluxos legados de breaks e propagação à Doctoralia.
@@ -72,7 +71,8 @@ Nenhum dos itens abaixo pode ser inferido por tentativa em produção:
 
 ## Separação entre implementação, deploy e ativação
 
-Os contratos de verify e recovery estão implementados no ramo `INCREMENTAL`,
-mas isso não autoriza deploy nem ativação. O preflight e o cancelamento
-incrementais continuam bloqueados pelos contratos acima. Esta implementação não
-altera conexão, configuração, schema ou banco.
+Os contratos de preflight, verify e recovery estão implementados no ramo
+`INCREMENTAL`, mas isso não autoriza deploy nem ativação. O contrato e a
+estratégia de cancelamentos incrementais, além dos gates operacionais por base,
+continuam bloqueando a ativação. Esta implementação não altera conexão,
+configuração, schema ou banco.

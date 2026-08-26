@@ -203,7 +203,7 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
 
     it('processa no INCREMENTAL apenas os itens recebidos e não captura nem reconcilia desaparecimentos', async () => {
         const {
-            service, conn, capture, upsert, reconcileDisappeared, logger,
+            service, conn, capture, upsert, reconcileDisappeared, logger, vismedService,
         } = buildService({ feedMode: 'INCREMENTAL', response: [appointment('pending-1')] });
 
         await service.pollVismedClinic(conn);
@@ -219,6 +219,11 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
         expect(logger.log).toHaveBeenCalledWith(expect.stringContaining('mode=INCREMENTAL'));
         expect(logger.log).toHaveBeenCalledWith(
             expect.stringContaining('DISAPPEARANCE_RECONCILIATION_SUPPRESSED'),
+        );
+        expect(vismedService.getAgendamentos).toHaveBeenCalledWith(
+            11,
+            'https://vismed.test',
+            expect.not.objectContaining({ nonDestructive: expect.anything() }),
         );
     });
 
@@ -473,9 +478,13 @@ describe('BookingSyncService — verify VisMed por contrato de feed', () => {
     });
 });
 
-describe('BookingSyncService — gate do preflight incremental', () => {
-    it('permanece fail-closed sem ler o feed nem autorizar POST', async () => {
-        const { service, vismedService } = buildService({ feedMode: 'INCREMENTAL' });
+describe('BookingSyncService — preflight incremental não destrutivo', () => {
+    it('lê todas as unidades com sincronizar=0 e classifica ausência completa', async () => {
+        const { service, vismedService, prisma } = buildService({
+            feedMode: 'INCREMENTAL',
+            response: [],
+        });
+        prisma.vismedUnit.findMany.mockResolvedValue([{ vismedId: 11 }, { vismedId: 12 }]);
 
         await expect((service as any).preflightVismedAppointment(
             clinicId,
@@ -486,12 +495,26 @@ describe('BookingSyncService — gate do preflight incremental', () => {
             },
             'booking-sync-id',
             new AbortController().signal,
-        )).resolves.toEqual({
-            state: 'unknown',
-            reason: 'incremental_preflight_contract_blocked',
-        });
+        )).resolves.toEqual({ state: 'confirmed_absent' });
 
-        expect(vismedService.getAgendamentos).not.toHaveBeenCalled();
+        expect(vismedService.getAgendamentos).toHaveBeenCalledTimes(2);
+        expect(vismedService.getAgendamentos).toHaveBeenNthCalledWith(
+            1,
+            11,
+            'https://vismed.test',
+            expect.objectContaining({
+                dataini: '20/08/2026',
+                datafim: '20/08/2026',
+                profissional: 123,
+                nonDestructive: true,
+            }),
+        );
+        expect(vismedService.getAgendamentos).toHaveBeenNthCalledWith(
+            2,
+            12,
+            'https://vismed.test',
+            expect.objectContaining({ nonDestructive: true }),
+        );
         expect(vismedService.getAgendamentoById).not.toHaveBeenCalled();
         expect(vismedService.requestRedelivery).not.toHaveBeenCalled();
     });
