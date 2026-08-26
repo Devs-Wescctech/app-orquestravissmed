@@ -302,7 +302,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
 
             let resolvedUnits: any;
             try {
-                resolvedUnits = await this.vismedService.getUnidades(idEmpresaGestora, baseUrl);
+                resolvedUnits = await this.vismedService.getUnidadesForPolling(idEmpresaGestora, baseUrl);
             } catch (unitResolutionErr: any) {
                 this.logger.warn(
                     `[VISMED-POLL] UNIT_SCOPE_RESOLUTION_ERROR clinicId=${conn.clinicId} managerId=${idEmpresaGestora} route=${baseUrl} reason=REQUEST_FAILED error=${unitResolutionErr?.message || 'UNKNOWN'}`,

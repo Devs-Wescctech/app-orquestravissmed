@@ -93,6 +93,22 @@ export class VismedService {
         baseUrl?: string,
         signal?: AbortSignal,
         requireHttp200 = false,
+    ): Promise<any> {
+        return this.requestJson(path, baseUrl, signal, requireHttp200, false);
+    }
+
+    private requestDataStrict(
+        path: string,
+        baseUrl?: string,
+    ): Promise<unknown> {
+        return this.requestJson(path, baseUrl, undefined, false, true);
+    }
+
+    private requestJson(
+        path: string,
+        baseUrl?: string,
+        signal?: AbortSignal,
+        requireHttp200 = false,
         preserveFalsyJson = false,
     ): Promise<any> {
         return new Promise((resolve, reject) => {
@@ -234,15 +250,26 @@ export class VismedService {
     async getUnidades(idEmpresaGestora: number, baseUrl?: string): Promise<any[]> {
         try {
             this.logger.log(`Buscando unidades para empresa gestora: ${idEmpresaGestora} na Base URL: ${baseUrl || 'padrão'}`);
-            return await this.requestData(
-                `unidade-by-idempresagestora?idempresagestora=${idEmpresaGestora}`,
-                baseUrl,
-                undefined,
-                false,
-                true,
-            );
+            return await this.requestData(`unidade-by-idempresagestora?idempresagestora=${idEmpresaGestora}`, baseUrl);
         } catch (error) {
             this.logger.error(`Erro ao buscar unidades VisMed: ${error.message}`);
+            throw error;
+        }
+    }
+
+    /**
+     * Leitura estrita exclusiva do polling: preserva o JSON bruto para que o
+     * chamador diferencie [] válido de respostas falsy ou em formato inválido.
+     */
+    async getUnidadesForPolling(idEmpresaGestora: number, baseUrl: string): Promise<unknown> {
+        try {
+            this.logger.log(`Buscando unidades (polling estrito) para empresa gestora: ${idEmpresaGestora} na Base URL: ${baseUrl}`);
+            return await this.requestDataStrict(
+                `unidade-by-idempresagestora?idempresagestora=${idEmpresaGestora}`,
+                baseUrl,
+            );
+        } catch (error) {
+            this.logger.error(`Erro ao buscar unidades VisMed para polling: ${error.message}`);
             throw error;
         }
     }

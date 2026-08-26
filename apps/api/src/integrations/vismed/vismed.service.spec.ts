@@ -125,6 +125,38 @@ describe('VismedService', () => {
       expect(req.destroyed).toBe(false);
     });
 
+    it.each([
+      ['null', 'null'],
+      ['false', 'false'],
+      ['zero', '0'],
+      ['string vazia', '""'],
+    ])('normaliza resposta JSON falsy %s para [] no contrato compartilhado', async (_label, body) => {
+      const req = new FakeReq();
+      getSpy.mockImplementation((_url: any, cb: any) => {
+        setImmediate(() => respond(req, cb, 200, body));
+        return req as any;
+      });
+
+      await expect(service.getUnidades(1, 'https://vismed.test')).resolves.toEqual([]);
+    });
+
+    it.each([
+      ['null', 'null', null],
+      ['false', 'false', false],
+      ['zero', '0', 0],
+      ['string vazia', '""', ''],
+      ['array vazio', '[]', []],
+      ['objeto', '{"invalid":true}', { invalid: true }],
+    ])('preserva resposta %s somente na leitura estrita do polling', async (_label, body, expected) => {
+      const req = new FakeReq();
+      getSpy.mockImplementation((_url: any, cb: any) => {
+        setImmediate(() => respond(req, cb, 200, body));
+        return req as any;
+      });
+
+      await expect(service.getUnidadesForPolling(1, 'https://vismed.test')).resolves.toEqual(expected);
+    });
+
     it('timeout rejeita com VismedTimeoutError e destrói a request', async () => {
       const req = new FakeReq();
       getSpy.mockImplementation((_url: any, _cb: any) => {
