@@ -85,7 +85,7 @@ describe('VismedService', () => {
   });
 
   describe('getAgendamentos', () => {
-    it('mantém a URL destrutiva atual por default e adiciona sincronizar=0 somente no opt-in', async () => {
+    it('consome somente no modo explícito e omite sincronizar em readonly e por default', async () => {
       const requestedUrls: string[] = [];
       getSpy.mockImplementation((url: any, cb: any) => {
         requestedUrls.push(String(url));
@@ -102,13 +102,19 @@ describe('VismedService', () => {
       await service.getAgendamentos(11, 'https://vismed.test/api/v1.0', filters);
       await service.getAgendamentos(11, 'https://vismed.test/api/v1.0', {
         ...filters,
-        nonDestructive: true,
+        syncMode: 'readonly',
+      });
+      await service.getAgendamentos(11, 'https://vismed.test/api/v1.0', {
+        ...filters,
+        syncMode: 'consume',
       });
 
       expect(requestedUrls).toEqual([
         'https://vismed.test/api/v1.0/get-agendamento-filtros?unidade=11&dataini=20%2F08%2F2026&datafim=20%2F08%2F2026&profissional=123',
-        'https://vismed.test/api/v1.0/get-agendamento-filtros?unidade=11&dataini=20%2F08%2F2026&datafim=20%2F08%2F2026&profissional=123&sincronizar=0',
+        'https://vismed.test/api/v1.0/get-agendamento-filtros?unidade=11&dataini=20%2F08%2F2026&datafim=20%2F08%2F2026&profissional=123',
+        'https://vismed.test/api/v1.0/get-agendamento-filtros?unidade=11&dataini=20%2F08%2F2026&datafim=20%2F08%2F2026&profissional=123&sincronizar=1',
       ]);
+      expect(requestedUrls.every(url => !url.includes('sincronizar=0'))).toBe(true);
     });
   });
 

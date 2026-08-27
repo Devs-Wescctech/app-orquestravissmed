@@ -368,7 +368,7 @@ export class VismedService {
             dataini?: string;
             datafim?: string;
             profissional?: number;
-            nonDestructive?: boolean;
+            syncMode?: 'consume' | 'readonly';
             signal?: AbortSignal;
         },
     ): Promise<any[]> {
@@ -377,7 +377,7 @@ export class VismedService {
             if (options?.dataini) path += `&dataini=${encodeURIComponent(options.dataini)}`;
             if (options?.datafim) path += `&datafim=${encodeURIComponent(options.datafim)}`;
             if (options?.profissional) path += `&profissional=${options.profissional}`;
-            if (options?.nonDestructive === true) path += '&sincronizar=0';
+            if (options?.syncMode === 'consume') path += '&sincronizar=1';
             this.logger.log(`Buscando agendamentos VisMed: unidade=${unidade}`);
 
             const actualBase = baseUrl || 'https://app.vissmed.com.br/api-vissmed-4';

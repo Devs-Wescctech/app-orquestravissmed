@@ -385,7 +385,11 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                     const agendamentos = await this.vismedService.getAgendamentos(
                         u.vismedId,
                         baseUrl,
-                        { dataini, datafim },
+                        {
+                            dataini,
+                            datafim,
+                            ...(feedMode === 'INCREMENTAL' ? { syncMode: 'consume' as const } : {}),
+                        },
                     );
 
                     if (!Array.isArray(agendamentos)) {
@@ -3503,7 +3507,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                     dataini: dataBr,
                     datafim: dataBr,
                     profissional: vismedDoctor.vismedId,
-                    ...(feedMode === 'INCREMENTAL' ? { nonDestructive: true } : {}),
+                    ...(feedMode === 'INCREMENTAL' ? { syncMode: 'readonly' as const } : {}),
                     signal,
                 });
             } catch (err: any) {

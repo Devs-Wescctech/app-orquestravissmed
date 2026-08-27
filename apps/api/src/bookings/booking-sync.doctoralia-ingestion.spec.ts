@@ -564,7 +564,7 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
             expect(getAgendamentos).toHaveBeenCalledWith(
                 11,
                 INCREMENTAL_VISMED_BASE_URL,
-                expect.objectContaining({ nonDestructive: true }),
+                expect.objectContaining({ syncMode: 'readonly' }),
             );
             expect(createAppointment).not.toHaveBeenCalled();
             expect(prisma.bookingSync.update).not.toHaveBeenCalledWith(
@@ -1000,7 +1000,7 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
             )).resolves.toEqual({ state: 'unknown', reason: 'multiple_matches' });
         });
 
-        it('no INCREMENTAL usa leitura não destrutiva e preserva a classificação conservadora', async () => {
+        it('no INCREMENTAL usa readonly e preserva a classificação conservadora', async () => {
             const { service, prisma, getAgendamentos } = setupActualPreflight([[]]);
             prisma.integrationConnection.findFirst.mockResolvedValue({
                 clinicId: conn.clinicId,
@@ -1024,7 +1024,7 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
                     dataini: '20/08/2026',
                     datafim: '20/08/2026',
                     profissional: 123,
-                    nonDestructive: true,
+                    syncMode: 'readonly',
                 }),
             );
         });
@@ -1060,7 +1060,7 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
             expect(getAgendamentos).toHaveBeenCalledWith(
                 1,
                 INCREMENTAL_VISMED_BASE_URL,
-                expect.objectContaining({ nonDestructive: true }),
+                expect.objectContaining({ syncMode: 'readonly' }),
             );
         });
 

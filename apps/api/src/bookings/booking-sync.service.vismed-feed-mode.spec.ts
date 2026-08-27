@@ -371,7 +371,7 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
         expect(vismedService.getAgendamentos).toHaveBeenCalledWith(
             11,
             INCREMENTAL_BASE_URL,
-            expect.not.objectContaining({ nonDestructive: expect.anything() }),
+            expect.objectContaining({ syncMode: 'consume' }),
         );
     });
 
@@ -702,8 +702,8 @@ describe('BookingSyncService — verify VisMed por contrato de feed', () => {
     });
 });
 
-describe('BookingSyncService — preflight incremental não destrutivo', () => {
-    it('lê todas as unidades com sincronizar=0 e classifica ausência completa', async () => {
+describe('BookingSyncService — preflight incremental somente leitura', () => {
+    it('lê todas as unidades em readonly e classifica ausência completa', async () => {
         const { service, vismedService, prisma } = buildService({
             feedMode: 'LEGACY',
             response: [],
@@ -731,14 +731,14 @@ describe('BookingSyncService — preflight incremental não destrutivo', () => {
                 dataini: '20/08/2026',
                 datafim: '20/08/2026',
                 profissional: 123,
-                nonDestructive: true,
+                syncMode: 'readonly',
             }),
         );
         expect(vismedService.getAgendamentos).toHaveBeenNthCalledWith(
             2,
             12,
             INCREMENTAL_BASE_URL,
-            expect.objectContaining({ nonDestructive: true }),
+            expect.objectContaining({ syncMode: 'readonly' }),
         );
         expect(vismedService.getAgendamentoById).not.toHaveBeenCalled();
         expect(vismedService.requestRedelivery).not.toHaveBeenCalled();
