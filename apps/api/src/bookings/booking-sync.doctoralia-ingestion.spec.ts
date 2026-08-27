@@ -1,4 +1,7 @@
 import { BookingSyncService } from './booking-sync.service';
+const LEGACY_VISMED_BASE_URL = 'https://app.vissmed.com.br/api-vissmed-4';
+const INCREMENTAL_VISMED_BASE_URL = 'https://app.vissmed.com.br/api-docctor-3';
+
 import { ClinicConcurrencyGuard } from './clinic-concurrency-guard';
 import { DoctoraliaMetricsService } from '../metrics/doctoralia-metrics.service';
 import { DoctoraliaCircuitOpenError } from '../integrations/doctoralia-circuit-breaker';
@@ -538,7 +541,7 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
             prisma.integrationConnection.findFirst.mockResolvedValue({
                 clinicId: conn.clinicId,
                 provider: 'vismed',
-                domain: 'https://vismed.invalid',
+                domain: INCREMENTAL_VISMED_BASE_URL,
                 vismedAppointmentFeedMode: 'INCREMENTAL',
             });
             prisma.vismedDoctor = {
@@ -560,7 +563,7 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
 
             expect(getAgendamentos).toHaveBeenCalledWith(
                 11,
-                'https://vismed.invalid',
+                INCREMENTAL_VISMED_BASE_URL,
                 expect.objectContaining({ nonDestructive: true }),
             );
             expect(createAppointment).not.toHaveBeenCalled();
@@ -910,7 +913,7 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
             prisma.integrationConnection.findFirst.mockResolvedValue({
                 clinicId: conn.clinicId,
                 provider: 'vismed',
-                domain: 'https://vismed.invalid',
+                domain: LEGACY_VISMED_BASE_URL,
             });
             prisma.vismedDoctor = {
                 findUnique: jest.fn().mockResolvedValue({ id: 'vdoc-uuid', vismedId: 123 }),
@@ -1002,7 +1005,7 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
             prisma.integrationConnection.findFirst.mockResolvedValue({
                 clinicId: conn.clinicId,
                 provider: 'vismed',
-                domain: 'https://vismed.invalid',
+                domain: INCREMENTAL_VISMED_BASE_URL,
                 vismedAppointmentFeedMode: 'INCREMENTAL',
             });
 
@@ -1016,7 +1019,7 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
 
             expect(getAgendamentos).toHaveBeenCalledWith(
                 1,
-                'https://vismed.invalid',
+                INCREMENTAL_VISMED_BASE_URL,
                 expect.objectContaining({
                     dataini: '20/08/2026',
                     datafim: '20/08/2026',
@@ -1039,7 +1042,7 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
             prisma.integrationConnection.findFirst.mockResolvedValue({
                 clinicId: conn.clinicId,
                 provider: 'vismed',
-                domain: 'https://vismed.invalid',
+                domain: INCREMENTAL_VISMED_BASE_URL,
                 vismedAppointmentFeedMode: 'INCREMENTAL',
             });
 
@@ -1056,7 +1059,7 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
             });
             expect(getAgendamentos).toHaveBeenCalledWith(
                 1,
-                'https://vismed.invalid',
+                INCREMENTAL_VISMED_BASE_URL,
                 expect.objectContaining({ nonDestructive: true }),
             );
         });
@@ -1069,7 +1072,7 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
             prisma.integrationConnection.findFirst.mockResolvedValue({
                 clinicId: conn.clinicId,
                 provider: 'vismed',
-                domain: 'https://vismed.invalid',
+                domain: INCREMENTAL_VISMED_BASE_URL,
                 vismedAppointmentFeedMode: 'INCREMENTAL',
             });
 
@@ -1087,7 +1090,7 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
             prisma.integrationConnection.findFirst.mockResolvedValue({
                 clinicId: conn.clinicId,
                 provider: 'vismed',
-                domain: 'https://vismed.invalid',
+                domain: INCREMENTAL_VISMED_BASE_URL,
                 vismedAppointmentFeedMode: 'INCREMENTAL',
             });
 

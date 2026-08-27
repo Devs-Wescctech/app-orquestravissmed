@@ -1,78 +1,45 @@
-# Gate pré-deploy — contrato do feed de agendamentos VisMed
+# Gate do contrato do feed de agendamentos Vissmed
 
-> **Estado atual: BLOQUEADO.** Não existe neste repositório evidência formal ou não destrutiva suficiente para classificar as bases VisMed efetivamente consumidas pelo ambiente Portainer.
->
-> Este gate deve ser concluído **antes de qualquer deploy** que contenha o modo de feed. Ele não autoriza ativar `INCREMENTAL`, editar conexões, pausar fluxos ou alterar dados.
+## Fonte autoritativa
 
-## Regra de decisão
+O contrato do feed é definido exclusivamente pelo registry versionado no backend,
+usando a URL canônica de `IntegrationConnection.domain`. O campo legado
+`vismedAppointmentFeedMode` não seleciona, sobrescreve nem fornece fallback.
 
-Somente é permitido prosseguir com o deploy se **todas** as instâncias/bases VisMed usadas por conexões ativas estiverem classificadas como `LEGACY` mediante evidência positiva.
+Bases atualmente classificadas:
 
-Uma classificação `INCREMENTAL`, `MISTA` ou `INCONCLUSIVA` bloqueia o deploy. Registrar o bloqueio, preservar a evidência e encaminhar a decisão para a Fase 2; não usar o campo local nullable como evidência de que o upstream é snapshot.
+- `https://app.vissmed.com.br/api-docctor-3` — `INCREMENTAL`
+- `https://app.vissmed.com.br/api-docctor-5` — `INCREMENTAL`
+- `https://app.vissmed.com.br/api-vissmed-4` — `LEGACY`
 
-É proibido chamar exploratoriamente `get-agendamento-filtros` em produção para obter esta prova: sob o novo contrato, a própria leitura pode marcar uma pendência como entregue.
+## Cadastrar ou alterar uma instância
 
-## Evidência aceita
+1. Comprove a URL canônica e o contrato do feed em configuração ou documentação
+   confiável. Não deduza o contrato pelo conteúdo do feed.
+2. Adicione ou altere a entrada no registry por mudança versionada.
+3. Inclua testes de canonicalização, resolução e fail-closed.
+4. Faça build e execute as suítes focadas de regressão.
+5. Publique o registry e seu consumidor na mesma versão.
 
-Registre uma das seguintes fontes, sem credenciais ou dados de pacientes:
+Uma URL ausente, inválida ou não cadastrada resulta em `UNCLASSIFIED`. Nesse estado,
+nenhum timer novo é criado e cada execução individual é bloqueada antes de resolver
+unidades ou ler o feed. Os demais fluxos Vissmed e o status da conexão não mudam.
 
-1. confirmação técnica formal da VisMed, específica para a base e a rota;
-2. demonstração em homologação que seja comprovadamente não destrutiva;
-3. dados de teste controlados que mostrem a semântica de retorno sem consumir registros produtivos.
+## Rollout
 
-Para cada base, a evidência deve responder se a ausência de um ID no retorno significa:
+Não mantenha simultaneamente réplicas novas e antigas sem controle: versões antigas
+ainda podem obedecer ao campo por conexão, enquanto a versão nova obedece somente ao
+registry. Faça substituição coordenada das réplicas ou mantenha temporariamente os
+valores legados coerentes até todas as réplicas antigas saírem de circulação.
 
-- `LEGACY`: o ID não existe mais na janela (snapshot); ou
-- `INCREMENTAL`: o ID pode apenas já ter sido entregue/sincronizado.
+Após o rollout, confirme nos logs:
 
-## Inventário e classificação obrigatórios
+- `VISMED_APPOINTMENT_FEED_CLASSIFIED`, com instância, modo e
+  `source=INSTANCE_REGISTRY`, para bases admitidas;
+- `VISMED_APPOINTMENT_FEED_UNCLASSIFIED` para bases bloqueadas;
+- `VISMED_APPOINTMENT_FEED_MODE_DIVERGENCE` quando o campo legado divergir, sem
+  alterar o modo derivado do registry.
 
-Preencher uma linha para **cada base/instância distinta** consumida pelas conexões VisMed ativas no Portainer. Use identificadores técnicos não sensíveis (por exemplo, hostname/base mascarada); não registrar `clientId`, URL assinada, credenciais ou informações de pacientes.
-
-| Instância/base técnica | Conexões/clínicas cobertas | Fonte da evidência | Data (UTC) | Escopo testado | Classificação | Responsável | Decisão |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| **PENDENTE — inventariar no Portainer** | — | — | — | — | `INCONCLUSIVA` | — | **BLOQUEAR DEPLOY** |
-
-## Checklist de liberação
-
-- [ ] Inventário obtido a partir das conexões VisMed ativas no **Portainer**, não da base de deployment do Replit.
-- [ ] Toda base no inventário tem evidência aceita, com fonte, data e escopo técnico registrados.
-- [ ] Toda linha está classificada explicitamente como `LEGACY`.
-- [ ] Não há base `INCREMENTAL`, `MISTA` ou `INCONCLUSIVA`.
-- [ ] Não houve chamada exploratória produtiva a `get-agendamento-filtros`.
-- [ ] Confirmado que o deploy/migration não define `vismedAppointmentFeedMode` em nenhuma conexão.
-- [ ] Busca pós-migration confirma zero conexões com `vismedAppointmentFeedMode = 'INCREMENTAL'`.
-
-Se qualquer item falhar, o deploy permanece bloqueado e a Fase 2 deve decidir o contrato completo (incluindo preflight, verificação pós-criação, cancelamentos e reentrega).
-
-## Proteções já confirmadas no código
-
-- O caminho `LEGACY` mantém a leitura snapshot, preflight por profissional/data/horário/paciente, verificação pós-criação e reconciliação por desaparecimento.
-- No modo explícito `INCREMENTAL`, o polling chama `get-agendamento-filtros` sem `sincronizar=0` e continua consumindo as pendências. Um retorno vazio nesse feed não comprova cancelamento, inexistência nem criação fantasma.
-- O contrato do preflight incremental foi confirmado: `GET get-agendamento-filtros` com os filtros de unidade, data e profissional e `sincronizar=0` é uma leitura não destrutiva. Somente esse preflight usa a opção; leituras completas e inequívocas reutilizam a classificação conservadora do modo legado, e qualquer falha, parcialidade ou ambiguidade permanece inconclusiva.
-- A verificação incremental pós-POST usa exclusivamente `GET /api/v1.0/get-agendamento-by-id?idagendamento=...`: somente dados válidos do mesmo ID confirmam existência e somente `[]` confirma ausência; falhas e respostas ambíguas permanecem `unverified`.
-- Falhas de processamento com ID identificável são deduplicadas e enviadas a `POST /api/v1.0/reenviar-para-docctoralia` com `idagendamento` separado por vírgulas. Somente HTTP 200 aceita a solicitação; não há ACK de processamento, persistência adicional, fila ou retry paralelo.
-- Itens cuja reentrega é aceita voltam ao `get-agendamento-filtros` e percorrem o polling e o mesmo upsert idempotente. Updates com o mesmo ID seguem esse caminho único.
-
-## Contratos que a VisMed ainda deve fornecer
-
-Nenhum dos itens abaixo pode ser inferido por tentativa em produção:
-
-1. **Cancelamentos incrementais:** fonte contratual para distinguir item já entregue de item removido/cancelado. A reconciliação por desaparecimento permanece deliberadamente suprimida nesse modo.
-
-## Condições adicionais para ativação futura
-
-- [ ] Os contratos restantes foram recebidos por escrito e implementados com testes de integração em homologação não destrutiva.
-- [x] O preflight incremental usa o contrato oficial não destrutivo de `get-agendamento-filtros` com `sincronizar=0`.
-- [ ] A verificação pós-POST por ID confirma presença/ausência sem consumir outro item do feed.
-- [ ] Recovery valida IDs, envia somente lotes autorizados pelo contrato e aguarda a reentrega pelo polling; o processamento continua no mesmo upsert idempotente por `clinicId + vismedAppointmentId`.
-- [ ] A estratégia de cancelamento incremental foi aprovada sem alterar os fluxos legados de breaks e propagação à Doctoralia.
-- [ ] Uma nova revisão operacional aprovou explicitamente cada base antes de qualquer conexão ser marcada como `INCREMENTAL`.
-
-## Separação entre implementação, deploy e ativação
-
-Os contratos de preflight, verify e recovery estão implementados no ramo
-`INCREMENTAL`, mas isso não autoriza deploy nem ativação. O contrato e a
-estratégia de cancelamentos incrementais, além dos gates operacionais por base,
-continuam bloqueando a ativação. Esta implementação não altera conexão,
-configuração, schema ou banco.
+Não faça chamadas exploratórias a `get-agendamento-filtros` para classificar uma
+base. O contrato deve vir de evidência técnica confiável e entrar por revisão de
+código. Esta mudança não autoriza deploy, ativação de conexões ou alteração de banco.

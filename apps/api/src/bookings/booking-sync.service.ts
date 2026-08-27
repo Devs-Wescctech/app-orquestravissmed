@@ -12,7 +12,7 @@ import { isDoctoraliaCircuitOpenError } from '../integrations/doctoralia-circuit
 import { isDoctoraliaQueueError } from '../integrations/doctoralia-queue.errors';
 import { randomUUID } from 'crypto';
 import { BookingClaimService, ClaimDeferError } from './booking-claim.service';
-import { normalizeVismedAppointmentFeedMode } from './vismed-appointment-feed-mode';
+import { resolveVismedAppointmentFeedContract } from './vismed-appointment-feed-mode';
 import { normalizeVismedAppointmentRecoveryIds } from './vismed-appointment-feed-recovery';
 
 const POLL_BASE_INTERVAL_MS = 30 * 1000;
@@ -205,6 +205,16 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
 
             for (const vConn of vismedConns) {
                 if (this.polledVismedClinicIds.has(vConn.clinicId)) continue;
+                const feedContract = resolveVismedAppointmentFeedContract(
+                    vConn.domain,
+                    vConn.vismedAppointmentFeedMode,
+                );
+                if (feedContract.contract === 'UNCLASSIFIED') {
+                    this.logger.warn(
+                        `[VISMED-POLL] VISMED_APPOINTMENT_FEED_UNCLASSIFIED clinicId=${vConn.clinicId} reason=${feedContract.reason} — polling timer not scheduled`,
+                    );
+                    continue;
+                }
 
                 const index = this.polledVismedClinicIds.size;
                 const stagger = 3000 + index * STAGGER_PER_CLINIC_MS;
@@ -238,8 +248,25 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
     async pollVismedClinic(staleConn: any) {
         const conn = await this.getEligibleConnection(staleConn.clinicId, 'vismed');
         if (!conn) return;
-        const feedModeResolution = normalizeVismedAppointmentFeedMode(conn.vismedAppointmentFeedMode);
-        const feedMode = feedModeResolution.mode;
+        const feedContract = resolveVismedAppointmentFeedContract(
+            conn.domain,
+            conn.vismedAppointmentFeedMode,
+        );
+        if (feedContract.contract === 'UNCLASSIFIED') {
+            this.logger.warn(
+                `[VISMED-POLL] VISMED_APPOINTMENT_FEED_UNCLASSIFIED clinicId=${conn.clinicId} reason=${feedContract.reason} — poll blocked`,
+            );
+            return;
+        }
+        const feedMode = feedContract.contract;
+        if (feedContract.legacyFieldDiverges) {
+            this.logger.warn(
+                `[VISMED-POLL] VISMED_APPOINTMENT_FEED_MODE_DIVERGENCE clinicId=${conn.clinicId} instanceId=${feedContract.instanceId} registryMode=${feedMode} source=INSTANCE_REGISTRY — registry prevailed`,
+            );
+        }
+        this.logger.log(
+            `[VISMED-POLL] VISMED_APPOINTMENT_FEED_CLASSIFIED clinicId=${conn.clinicId} instanceId=${feedContract.instanceId} mode=${feedMode} source=INSTANCE_REGISTRY`,
+        );
 
         // Aquisição atômica segundo a matriz do guard. Safety Sweep é o único
         // par compatível; todos os demais conflitos continuam bloqueando.
@@ -268,11 +295,6 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         try {
         await runWithDoctoraliaContext({ origin: 'POLLING', clinicId: conn.clinicId, pollExecutionId }, async () => {
         try {
-            if (feedModeResolution.invalidConfiguration) {
-                this.logger.warn(
-                    `[VISMED-POLL] INVALID_APPOINTMENT_FEED_MODE clinicId=${conn.clinicId} — using LEGACY`,
-                );
-            }
             this.logger.log(`[VISMED-POLL] Clinic ${conn.clinicId}: mode=${feedMode}`);
             const idEmpresaGestora = parsePositiveSafeIntegerId(conn.clientId);
             if (idEmpresaGestora === null) {
@@ -282,23 +304,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 return;
             }
 
-            const baseUrl = typeof conn.domain === 'string' ? conn.domain.trim() : '';
-            try {
-                const parsedBaseUrl = new URL(baseUrl);
-                if (
-                    (parsedBaseUrl.protocol !== 'http:' && parsedBaseUrl.protocol !== 'https:')
-                    || !parsedBaseUrl.hostname
-                    || parsedBaseUrl.username
-                    || parsedBaseUrl.password
-                ) {
-                    throw new Error('unsupported URL');
-                }
-            } catch {
-                this.logger.warn(
-                    `[VISMED-POLL] UNIT_SCOPE_RESOLUTION_ERROR clinicId=${conn.clinicId} managerId=${idEmpresaGestora} reason=INVALID_BASE_URL`,
-                );
-                return;
-            }
+            const baseUrl = feedContract.canonicalBaseUrl;
 
             let resolvedUnits: any;
             try {
@@ -3459,7 +3465,14 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             where: { clinicId, provider: 'vismed' },
         });
         if (!conn) return { state: 'unknown', reason: 'missing_connection' };
-        const feedMode = normalizeVismedAppointmentFeedMode(conn.vismedAppointmentFeedMode).mode;
+        const feedContract = resolveVismedAppointmentFeedContract(
+            conn.domain,
+            conn.vismedAppointmentFeedMode,
+        );
+        if (feedContract.contract === 'UNCLASSIFIED') {
+            return { state: 'unknown', reason: 'unclassified_appointment_feed_instance' };
+        }
+        const feedMode = feedContract.contract;
 
         const vismedDoctor = await this.prisma.vismedDoctor.findUnique({ where: { id: vismedDoctorId } });
         if (!vismedDoctor?.vismedId) return { state: 'unknown', reason: 'missing_doctor' };
@@ -3476,7 +3489,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
 
         const units = await this.prisma.vismedUnit.findMany({ where: { isActive: true } });
         if (units.length === 0) return { state: 'unknown', reason: 'no_active_units' };
-        const baseUrl = conn.domain || undefined;
+        const baseUrl = feedContract.canonicalBaseUrl;
         const foundIds = new Set<string>();
         const orphanByVismedId = new Map<string, string>();
         let incompleteRead = false;
@@ -3966,11 +3979,16 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 where: { clinicId, provider: 'vismed' },
             });
             if (!conn) return 'unverified';
-            if (normalizeVismedAppointmentFeedMode(conn.vismedAppointmentFeedMode).mode === 'INCREMENTAL') {
+            const feedContract = resolveVismedAppointmentFeedContract(
+                conn.domain,
+                conn.vismedAppointmentFeedMode,
+            );
+            if (feedContract.contract === 'UNCLASSIFIED') return 'unverified';
+            if (feedContract.contract === 'INCREMENTAL') {
                 return this.verifyVismedAppointmentByOfficialIdContract(
                     clinicId,
                     vismedAppointmentId,
-                    conn.domain || undefined,
+                    feedContract.canonicalBaseUrl,
                     signal,
                 );
             }
@@ -3985,7 +4003,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
 
             const units = await this.prisma.vismedUnit.findMany({ where: { isActive: true } });
             if (units.length === 0) return 'unverified';
-            const baseUrl = conn.domain || undefined;
+            const baseUrl = feedContract.canonicalBaseUrl;
 
             let allUnitsRead = true;
             for (const u of units) {

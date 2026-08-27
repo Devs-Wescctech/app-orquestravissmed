@@ -1,9 +1,10 @@
 import { BookingSyncService } from './booking-sync.service';
 import { ClinicConcurrencyGuard } from './clinic-concurrency-guard';
-import { normalizeVismedAppointmentFeedMode } from './vismed-appointment-feed-mode';
 import { normalizeVismedAppointmentRecoveryIds } from './vismed-appointment-feed-recovery';
 
 const clinicId = 'clinic-feed-mode';
+const LEGACY_BASE_URL = 'https://app.vissmed.com.br/api-vissmed-4';
+const INCREMENTAL_BASE_URL = 'https://app.vissmed.com.br/api-docctor-3';
 
 const appointment = (id = 'vismed-appointment-1') => ({
     idpacienteagendamento: id,
@@ -16,13 +17,17 @@ const appointment = (id = 'vismed-appointment-1') => ({
 function buildService(options: {
     feedMode?: unknown;
     response?: any;
+    domain?: unknown;
 } = {}) {
+    const defaultDomain = options.feedMode === 'INCREMENTAL'
+        ? INCREMENTAL_BASE_URL
+        : LEGACY_BASE_URL;
     const conn = {
         clinicId,
         provider: 'vismed',
         status: 'connected',
         clientId: '42',
-        domain: 'https://vismed.test',
+        domain: options.domain === undefined ? defaultDomain : options.domain,
         ...(options.feedMode === undefined
             ? {}
             : { vismedAppointmentFeedMode: options.feedMode }),
@@ -94,28 +99,6 @@ function buildService(options: {
     };
 }
 
-describe('normalizeVismedAppointmentFeedMode', () => {
-    it.each([
-        ['campo ausente', undefined],
-        ['null', null],
-        ['vazio', ''],
-        ['valor desconhecido', 'FUTURE_MODE'],
-    ])('resolve %s como LEGACY', (_label, value) => {
-        expect(normalizeVismedAppointmentFeedMode(value).mode).toBe('LEGACY');
-    });
-
-    it('seleciona INCREMENTAL apenas quando o valor é explícito e reconhecido', () => {
-        expect(normalizeVismedAppointmentFeedMode('INCREMENTAL')).toEqual({
-            mode: 'INCREMENTAL',
-            invalidConfiguration: false,
-        });
-        expect(normalizeVismedAppointmentFeedMode('incremental')).toEqual({
-            mode: 'LEGACY',
-            invalidConfiguration: true,
-        });
-    });
-});
-
 describe('normalizeVismedAppointmentRecoveryIds', () => {
     it('aceita apenas IDs identificáveis e deduplica o lote da futura reentrega', () => {
         expect(normalizeVismedAppointmentRecoveryIds([
@@ -157,14 +140,14 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
         await service.pollVismedClinic(conn);
 
         expect(vismedService.getUnidadesForPolling).toHaveBeenCalledTimes(1);
-        expect(vismedService.getUnidadesForPolling).toHaveBeenCalledWith(42, 'https://vismed.test');
+        expect(vismedService.getUnidadesForPolling).toHaveBeenCalledWith(42, LEGACY_BASE_URL);
         expect(vismedService.getUnidades).not.toHaveBeenCalled();
         expect(vismedService.getAgendamentos).toHaveBeenCalledTimes(2);
         expect(vismedService.getAgendamentos).toHaveBeenNthCalledWith(
-            1, 11, 'https://vismed.test', expect.any(Object),
+            1, 11, LEGACY_BASE_URL, expect.any(Object),
         );
         expect(vismedService.getAgendamentos).toHaveBeenNthCalledWith(
-            2, 12, 'https://vismed.test', expect.any(Object),
+            2, 12, LEGACY_BASE_URL, expect.any(Object),
         );
         expect(vismedService.getAgendamentos).not.toHaveBeenCalledWith(
             999, expect.anything(), expect.anything(),
@@ -176,7 +159,7 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
             expect.any(Date),
             expect.any(Date),
             [{ vismedId: 11 }, { vismedId: 12 }],
-            'https://vismed.test',
+            LEGACY_BASE_URL,
             expect.any(String),
             expect.any(String),
             expect.any(Array),
@@ -204,6 +187,48 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
         expect(upsert).not.toHaveBeenCalled();
         expect(reconcileUnlinked).not.toHaveBeenCalled();
         expect(prisma.vismedUnit.findMany).not.toHaveBeenCalled();
+    });
+
+    it('revalida a conexão fresca e bloqueia o próximo poll após mudança para base desconhecida', async () => {
+        const {
+            service, conn, prisma, vismedService, upsert, reconcileDisappeared,
+            reconcileUnlinked, reconcileCancelled, reconcileWithoutVismedId,
+            propagateCancellation, syncBreak,
+        } = buildService({ feedMode: 'INCREMENTAL' });
+        prisma.integrationConnection.findFirst.mockResolvedValue({
+            ...conn,
+            domain: 'https://app.vissmed.com.br/unknown-instance',
+        });
+
+        await service.pollVismedClinic(conn);
+
+        expect(vismedService.getUnidadesForPolling).not.toHaveBeenCalled();
+        expect(vismedService.getAgendamentos).not.toHaveBeenCalled();
+        expect(upsert).not.toHaveBeenCalled();
+        expect(reconcileDisappeared).not.toHaveBeenCalled();
+        expect(reconcileUnlinked).not.toHaveBeenCalled();
+        expect(reconcileCancelled).not.toHaveBeenCalled();
+        expect(reconcileWithoutVismedId).not.toHaveBeenCalled();
+        expect(propagateCancellation).not.toHaveBeenCalled();
+        expect(syncBreak).not.toHaveBeenCalled();
+    });
+
+    it('ignora campo legado divergente e usa o contrato incremental do registry', async () => {
+        const {
+            service, conn, prisma, capture, logger, vismedService,
+        } = buildService({ feedMode: 'LEGACY', domain: INCREMENTAL_BASE_URL });
+        prisma.integrationConnection.findFirst.mockResolvedValue(conn);
+
+        await service.pollVismedClinic(conn);
+
+        expect(capture).not.toHaveBeenCalled();
+        expect(vismedService.getAgendamentos).toHaveBeenCalled();
+        expect(logger.warn).toHaveBeenCalledWith(
+            expect.stringContaining('VISMED_APPOINTMENT_FEED_MODE_DIVERGENCE'),
+        );
+        expect(logger.log).toHaveBeenCalledWith(
+            expect.stringContaining('source=INSTANCE_REGISTRY'),
+        );
     });
 
     it.each([
@@ -268,7 +293,7 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
         expect(upsert).toHaveBeenCalledWith(
             clinicId,
             appointment(),
-            { idEmpresaGestora: 42, baseUrl: 'https://vismed.test' },
+            { idEmpresaGestora: 42, baseUrl: LEGACY_BASE_URL },
         );
         expect(reconcileDisappeared).toHaveBeenCalledWith(
             clinicId,
@@ -276,7 +301,7 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
             expect.any(Date),
             expect.any(Date),
             [{ vismedId: 11 }],
-            'https://vismed.test',
+            LEGACY_BASE_URL,
             expect.any(String),
             expect.any(String),
             [{ id: 'known-booking-sync', vismedAppointmentId: 'known-vismed-id' }],
@@ -307,7 +332,7 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
         );
     });
 
-    it('avisa sobre configuração inválida e continua no ramo LEGACY', async () => {
+    it('registra divergência do campo legado e continua no ramo do registry', async () => {
         const {
             service, conn, capture, reconcileDisappeared, logger,
         } = buildService({ feedMode: 'incremental', response: [] });
@@ -317,10 +342,10 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
         expect(capture).toHaveBeenCalledTimes(1);
         expect(reconcileDisappeared).toHaveBeenCalledTimes(1);
         expect(logger.warn).toHaveBeenCalledWith(
-            expect.stringContaining('INVALID_APPOINTMENT_FEED_MODE'),
+            expect.stringContaining('VISMED_APPOINTMENT_FEED_MODE_DIVERGENCE'),
         );
         expect(logger.warn).not.toHaveBeenCalledWith(
-            expect.stringContaining('incremental'),
+            expect.stringContaining('legacyFieldValue'),
         );
     });
 
@@ -335,7 +360,7 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
         expect(upsert).toHaveBeenCalledWith(
             clinicId,
             appointment('pending-1'),
-            { idEmpresaGestora: 42, baseUrl: 'https://vismed.test' },
+            { idEmpresaGestora: 42, baseUrl: INCREMENTAL_BASE_URL },
         );
         expect(capture).not.toHaveBeenCalled();
         expect(reconcileDisappeared).not.toHaveBeenCalled();
@@ -345,7 +370,7 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
         );
         expect(vismedService.getAgendamentos).toHaveBeenCalledWith(
             11,
-            'https://vismed.test',
+            INCREMENTAL_BASE_URL,
             expect.not.objectContaining({ nonDestructive: expect.anything() }),
         );
     });
@@ -379,7 +404,7 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
         expect(vismedService.requestRedelivery).toHaveBeenCalledTimes(1);
         expect(vismedService.requestRedelivery).toHaveBeenCalledWith(
             ['retryable-1'],
-            'https://vismed.test',
+            INCREMENTAL_BASE_URL,
         );
         expect(logger.warn).toHaveBeenCalledWith(
             expect.stringContaining('RECOVERY_CANDIDATE'),
@@ -405,7 +430,7 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
         );
         expect(vismedService.requestRedelivery).toHaveBeenCalledWith(
             ['invalid-payload-1'],
-            'https://vismed.test',
+            INCREMENTAL_BASE_URL,
         );
     });
 
@@ -475,13 +500,13 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
             1,
             clinicId,
             appointment('replay-1'),
-            { idEmpresaGestora: 42, baseUrl: 'https://vismed.test' },
+            { idEmpresaGestora: 42, baseUrl: INCREMENTAL_BASE_URL },
         );
         expect(upsert).toHaveBeenNthCalledWith(
             2,
             clinicId,
             appointment('replay-1'),
-            { idEmpresaGestora: 42, baseUrl: 'https://vismed.test' },
+            { idEmpresaGestora: 42, baseUrl: INCREMENTAL_BASE_URL },
         );
     });
 
@@ -502,13 +527,13 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
             1,
             clinicId,
             original,
-            { idEmpresaGestora: 42, baseUrl: 'https://vismed.test' },
+            { idEmpresaGestora: 42, baseUrl: INCREMENTAL_BASE_URL },
         );
         expect(upsert).toHaveBeenNthCalledWith(
             2,
             clinicId,
             updated,
-            { idEmpresaGestora: 42, baseUrl: 'https://vismed.test' },
+            { idEmpresaGestora: 42, baseUrl: INCREMENTAL_BASE_URL },
         );
     });
 
@@ -544,6 +569,39 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
     );
 });
 
+describe('BookingSyncService — descoberta de timers Vissmed', () => {
+    it('não agenda timer novo para conexão não classificada', async () => {
+        const service: any = Object.create(BookingSyncService.prototype);
+        service.prisma = {
+            integrationConnection: {
+                findMany: jest.fn()
+                    .mockResolvedValueOnce([])
+                    .mockResolvedValueOnce([])
+                    .mockResolvedValueOnce([{
+                        clinicId,
+                        provider: 'vismed',
+                        status: 'connected',
+                        clientId: '42',
+                        domain: 'https://app.vissmed.com.br/unknown-instance',
+                        vismedAppointmentFeedMode: 'LEGACY',
+                    }]),
+            },
+        };
+        service.logger = { log: jest.fn(), warn: jest.fn(), debug: jest.fn(), error: jest.fn() };
+        service.polledClinicIds = new Set<string>();
+        service.polledVismedClinicIds = new Set<string>();
+        service.clinicTimers = [];
+        service.isShuttingDown = false;
+
+        await service.refreshPollingSchedule();
+
+        expect(service.polledVismedClinicIds.has(clinicId)).toBe(false);
+        expect(service.logger.warn).toHaveBeenCalledWith(
+            expect.stringContaining('VISMED_APPOINTMENT_FEED_UNCLASSIFIED'),
+        );
+    });
+});
+
 describe('BookingSyncService — verify VisMed por contrato de feed', () => {
     it.each([
         ['confirma o ID esperado', [appointment('expected-1')], 'confirmed'],
@@ -564,7 +622,7 @@ describe('BookingSyncService — verify VisMed por contrato de feed', () => {
 
         expect(vismedService.getAgendamentoById).toHaveBeenCalledWith(
             'expected-1',
-            'https://vismed.test',
+            INCREMENTAL_BASE_URL,
             undefined,
         );
         expect(vismedService.getAgendamentos).not.toHaveBeenCalled();
@@ -583,10 +641,32 @@ describe('BookingSyncService — verify VisMed por contrato de feed', () => {
         expect(vismedService.getAgendamentos).not.toHaveBeenCalled();
     });
 
+    it('usa a URL canônica no verify incremental após normalizações sintáticas seguras', async () => {
+        const { service, vismedService } = buildService({
+            feedMode: 'LEGACY',
+            domain: '  https://APP.VISSMED.COM.BR:443/api-docctor-3/  ',
+        });
+        vismedService.getAgendamentoById.mockResolvedValue([]);
+
+        await expect((service as any).verifyVismedAppointmentExists(
+            clinicId,
+            'doctor-uuid',
+            'expected-1',
+            { start_at: '2026-08-20T12:00:00.000Z' },
+        )).resolves.toBe('not_found');
+
+        expect(vismedService.getAgendamentoById).toHaveBeenCalledWith(
+            'expected-1',
+            INCREMENTAL_BASE_URL,
+            undefined,
+        );
+    });
+
     it('preserva exatamente a consulta ao feed e a interpretação LEGACY', async () => {
         const { service, vismedService } = buildService({
             feedMode: 'LEGACY',
             response: [appointment('legacy-1')],
+            domain: '  https://APP.VISSMED.COM.BR:443/api-vissmed-4/  ',
         });
 
         await expect((service as any).verifyVismedAppointmentExists(
@@ -597,15 +677,37 @@ describe('BookingSyncService — verify VisMed por contrato de feed', () => {
         )).resolves.toBe('confirmed');
 
         expect(vismedService.getAgendamentos).toHaveBeenCalledTimes(1);
+        expect(vismedService.getAgendamentos).toHaveBeenCalledWith(
+            11,
+            LEGACY_BASE_URL,
+            expect.any(Object),
+        );
         expect(vismedService.getAgendamentoById).not.toHaveBeenCalled();
+    });
+
+    it('não lê o feed no verify quando a instância é desconhecida', async () => {
+        const { service, vismedService } = buildService({
+            domain: 'https://app.vissmed.com.br/unknown-instance',
+        });
+
+        await expect((service as any).verifyVismedAppointmentExists(
+            clinicId,
+            'doctor-uuid',
+            'expected-1',
+            { start_at: '2026-08-20T12:00:00.000Z' },
+        )).resolves.toBe('unverified');
+
+        expect(vismedService.getAgendamentoById).not.toHaveBeenCalled();
+        expect(vismedService.getAgendamentos).not.toHaveBeenCalled();
     });
 });
 
 describe('BookingSyncService — preflight incremental não destrutivo', () => {
     it('lê todas as unidades com sincronizar=0 e classifica ausência completa', async () => {
         const { service, vismedService, prisma } = buildService({
-            feedMode: 'INCREMENTAL',
+            feedMode: 'LEGACY',
             response: [],
+            domain: '  https://APP.VISSMED.COM.BR:443/api-docctor-3/  ',
         });
         prisma.vismedUnit.findMany.mockResolvedValue([{ vismedId: 11 }, { vismedId: 12 }]);
 
@@ -624,7 +726,7 @@ describe('BookingSyncService — preflight incremental não destrutivo', () => {
         expect(vismedService.getAgendamentos).toHaveBeenNthCalledWith(
             1,
             11,
-            'https://vismed.test',
+            INCREMENTAL_BASE_URL,
             expect.objectContaining({
                 dataini: '20/08/2026',
                 datafim: '20/08/2026',
@@ -635,10 +737,33 @@ describe('BookingSyncService — preflight incremental não destrutivo', () => {
         expect(vismedService.getAgendamentos).toHaveBeenNthCalledWith(
             2,
             12,
-            'https://vismed.test',
+            INCREMENTAL_BASE_URL,
             expect.objectContaining({ nonDestructive: true }),
         );
         expect(vismedService.getAgendamentoById).not.toHaveBeenCalled();
         expect(vismedService.requestRedelivery).not.toHaveBeenCalled();
+    });
+
+    it('não lê unidades nem feed no preflight quando a instância é desconhecida', async () => {
+        const { service, vismedService, prisma } = buildService({
+            domain: 'https://app.vissmed.com.br/unknown-instance',
+        });
+
+        await expect((service as any).preflightVismedAppointment(
+            clinicId,
+            'doctor-uuid',
+            {
+                start_at: '2026-08-20T12:00:00.000Z',
+                patient: { name: 'Paciente', surname: 'Teste' },
+            },
+            'booking-sync-id',
+            new AbortController().signal,
+        )).resolves.toEqual({
+            state: 'unknown',
+            reason: 'unclassified_appointment_feed_instance',
+        });
+
+        expect(prisma.vismedUnit.findMany).not.toHaveBeenCalled();
+        expect(vismedService.getAgendamentos).not.toHaveBeenCalled();
     });
 });
