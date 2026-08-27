@@ -28,7 +28,7 @@ export class PushSyncService {
         }
 
         const clinicDoctorMappings = await this.prisma.mapping.findMany({
-            where: { clinicId, entityType: 'DOCTOR' },
+            where: { clinicId, entityType: 'DOCTOR', status: 'LINKED' },
             select: { vismedId: true },
         });
         const clinicDoctorIds = clinicDoctorMappings.map(m => m.vismedId).filter(Boolean) as string[];
