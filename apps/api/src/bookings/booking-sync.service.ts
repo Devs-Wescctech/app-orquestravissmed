@@ -1252,6 +1252,26 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             const doctorUnlinked = unlinked.filter(r => r.doctoraliaDoctorId === doctorId);
             if (doctorUnlinked.length === 0) continue;
 
+            let doctor: { doctoraliaFacilityId: string } | null;
+            try {
+                doctor = await this.prisma.doctoraliaDoctor.findUnique({
+                    where: { doctoraliaDoctorId: doctorId },
+                    select: { doctoraliaFacilityId: true },
+                });
+            } catch {
+                this.logger.warn(
+                    `[RECONCILE] clinicId=${clinicId} doctorId=${doctorId} stage=resolve_doctor action=skip_error`,
+                );
+                continue;
+            }
+            const facilityId = doctor?.doctoraliaFacilityId?.trim();
+            if (!facilityId) {
+                this.logger.warn(
+                    `[RECONCILE] clinicId=${clinicId} doctorId=${doctorId} stage=resolve_doctor action=skip`,
+                );
+                continue;
+            }
+
             const minStartDate = new Date(Math.min(...doctorUnlinked.map(r => r.startAt.getTime())) - 24 * 60 * 60 * 1000);
             const maxEndDate = new Date(Math.max(...doctorUnlinked.map(r => r.startAt.getTime())) + 24 * 60 * 60 * 1000);
             const toBrtIso = (d: Date) => {
@@ -1262,21 +1282,36 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             const minStart = toBrtIso(minStartDate);
             const maxEnd = toBrtIso(maxEndDate);
 
-            const addresses = await this.prisma.bookingSync.findMany({
-                where: { clinicId, doctoraliaDoctorId: doctorId, doctoraliaAddressId: { not: null } },
-                select: { doctoraliaAddressId: true, doctoraliaFacilityId: true },
-                distinct: ['doctoraliaAddressId'],
-            });
+            let addresses: any[];
+            try {
+                await this.rateLimiter.acquire('doctoralia');
+                const response = await client.getAddresses(facilityId, doctorId);
+                const items = response?._items || (Array.isArray(response) ? response : []);
+                addresses = Array.isArray(items) ? items : [];
+            } catch {
+                this.logger.warn(
+                    `[RECONCILE] clinicId=${clinicId} doctorId=${doctorId} facilityId=${facilityId} stage=get_addresses action=skip`,
+                );
+                continue;
+            }
+
+            if (addresses.length === 0) {
+                this.logger.warn(
+                    `[RECONCILE] clinicId=${clinicId} doctorId=${doctorId} facilityId=${facilityId} stage=get_addresses action=skip_empty`,
+                );
+                continue;
+            }
 
             for (const addr of addresses) {
-                if (!addr.doctoraliaAddressId || !addr.doctoraliaFacilityId) continue;
+                const addressId = String(addr?.id || '').trim();
+                if (!addressId) continue;
 
                 try {
                     await this.rateLimiter.acquire('doctoralia');
                     const res = await client.getBookings(
-                        addr.doctoraliaFacilityId,
+                        facilityId,
                         doctorId,
-                        addr.doctoraliaAddressId,
+                        addressId,
                         minStart,
                         maxEnd,
                     );
@@ -1305,24 +1340,38 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                         );
 
                         if (match) {
-                            await this.prisma.bookingSync.update({
-                                where: { id: match.id },
+                            const adopted = await this.prisma.bookingSync.updateMany({
+                                where: {
+                                    id: match.id,
+                                    clinicId,
+                                    doctoraliaDoctorId: doctorId,
+                                    doctoraliaBookingId: null,
+                                    status: { in: ['BOOKED', 'CONFIRMED'] },
+                                },
                                 data: {
                                     doctoraliaBookingId: bid,
-                                    doctoraliaAddressId: addr.doctoraliaAddressId,
-                                    doctoraliaFacilityId: addr.doctoraliaFacilityId,
+                                    doctoraliaAddressId: addressId,
+                                    doctoraliaFacilityId: facilityId,
                                     syncedToDoctoralia: true,
                                 },
                             });
+                            if (adopted.count !== 1) {
+                                this.logger.warn(
+                                    `[RECONCILE] clinicId=${clinicId} doctorId=${doctorId} facilityId=${facilityId} addressId=${addressId} bookingSyncId=${match.id} doctoraliaBookingId=${bid} stage=match action=skip_changed`,
+                                );
+                                continue;
+                            }
                             match.doctoraliaBookingId = bid;
                             alreadyLinked.add(bid);
                             this.logger.log(
-                                `[RECONCILE] Linked BookingSync ${match.id} (vismedAppt=${match.vismedAppointmentId}) ↔ Doctoralia booking ${bid}`,
+                                `[RECONCILE] clinicId=${clinicId} doctorId=${doctorId} facilityId=${facilityId} addressId=${addressId} bookingSyncId=${match.id} doctoraliaBookingId=${bid} stage=match action=linked`,
                             );
                         }
                     }
-                } catch (err: any) {
-                    this.logger.warn(`[RECONCILE] Failed fetching bookings for doctor ${doctorId}: ${err.message}`);
+                } catch {
+                    this.logger.warn(
+                        `[RECONCILE] clinicId=${clinicId} doctorId=${doctorId} facilityId=${facilityId} addressId=${addressId} stage=get_bookings action=skip`,
+                    );
                 }
             }
         }

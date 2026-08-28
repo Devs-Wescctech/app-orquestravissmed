@@ -36,6 +36,8 @@ const notification = (id = 'booking-anon-1') => ({
 function buildService() {
     const client = {
         getNotifications: jest.fn().mockResolvedValue({ _items: [] }),
+        getAddresses: jest.fn().mockResolvedValue({ _items: [] }),
+        getBookings: jest.fn().mockResolvedValue({ _items: [] }),
     };
     const prisma = {
         integrationConnection: {
@@ -44,8 +46,12 @@ function buildService() {
         bookingSync: {
             upsert: jest.fn(),
             findUnique: jest.fn(),
+            findMany: jest.fn().mockResolvedValue([]),
             update: jest.fn().mockResolvedValue({}),
             updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        },
+        doctoraliaDoctor: {
+            findUnique: jest.fn().mockResolvedValue(null),
         },
         mapping: {
             findFirst: jest.fn().mockResolvedValue(null),
@@ -77,6 +83,148 @@ function buildService() {
     );
     return { service, prisma, queue, rateLimiter, guard, client, metrics, claim };
 }
+
+describe('BookingSyncService — reconciliação Doctoralia com vínculos atuais', () => {
+    const clinicId = conn.clinicId;
+    const startAt = new Date('2026-08-20T12:00:00.000Z');
+    const unlinked = (doctorId: string, id = `sync-${doctorId}`) => ({
+        id,
+        clinicId,
+        doctoraliaDoctorId: doctorId,
+        doctoraliaBookingId: null,
+        doctoraliaAddressId: 'historical-address',
+        doctoraliaFacilityId: 'historical-facility',
+        vismedAppointmentId: `vismed-${id}`,
+        status: 'BOOKED',
+        startAt,
+    });
+
+    function setup(records: any[]) {
+        const built = buildService();
+        built.prisma.bookingSync.findMany
+            .mockResolvedValueOnce(records)
+            .mockResolvedValue([]);
+        return built;
+    }
+
+    it('usa somente facility atual e endereços atuais, buscando endereços uma vez por médico', async () => {
+        const { service, prisma, client } = setup([
+            unlinked('doctor-1', 'sync-1'),
+            { ...unlinked('doctor-1', 'sync-2'), startAt: new Date(startAt.getTime() + 60_000) },
+        ]);
+        prisma.doctoraliaDoctor.findUnique.mockResolvedValue({ doctoraliaFacilityId: 'current-facility' });
+        client.getAddresses.mockResolvedValue({ _items: [{ id: 'current-address' }] });
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect(client.getAddresses).toHaveBeenCalledTimes(1);
+        expect(client.getAddresses).toHaveBeenCalledWith('current-facility', 'doctor-1');
+        expect(client.getBookings).toHaveBeenCalledWith(
+            'current-facility', 'doctor-1', 'current-address', expect.any(String), expect.any(String),
+        );
+        expect(client.getBookings).not.toHaveBeenCalledWith(
+            'historical-facility', expect.anything(), 'historical-address', expect.anything(), expect.anything(),
+        );
+    });
+
+    it.each([
+        ['médico ausente', null, { _items: [{ id: 'address-1' }] }, false],
+        ['facility vazia', { doctoraliaFacilityId: ' ' }, { _items: [{ id: 'address-1' }] }, false],
+        ['endereços vazios', { doctoraliaFacilityId: 'facility-1' }, { _items: [] }, true],
+    ])('encerra somente o grupo quando há %s', async (_label, doctor, addresses, callsAddresses) => {
+        const { service, prisma, client } = setup([unlinked('doctor-1')]);
+        prisma.doctoraliaDoctor.findUnique.mockResolvedValue(doctor);
+        client.getAddresses.mockResolvedValue(addresses);
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect(client.getAddresses).toHaveBeenCalledTimes(callsAddresses ? 1 : 0);
+        expect(client.getBookings).not.toHaveBeenCalled();
+        expect(prisma.bookingSync.update).not.toHaveBeenCalled();
+    });
+
+    it('isola erro de endereços de um médico e continua com o próximo', async () => {
+        const { service, prisma, client } = setup([
+            unlinked('doctor-fails'),
+            unlinked('doctor-ok'),
+        ]);
+        prisma.doctoraliaDoctor.findUnique
+            .mockResolvedValueOnce({ doctoraliaFacilityId: 'facility-fails' })
+            .mockResolvedValueOnce({ doctoraliaFacilityId: 'facility-ok' });
+        client.getAddresses
+            .mockRejectedValueOnce(new Error('403 with patient data that must not be logged'))
+            .mockResolvedValueOnce({ _items: [{ id: 'address-ok' }] });
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect(client.getBookings).toHaveBeenCalledWith(
+            'facility-ok', 'doctor-ok', 'address-ok', expect.any(String), expect.any(String),
+        );
+    });
+
+    it('isola erro no lookup local de um médico e continua com o próximo', async () => {
+        const { service, prisma, client } = setup([
+            unlinked('doctor-fails'),
+            unlinked('doctor-ok'),
+        ]);
+        prisma.doctoraliaDoctor.findUnique
+            .mockRejectedValueOnce(new Error('database unavailable'))
+            .mockResolvedValueOnce({ doctoraliaFacilityId: 'facility-ok' });
+        client.getAddresses.mockResolvedValue({ _items: [{ id: 'address-ok' }] });
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect(client.getAddresses).toHaveBeenCalledTimes(1);
+        expect(client.getBookings).toHaveBeenCalledWith(
+            'facility-ok', 'doctor-ok', 'address-ok', expect.any(String), expect.any(String),
+        );
+    });
+
+    it('isola falha de endereço e vincula o match válido sem atravessar clínica', async () => {
+        const record = unlinked('doctor-1');
+        const { service, prisma, client } = setup([record]);
+        prisma.doctoraliaDoctor.findUnique.mockResolvedValue({ doctoraliaFacilityId: 'facility-1' });
+        client.getAddresses.mockResolvedValue({ _items: [{ id: 'address-fails' }, { id: 'address-ok' }] });
+        client.getBookings
+            .mockRejectedValueOnce(new Error('forbidden'))
+            .mockResolvedValueOnce({
+                _items: [{ id: 'booking-1', start_at: startAt.toISOString() }],
+            });
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect(prisma.bookingSync.updateMany).toHaveBeenCalledWith({
+            where: {
+                id: record.id,
+                clinicId,
+                doctoraliaDoctorId: 'doctor-1',
+                doctoraliaBookingId: null,
+                status: { in: ['BOOKED', 'CONFIRMED'] },
+            },
+            data: {
+                doctoraliaBookingId: 'booking-1',
+                doctoraliaAddressId: 'address-ok',
+                doctoraliaFacilityId: 'facility-1',
+                syncedToDoctoralia: true,
+            },
+        });
+    });
+
+    it('não adota quando o registro muda entre a seleção e a persistência', async () => {
+        const record = unlinked('doctor-1');
+        const { service, prisma, client } = setup([record]);
+        prisma.doctoraliaDoctor.findUnique.mockResolvedValue({ doctoraliaFacilityId: 'facility-1' });
+        prisma.bookingSync.updateMany.mockResolvedValue({ count: 0 });
+        client.getAddresses.mockResolvedValue({ _items: [{ id: 'address-1' }] });
+        client.getBookings.mockResolvedValue({
+            _items: [{ id: 'booking-1', start_at: startAt.toISOString() }],
+        });
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect(record.doctoraliaBookingId).toBeNull();
+    });
+});
 
 describe('BookingSyncService — ingestão Doctoralia confiável', () => {
     it('poll de notifications atravessa poll VisMed longo e o booking alcança handleSlotBooked', async () => {
