@@ -827,20 +827,22 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                     );
                     continue;
                 }
-                await this.propagateVismedCancellationToDoctoralia(rec.id).catch(err =>
-                    this.logger.warn(
-                        `[RECONCILE-DISAPPEARED] propagate cancel failed for ${rec.vismedAppointmentId}: ${err.message}`,
-                    ),
-                );
-                // Agendamentos origin=VISMED criam um BREAK (bloqueio) na Doctoralia em vez de
-                // booking. O propagate acima só cancela bookings (precisa de doctoraliaBookingId).
-                // Sem esta chamada, o break permanecia na agenda da Doctoralia mesmo após o
-                // agendamento sumir da VisMed. syncDoctoraliaBreak apaga o break quando status=CANCELLED.
-                await this.syncDoctoraliaBreak(rec.id).catch(err =>
-                    this.logger.warn(
-                        `[RECONCILE-DISAPPEARED] break delete failed for ${rec.vismedAppointmentId}: ${err.message}`,
-                    ),
-                );
+                if (await this.resolveCurrentClinicDoctorMapping(rec, 'RECONCILE_DISAPPEARED')) {
+                    await this.propagateVismedCancellationToDoctoralia(rec.id).catch(err =>
+                        this.logger.warn(
+                            `[RECONCILE-DISAPPEARED] propagate cancel failed for ${rec.vismedAppointmentId}: ${err.message}`,
+                        ),
+                    );
+                    // Agendamentos origin=VISMED criam um BREAK (bloqueio) na Doctoralia em vez de
+                    // booking. O propagate acima só cancela bookings (precisa de doctoraliaBookingId).
+                    // Sem esta chamada, o break permanecia na agenda da Doctoralia mesmo após o
+                    // agendamento sumir da VisMed. syncDoctoraliaBreak apaga o break quando status=CANCELLED.
+                    await this.syncDoctoraliaBreak(rec.id).catch(err =>
+                        this.logger.warn(
+                            `[RECONCILE-DISAPPEARED] break delete failed for ${rec.vismedAppointmentId}: ${err.message}`,
+                        ),
+                    );
+                }
             } catch (err: any) {
                 this.logger.warn(
                     `[RECONCILE-DISAPPEARED] Error processing ${rec.vismedAppointmentId}: ${err.message}`,
@@ -1394,7 +1396,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             cursor.discoveryPageHadAuthorizedFacility = false;
             cursor.discoveryPageFailed = false;
         }
-        const unlinked = await this.prisma.bookingSync.findMany({
+        const unlinkedCandidates = await this.prisma.bookingSync.findMany({
             where: {
                 ...eligibleWhere,
                 doctoraliaDoctorId: doctorId,
@@ -1404,7 +1406,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             take: MAX_UNLINKED,
         });
 
-        if (unlinked.length === 0) {
+        if (unlinkedCandidates.length === 0) {
             this.deleteReconcileOffset(clinicId, cursor, doctorId);
             cursor.lastDoctorId = doctorId;
             cursor.touchedAt = startedAt;
@@ -1412,8 +1414,8 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             this.reconcileDoctorCursorByClinic.set(clinicId, cursor);
             return;
         }
-        const hasContinuation = unlinked.length >= MAX_UNLINKED;
-        const continuationOffset = hasContinuation ? unlinked[unlinked.length - 1].id : undefined;
+        const hasContinuation = unlinkedCandidates.length >= MAX_UNLINKED;
+        const continuationOffset = hasContinuation ? unlinkedCandidates[unlinkedCandidates.length - 1].id : undefined;
         cursor.touchedAt = startedAt;
         this.reconcileDoctorCursorByClinic.delete(clinicId);
         this.reconcileDoctorCursorByClinic.set(clinicId, cursor);
@@ -1422,7 +1424,21 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             if (!oldestClinicId) break;
             this.deleteReconcileCursor(oldestClinicId);
         }
-        if (unlinked.length === 0) return;
+        const unlinked = [];
+        for (const candidate of unlinkedCandidates) {
+            if (await this.resolveCurrentClinicDoctorMapping(candidate, 'RECONCILE_UNLINKED')) {
+                unlinked.push(candidate);
+            }
+        }
+        if (unlinked.length === 0) {
+            if (hasContinuation && continuationOffset) {
+                this.setReconcileOffset(clinicId, cursor, doctorId, continuationOffset);
+            } else {
+                this.deleteReconcileOffset(clinicId, cursor, doctorId);
+                cursor.lastDoctorId = doctorId;
+            }
+            return;
+        }
 
         const docConn = await this.prisma.integrationConnection.findFirst({
             where: { clinicId, provider: 'doctoralia', status: { not: 'disconnected' }, clientId: { not: null } },
@@ -1786,6 +1802,14 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
 
         if (linked.length === 0) return;
 
+        const authorizedLinked = [];
+        for (const rec of linked) {
+            if (await this.resolveCurrentClinicDoctorMapping(rec, 'RECONCILE_CANCELLED_DISCOVERY')) {
+                authorizedLinked.push(rec);
+            }
+        }
+        if (authorizedLinked.length === 0) return;
+
         const docConn = await this.prisma.integrationConnection.findFirst({
             where: { clinicId, provider: 'doctoralia', status: { not: 'disconnected' }, clientId: { not: null } },
         });
@@ -1797,10 +1821,10 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             docConn.clientSecret || '',
         );
 
-        const doctorIds = [...new Set(linked.map(r => r.doctoraliaDoctorId!).filter(Boolean))];
+        const doctorIds = [...new Set(authorizedLinked.map(r => r.doctoraliaDoctorId!).filter(Boolean))];
 
         for (const doctorId of doctorIds) {
-            const doctorLinked = linked.filter(r => r.doctoraliaDoctorId === doctorId);
+            const doctorLinked = authorizedLinked.filter(r => r.doctoraliaDoctorId === doctorId);
             if (doctorLinked.length === 0) continue;
 
             const minStartDate = new Date(Math.min(...doctorLinked.map(r => r.startAt.getTime())) - 24 * 60 * 60 * 1000);
@@ -1889,6 +1913,9 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                         );
 
                         try {
+                            if (!await this.resolveCurrentClinicDoctorMapping(rec, 'RECONCILE_CANCELLED_PROPAGATE')) {
+                                continue;
+                            }
                             const updated = await this.prisma.bookingSync.updateMany({
                                 where: {
                                     id: rec.id,
@@ -2015,6 +2042,130 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         }
     }
 
+    private async resolveCurrentClinicDoctorMapping(
+        rec: { clinicId: string; vismedDoctorId?: string | null; doctoraliaDoctorId?: string | null },
+        stage: string,
+    ): Promise<any | null> {
+        const safeId = (value: unknown): string => String(value ?? 'none')
+            .replace(/[^A-Za-z0-9_-]/g, '_')
+            .slice(0, 100) || 'none';
+        if (!rec.vismedDoctorId) {
+            this.logger.warn(
+                `[VISMED-POLL] CLINIC_DOCTOR_REMOTE_EFFECT_SKIPPED clinicId=${safeId(rec.clinicId)} vismedDoctorId=${safeId(rec.vismedDoctorId)} doctoraliaDoctorId=${safeId(rec.doctoraliaDoctorId)} stage=${safeId(stage)} reason=TECHNICAL_ID_MISSING action=SKIP_REMOTE_EFFECT`,
+            );
+            return null;
+        }
+
+        const mapping = await this.prisma.mapping.findUnique({
+            where: {
+                clinicId_entityType_vismedId: {
+                    clinicId: rec.clinicId,
+                    entityType: 'DOCTOR',
+                    vismedId: rec.vismedDoctorId,
+                },
+            },
+        });
+        const externalId = typeof mapping?.externalId === 'string'
+            ? mapping.externalId.trim()
+            : '';
+        if (
+            !mapping
+            || mapping.status !== 'LINKED'
+            || !externalId
+            || (rec.doctoraliaDoctorId && externalId !== rec.doctoraliaDoctorId)
+        ) {
+            this.logger.warn(
+                `[VISMED-POLL] CLINIC_DOCTOR_REMOTE_EFFECT_SKIPPED clinicId=${safeId(rec.clinicId)} vismedDoctorId=${safeId(rec.vismedDoctorId)} mappingId=${safeId(mapping?.id)} doctoraliaDoctorId=${safeId(rec.doctoraliaDoctorId)} stage=${safeId(stage)} reason=CLINIC_MAPPING_NOT_AUTHORIZED action=SKIP_REMOTE_EFFECT`,
+            );
+            return null;
+        }
+
+        const localDoctor = await this.prisma.doctoraliaDoctor.findUnique({
+            where: { doctoraliaDoctorId: externalId },
+        });
+        if (!localDoctor || localDoctor.doctoraliaDoctorId !== externalId) {
+            this.logger.warn(
+                `[VISMED-POLL] CLINIC_DOCTOR_REMOTE_EFFECT_SKIPPED clinicId=${safeId(rec.clinicId)} vismedDoctorId=${safeId(rec.vismedDoctorId)} mappingId=${safeId(mapping.id)} doctoraliaDoctorId=${safeId(externalId)} stage=${safeId(stage)} reason=DOCTORALIA_DOCTOR_NOT_FOUND action=SKIP_REMOTE_EFFECT`,
+            );
+            return null;
+        }
+        return mapping;
+    }
+
+    /**
+     * Resolve o médico Doctoralia exclusivamente pela autoridade da clínica.
+     * ProfessionalUnifiedMapping é deliberadamente apenas um sinal auxiliar de
+     * inconsistência: sua ausência ou divergência nunca muda a decisão clínica.
+     */
+    private async resolveClinicDoctorForVismedAppointment(
+        clinicId: string,
+        vismedDoctorId: string,
+    ): Promise<{ doctoraliaDoctorId: string; doctoraliaFacilityId: string | null } | null> {
+        const safeId = (value: unknown): string => String(value ?? 'none')
+            .replace(/[^A-Za-z0-9_-]/g, '_')
+            .slice(0, 100) || 'none';
+        const mapping = await this.prisma.mapping.findUnique({
+            where: {
+                clinicId_entityType_vismedId: {
+                    clinicId,
+                    entityType: 'DOCTOR',
+                    vismedId: vismedDoctorId,
+                },
+            },
+        });
+
+        const externalId = typeof mapping?.externalId === 'string'
+            ? mapping.externalId.trim()
+            : '';
+        if (!mapping || mapping.status !== 'LINKED' || !externalId) {
+            const reason = !mapping
+                ? 'CLINIC_MAPPING_NOT_FOUND'
+                : mapping.status !== 'LINKED'
+                    ? 'CLINIC_MAPPING_NOT_LINKED'
+                    : 'CLINIC_MAPPING_EXTERNAL_ID_INVALID';
+            this.logger.warn(
+                `[VISMED-POLL] CLINIC_DOCTOR_RESOLUTION_SKIPPED clinicId=${safeId(clinicId)} vismedDoctorId=${safeId(vismedDoctorId)} mappingId=${safeId(mapping?.id)} stage=CLINIC_MAPPING reason=${reason} action=UPSERT_LOCAL_WITHOUT_DOCTORALIA_AUTHORITY`,
+            );
+            return null;
+        }
+
+        const clinicDoctor = await this.prisma.doctoraliaDoctor.findUnique({
+            where: { doctoraliaDoctorId: externalId },
+        });
+        if (!clinicDoctor || clinicDoctor.doctoraliaDoctorId !== externalId) {
+            this.logger.warn(
+                `[VISMED-POLL] CLINIC_DOCTOR_RESOLUTION_SKIPPED clinicId=${safeId(clinicId)} vismedDoctorId=${safeId(vismedDoctorId)} mappingId=${safeId(mapping.id)} doctoraliaDoctorId=${safeId(externalId)} stage=CLINIC_MAPPING reason=DOCTORALIA_DOCTOR_NOT_FOUND action=UPSERT_LOCAL_WITHOUT_DOCTORALIA_AUTHORITY`,
+            );
+            return null;
+        }
+
+        try {
+            const unifiedMappings = await this.prisma.professionalUnifiedMapping.findMany({
+                where: { vismedDoctorId, isActive: true },
+                include: { doctoraliaDoctor: true },
+                orderBy: { id: 'asc' },
+            });
+            for (const unified of unifiedMappings) {
+                const unifiedExternalId = unified.doctoraliaDoctor?.doctoraliaDoctorId || null;
+                if (unifiedExternalId && unifiedExternalId !== externalId) {
+                    this.logger.warn(
+                        `[VISMED-POLL] CLINIC_DOCTOR_AUTHORITY_DIVERGENCE clinicId=${safeId(clinicId)} vismedDoctorId=${safeId(vismedDoctorId)} mappingId=${safeId(mapping.id)} clinicDoctoraliaDoctorId=${safeId(externalId)} unifiedMappingId=${safeId(unified.id)} unifiedDoctoraliaDoctorId=${safeId(unifiedExternalId)} stage=AUXILIARY_COMPARISON reason=UNIFIED_MAPPING_DIVERGES action=USE_CLINIC_MAPPING_REMEDIATE_LATER`,
+                    );
+                }
+            }
+        } catch {
+            // Diagnóstico global é best-effort e não participa da autorização.
+            this.logger.warn(
+                `[VISMED-POLL] CLINIC_DOCTOR_AUXILIARY_CHECK_FAILED clinicId=${safeId(clinicId)} vismedDoctorId=${safeId(vismedDoctorId)} mappingId=${safeId(mapping.id)} clinicDoctoraliaDoctorId=${safeId(externalId)} stage=AUXILIARY_COMPARISON reason=UNIFIED_MAPPING_QUERY_FAILED action=USE_CLINIC_MAPPING`,
+            );
+        }
+
+        return {
+            doctoraliaDoctorId: externalId,
+            doctoraliaFacilityId: clinicDoctor.doctoraliaFacilityId || null,
+        };
+    }
+
     private async upsertVismedAppointment(
         clinicId: string,
         a: any,
@@ -2038,20 +2189,20 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             doctor = await this.ensureVismedDoctorFromAppointment(clinicId, Number(idProf), opts);
         }
 
-        // Resolve linked Doctoralia doctor so the appointment shows up when
-        // the dashboard filters by doctoraliaDoctorId.
-        let doctoraliaDoctorId: string | null = null;
-        let doctoraliaFacilityId: string | null = null;
-        if (doctor?.id) {
-            const link = await this.prisma.professionalUnifiedMapping.findFirst({
-                where: { vismedDoctorId: doctor.id, isActive: true },
-                include: { doctoraliaDoctor: true },
-            });
-            if (link?.doctoraliaDoctor) {
-                doctoraliaDoctorId = link.doctoraliaDoctor.doctoraliaDoctorId;
-                doctoraliaFacilityId = link.doctoraliaDoctor.doctoraliaFacilityId;
-            }
+        // Autoridade exclusiva: o Mapping DOCTOR LINKED desta clínica. O vínculo
+        // unificado é global e serve somente para diagnóstico; nunca autoriza,
+        // invalida, sobrescreve ou fornece fallback para a decisão clínica.
+        let clinicDoctor: { doctoraliaDoctorId: string; doctoraliaFacilityId: string | null } | null = null;
+        if (!doctor?.id) {
+            this.logger.warn(
+                `[VISMED-POLL] CLINIC_DOCTOR_RESOLUTION_SKIPPED clinicId=${String(clinicId).replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 100)} vismedProfessionalId=${Number(idProf)} stage=CLINIC_MAPPING reason=VISMED_DOCTOR_NOT_FOUND action=UPSERT_LOCAL_WITHOUT_DOCTORALIA_AUTHORITY`,
+            );
+        } else {
+            clinicDoctor = await this.resolveClinicDoctorForVismedAppointment(clinicId, doctor.id);
         }
+        const hasClinicDoctorAuthority = clinicDoctor !== null;
+        const doctoraliaDoctorId = clinicDoctor?.doctoraliaDoctorId ?? null;
+        const doctoraliaFacilityId = clinicDoctor?.doctoraliaFacilityId ?? null;
 
         const startAt = new Date(`${dataAg}T${horaIni}:00-03:00`);
         if (isNaN(startAt.getTime())) {
@@ -2098,7 +2249,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         const previousCancelledBy = existingByVismedId?.cancelledBy ?? null;
         const previousStartAt = existingByVismedId?.startAt ?? null;
 
-        if (!existingByVismedId && doctor?.id) {
+        if (hasClinicDoctorAuthority && !existingByVismedId && doctor?.id) {
             const windowMs = 2 * 60 * 1000;
             const orphan = await this.prisma.bookingSync.findFirst({
                 where: {
@@ -2204,7 +2355,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         // ainda não tem dono. Caso contrário, o upsert abaixo (key clinicId_vismedAppointmentId)
         // já vai atualizar a row correta — tentar gravar o mesmo vismedAppointmentId em outra
         // row violaria a unique constraint (clinicId, vismedAppointmentId).
-        const existingDoctoralia = !existingByVismedId
+        const existingDoctoralia = hasClinicDoctorAuthority && !existingByVismedId
             ? await this.prisma.bookingSync.findFirst({
                 where: {
                     clinicId,
@@ -2249,7 +2400,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             && existingByVismedId.cancelledBy === 'DOCTORALIA'
             && !existingByVismedId.syncedToVismed;
 
-        if (pendingCancelFromDoctoralia) {
+        if (hasClinicDoctorAuthority && pendingCancelFromDoctoralia) {
             this.logger.log(
                 `[VISMED-POLL] Pending cancellation for ${vismedAppointmentId} — propagating to VisMed now`,
             );
@@ -2285,9 +2436,11 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             },
             update: {
                 status: effectiveStatus,
-                vismedDoctorId: doctor?.id || null,
-                doctoraliaDoctorId,
-                doctoraliaFacilityId,
+                ...(doctor?.id ? { vismedDoctorId: doctor.id } : {}),
+                ...(hasClinicDoctorAuthority ? {
+                    doctoraliaDoctorId,
+                    doctoraliaFacilityId,
+                } : {}),
                 startAt,
                 endAt,
                 duration: durationMin,
@@ -2303,7 +2456,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             },
         });
 
-        if (realOrigin === 'VISMED' && upserted.origin === 'VISMED') {
+        if (hasClinicDoctorAuthority && realOrigin === 'VISMED' && upserted.origin === 'VISMED') {
             await this.syncDoctoraliaBreak(upserted.id).catch((err) =>
                 this.logger.warn(`[VISMED-POLL] break sync failed: ${err.message}`),
             );
@@ -2316,7 +2469,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         // se já está marcado como sincronizado. Em caso de falha anterior (syncedToDoctoralia=false),
         // a próxima rodada de poll re-tentará automaticamente.
         void previousStatus; void previousCancelledBy;
-        if (status === 'CANCELLED') {
+        if (hasClinicDoctorAuthority && status === 'CANCELLED') {
             await this.propagateVismedCancellationToDoctoralia(upserted.id).catch((err) =>
                 this.logger.warn(`[CANCEL-SYNC] propagate vismed→doctoralia failed: ${err.message}`),
             );
@@ -2326,7 +2479,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         // Propaga para a Doctoralia via moveBooking. Anti-eco fica dentro do helper.
         const startChanged = previousStartAt && previousStartAt.getTime() !== startAt.getTime();
         const isLiveStatus = status === 'BOOKED' || status === 'CONFIRMED';
-        if (startChanged && isLiveStatus) {
+        if (hasClinicDoctorAuthority && startChanged && isLiveStatus) {
             this.logger.log(
                 `[RESCHEDULE-SYNC] VisMed apptId=${vismedAppointmentId} mudou de ${previousStartAt!.toISOString()} → ${startAt.toISOString()}`,
             );

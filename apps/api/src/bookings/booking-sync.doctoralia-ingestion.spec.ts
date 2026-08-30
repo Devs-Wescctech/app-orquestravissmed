@@ -95,6 +95,7 @@ describe('BookingSyncService — reconciliação Doctoralia com vínculos atuais
     const unlinked = (doctorId: string, id = `sync-${doctorId}`) => ({
         id,
         clinicId,
+        vismedDoctorId: `vismed-${doctorId}`,
         doctoraliaDoctorId: doctorId,
         doctoraliaBookingId: null,
         doctoraliaAddressId: 'historical-address',
@@ -105,6 +106,20 @@ describe('BookingSyncService — reconciliação Doctoralia com vínculos atuais
     });
 
     function configureRecords(built: ReturnType<typeof buildService>, records: any[]) {
+        built.prisma.mapping.findUnique = jest.fn().mockImplementation(async (args: any) => {
+            const vismedDoctorId = args?.where?.clinicId_entityType_vismedId?.vismedId;
+            const record = records.find(item => item.vismedDoctorId === vismedDoctorId);
+            return record
+                ? {
+                    id: `mapping-${vismedDoctorId}`,
+                    status: 'LINKED',
+                    externalId: record.doctoraliaDoctorId,
+                }
+                : null;
+        });
+        built.prisma.doctoraliaDoctor.findUnique.mockImplementation(async (args: any) => ({
+            doctoraliaDoctorId: args?.where?.doctoraliaDoctorId,
+        }));
         built.prisma.bookingSync.findFirst.mockImplementation(async (args: any) => {
             const after = args?.where?.doctoraliaDoctorId?.gt;
             const doctorId = [...new Set(records.map(record => record.doctoraliaDoctorId))]
@@ -156,6 +171,34 @@ describe('BookingSyncService — reconciliação Doctoralia com vínculos atuais
         expect(client.getBookings).not.toHaveBeenCalledWith(
             'historical-facility', expect.anything(), 'historical-address', expect.anything(), expect.anything(),
         );
+    });
+
+    it('não cria cliente nem consulta Doctoralia para registro sem autoridade clínica atual', async () => {
+        const built = setup([unlinked('doctor-foreign')]);
+        built.prisma.mapping.findUnique.mockResolvedValue(null);
+        const createClient = (built.service as any).docplannerService.createClient;
+
+        await (built.service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect(createClient).not.toHaveBeenCalled();
+        expect(built.client.getFacilities).not.toHaveBeenCalled();
+        expect(built.client.getDoctors).not.toHaveBeenCalled();
+        expect(built.client.getAddresses).not.toHaveBeenCalled();
+        expect(built.client.getBookings).not.toHaveBeenCalled();
+    });
+
+    it('não consulta Doctoralia quando o ID histórico diverge do mapping clínico atual', async () => {
+        const built = setup([unlinked('doctor-foreign')]);
+        built.prisma.mapping.findUnique.mockResolvedValue({
+            id: 'mapping-current',
+            status: 'LINKED',
+            externalId: 'doctor-current',
+        });
+
+        await (built.service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect(built.client.getFacilities).not.toHaveBeenCalled();
+        expect(built.client.getBookings).not.toHaveBeenCalled();
     });
 
     it('deduplica facilities normalizadas antes de consultar médicos', async () => {
@@ -985,6 +1028,18 @@ describe('BookingSyncService — reconciliação Doctoralia com vínculos atuais
                 ),
             );
         });
+        prisma.mapping.findUnique = jest.fn().mockImplementation(async (args: any) => {
+            const vismedDoctorId = args?.where?.clinicId_entityType_vismedId?.vismedId;
+            const doctorId = String(vismedDoctorId || '').replace(/^vismed-/, '');
+            return {
+                id: `mapping-${vismedDoctorId}`,
+                status: 'LINKED',
+                externalId: doctorId,
+            };
+        });
+        prisma.doctoraliaDoctor.findUnique.mockImplementation(async (args: any) => ({
+            doctoraliaDoctorId: args?.where?.doctoraliaDoctorId,
+        }));
         client.getFacilities.mockResolvedValue({
             _items: [{ id: 'facility-1' }, { id: 'facility-2' }],
         });
@@ -1269,6 +1324,91 @@ describe('BookingSyncService — reconciliação Doctoralia com vínculos atuais
         expect(second.client.getFacilities).toHaveBeenCalledTimes(1);
         expect(first.client.getDoctors).toHaveBeenCalledTimes(1);
         expect(second.client.getDoctors).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('BookingSyncService — autoridade clínica na reconciliação de cancelamentos Doctoralia', () => {
+    const clinicId = conn.clinicId;
+    const linkedRecord = {
+        id: 'sync-cancelled-authority',
+        clinicId,
+        vismedDoctorId: 'vismed-doctor-1',
+        vismedAppointmentId: 'vismed-appointment-1',
+        doctoraliaDoctorId: 'doctor-1',
+        doctoraliaBookingId: 'booking-1',
+        doctoraliaAddressId: 'address-1',
+        doctoraliaFacilityId: 'facility-1',
+        status: 'BOOKED',
+        startAt: new Date('2026-08-20T12:00:00.000Z'),
+        lastMoveBy: null,
+        lastMoveAt: null,
+        lastMoveTargetStartAt: null,
+    };
+    const validMapping = {
+        id: 'mapping-1',
+        status: 'LINKED',
+        externalId: 'doctor-1',
+    };
+
+    function setupCancelledReconciliation(mapping: any) {
+        const built = buildService();
+        built.prisma.bookingSync.findMany
+            .mockResolvedValueOnce([linkedRecord])
+            .mockResolvedValueOnce([{
+                doctoraliaAddressId: 'address-1',
+                doctoraliaFacilityId: 'facility-1',
+            }]);
+        built.prisma.mapping.findUnique = jest.fn().mockResolvedValue(mapping);
+        built.prisma.doctoraliaDoctor.findUnique.mockResolvedValue({
+            doctoraliaDoctorId: 'doctor-1',
+        });
+        built.client.getBookings.mockResolvedValue({
+            _items: [{ id: 'booking-1', status: 'cancelled' }],
+        });
+        const propagate = jest.spyOn(
+            built.service as any,
+            'propagateDoctoraliaCancellationToVismed',
+        ).mockResolvedValue(undefined);
+        return { ...built, propagate };
+    }
+
+    it.each([
+        ['mapping ausente', null],
+        ['mapping UNLINKED', { ...validMapping, status: 'UNLINKED' }],
+        ['mapping divergente', { ...validMapping, externalId: 'doctor-foreign' }],
+    ])('não cria cliente nem chama APIs quando o %s', async (_label, mapping) => {
+        const built = setupCancelledReconciliation(mapping);
+        const createClient = (built.service as any).docplannerService.createClient;
+
+        await (built.service as any).reconcileCancelledOnDoctoralia(clinicId);
+
+        expect(createClient).not.toHaveBeenCalled();
+        expect(built.client.getBookings).not.toHaveBeenCalled();
+        expect(built.prisma.bookingSync.updateMany).not.toHaveBeenCalled();
+        expect(built.propagate).not.toHaveBeenCalled();
+    });
+
+    it('revalida antes da propagação e não cancela na VisMed se a autoridade for revogada', async () => {
+        const built = setupCancelledReconciliation(validMapping);
+        built.prisma.mapping.findUnique
+            .mockResolvedValueOnce(validMapping)
+            .mockResolvedValueOnce(null);
+
+        await (built.service as any).reconcileCancelledOnDoctoralia(clinicId);
+
+        expect(built.client.getBookings).toHaveBeenCalledTimes(1);
+        expect(built.prisma.bookingSync.updateMany).not.toHaveBeenCalled();
+        expect(built.propagate).not.toHaveBeenCalled();
+    });
+
+    it('preserva o fluxo autorizado sem chamadas externas adicionais', async () => {
+        const built = setupCancelledReconciliation(validMapping);
+
+        await (built.service as any).reconcileCancelledOnDoctoralia(clinicId);
+
+        expect(built.client.getBookings).toHaveBeenCalledTimes(1);
+        expect(built.prisma.bookingSync.updateMany).toHaveBeenCalledTimes(1);
+        expect(built.propagate).toHaveBeenCalledWith(linkedRecord.id);
     });
 });
 

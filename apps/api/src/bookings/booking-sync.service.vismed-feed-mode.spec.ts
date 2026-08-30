@@ -392,6 +392,7 @@ describe('BookingSyncService — polling VisMed por contrato de feed', () => {
         expect(capture).not.toHaveBeenCalled();
         expect(reconcileDisappeared).not.toHaveBeenCalled();
         expect(logger.log).toHaveBeenCalledWith(expect.stringContaining('mode=INCREMENTAL'));
+        expect(logger.log).toHaveBeenCalledWith(expect.stringContaining('processed=1'));
         expect(logger.log).toHaveBeenCalledWith(
             expect.stringContaining('DISAPPEARANCE_RECONCILIATION_SUPPRESSED'),
         );

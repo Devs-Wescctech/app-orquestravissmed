@@ -67,6 +67,7 @@ function buildService(options: {
     transactionError?: Error;
     transactionCandidate?: any;
     fenceReads?: any[];
+    authorityMapping?: any;
 } = {}) {
     const original = options.original ?? originalRecord();
     const candidates = options.candidates ?? [];
@@ -101,6 +102,18 @@ function buildService(options: {
     );
     const prisma = {
         bookingSync,
+        mapping: {
+            findUnique: jest.fn().mockResolvedValue(
+                options.authorityMapping === undefined
+                    ? { id: 'mapping-1', status: 'LINKED', externalId: 'doctoralia-1' }
+                    : options.authorityMapping,
+            ),
+        },
+        doctoraliaDoctor: {
+            findUnique: jest.fn().mockResolvedValue({
+                doctoraliaDoctorId: 'doctoralia-1',
+            }),
+        },
         $transaction: options.transactionError
             ? jest.fn().mockRejectedValue(options.transactionError)
             : jest.fn((callback: any) => callback(tx)),
@@ -183,6 +196,18 @@ describe('BookingSyncService — rebind seguro de ID VisMed desaparecido', () =>
         expect(cancellationCalls(bookingSync)).toHaveLength(1);
         expect(propagate).toHaveBeenCalledWith('original-sync');
         expect(syncBreak).toHaveBeenCalledWith('original-sync');
+    });
+
+    it('cancela localmente sem efeito Doctoralia quando a autoridade clínica não existe mais', async () => {
+        const { service, bookingSync, propagate, syncBreak } = buildService({
+            authorityMapping: null,
+        });
+
+        await reconcile(service);
+
+        expect(cancellationCalls(bookingSync)).toHaveLength(1);
+        expect(propagate).not.toHaveBeenCalled();
+        expect(syncBreak).not.toHaveBeenCalled();
     });
 
     it('não escolhe entre dois replacements confirmados e persiste diagnóstico sem cancelar', async () => {
