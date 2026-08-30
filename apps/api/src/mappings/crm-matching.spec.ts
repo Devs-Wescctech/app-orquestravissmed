@@ -96,7 +96,7 @@ describe('sync — buildDoctoraliaDoctorUpsertData (fixture da listagem de médi
             name: 'Maria Aparecida Souza',
             licenseNumbers: ['CRM SP 21.212.112'],
         });
-        expect(update.doctoraliaFacilityId).toBe('fac-1');
+        expect(update).not.toHaveProperty('doctoraliaFacilityId');
         expect(update.licenseNumbers).toEqual(['CRM SP 21.212.112']);
         // E a camada 0 consegue consumir o que foi persistido
         expect(parseLicenseString(update.licenseNumbers[0])).toEqual({ council: 'CRM', uf: 'SP', digits: '21212112' });

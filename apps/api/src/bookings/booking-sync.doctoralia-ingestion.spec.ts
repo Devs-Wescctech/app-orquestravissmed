@@ -36,16 +36,21 @@ const notification = (id = 'booking-anon-1') => ({
 function buildService() {
     const client = {
         getNotifications: jest.fn().mockResolvedValue({ _items: [] }),
+        getCacheIdentity: jest.fn().mockReturnValue('www.doctoralia.com.br|client'),
+        getFacilities: jest.fn().mockResolvedValue({ _items: [] }),
+        getDoctors: jest.fn().mockResolvedValue({ _items: [] }),
         getAddresses: jest.fn().mockResolvedValue({ _items: [] }),
         getBookings: jest.fn().mockResolvedValue({ _items: [] }),
     };
     const prisma = {
         integrationConnection: {
             findFirst: jest.fn().mockResolvedValue(conn),
+            update: jest.fn(),
         },
         bookingSync: {
             upsert: jest.fn(),
             findUnique: jest.fn(),
+            findFirst: jest.fn().mockResolvedValue(null),
             findMany: jest.fn().mockResolvedValue([]),
             update: jest.fn().mockResolvedValue({}),
             updateMany: jest.fn().mockResolvedValue({ count: 1 }),
@@ -99,121 +104,1143 @@ describe('BookingSyncService — reconciliação Doctoralia com vínculos atuais
         startAt,
     });
 
+    function configureRecords(built: ReturnType<typeof buildService>, records: any[]) {
+        built.prisma.bookingSync.findFirst.mockImplementation(async (args: any) => {
+            const after = args?.where?.doctoraliaDoctorId?.gt;
+            const doctorId = [...new Set(records.map(record => record.doctoraliaDoctorId))]
+                .sort()
+                .find(id => !after || id > after);
+            return doctorId ? { doctoraliaDoctorId: doctorId } : null;
+        });
+        built.prisma.bookingSync.findMany.mockImplementation(async (args: any) => {
+            if (args?.select?.doctoraliaBookingId) return [];
+            const doctorId = typeof args?.where?.doctoraliaDoctorId === 'string'
+                ? args.where.doctoraliaDoctorId
+                : null;
+            const afterId = args?.where?.id?.gt;
+            return records
+                .filter(record => (!doctorId || record.doctoraliaDoctorId === doctorId)
+                    && (!afterId || record.id > afterId))
+                .sort((left, right) => left.id.localeCompare(right.id))
+                .slice(0, args.take);
+        });
+    }
+
     function setup(records: any[]) {
         const built = buildService();
-        built.prisma.bookingSync.findMany
-            .mockResolvedValueOnce(records)
-            .mockResolvedValue([]);
+        configureRecords(built, records);
+        built.client.getFacilities.mockResolvedValue({ _items: [{ id: 'facility-1' }] });
+        built.client.getDoctors.mockResolvedValue({
+            _items: [...new Set(records.map(record => record.doctoraliaDoctorId))].map(id => ({ id })),
+        });
         return built;
     }
 
-    it('usa somente facility atual e endereços atuais, buscando endereços uma vez por médico', async () => {
-        const { service, prisma, client } = setup([
+    it('descobre facilities pela conexão e consulta médicos uma vez por facility/ciclo', async () => {
+        const { service, client } = setup([
             unlinked('doctor-1', 'sync-1'),
             { ...unlinked('doctor-1', 'sync-2'), startAt: new Date(startAt.getTime() + 60_000) },
         ]);
-        prisma.doctoraliaDoctor.findUnique.mockResolvedValue({ doctoraliaFacilityId: 'current-facility' });
         client.getAddresses.mockResolvedValue({ _items: [{ id: 'current-address' }] });
 
         await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
 
+        expect(client.getFacilities).toHaveBeenCalledTimes(1);
+        expect(client.getDoctors).toHaveBeenCalledTimes(1);
+        expect(client.getDoctors).toHaveBeenCalledWith('facility-1');
         expect(client.getAddresses).toHaveBeenCalledTimes(1);
-        expect(client.getAddresses).toHaveBeenCalledWith('current-facility', 'doctor-1');
+        expect(client.getAddresses).toHaveBeenCalledWith('facility-1', 'doctor-1');
         expect(client.getBookings).toHaveBeenCalledWith(
-            'current-facility', 'doctor-1', 'current-address', expect.any(String), expect.any(String),
+            'facility-1', 'doctor-1', 'current-address', expect.any(String), expect.any(String),
         );
         expect(client.getBookings).not.toHaveBeenCalledWith(
             'historical-facility', expect.anything(), 'historical-address', expect.anything(), expect.anything(),
         );
     });
 
-    it.each([
-        ['médico ausente', null, { _items: [{ id: 'address-1' }] }, false],
-        ['facility vazia', { doctoraliaFacilityId: ' ' }, { _items: [{ id: 'address-1' }] }, false],
-        ['endereços vazios', { doctoraliaFacilityId: 'facility-1' }, { _items: [] }, true],
-    ])('encerra somente o grupo quando há %s', async (_label, doctor, addresses, callsAddresses) => {
-        const { service, prisma, client } = setup([unlinked('doctor-1')]);
-        prisma.doctoraliaDoctor.findUnique.mockResolvedValue(doctor);
-        client.getAddresses.mockResolvedValue(addresses);
+    it('deduplica facilities normalizadas antes de consultar médicos', async () => {
+        const { service, client } = setup([unlinked('doctor-1')]);
+        client.getFacilities.mockResolvedValue({
+            _items: [{ id: 'facility-1' }, { id: ' facility-1 ' }, { id: 'facility-1' }],
+        });
 
         await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
 
-        expect(client.getAddresses).toHaveBeenCalledTimes(callsAddresses ? 1 : 0);
-        expect(client.getBookings).not.toHaveBeenCalled();
-        expect(prisma.bookingSync.update).not.toHaveBeenCalled();
+        expect(client.getDoctors).toHaveBeenCalledTimes(1);
+        expect(client.getDoctors).toHaveBeenCalledWith('facility-1');
     });
 
-    it('isola erro de endereços de um médico e continua com o próximo', async () => {
-        const { service, prisma, client } = setup([
-            unlinked('doctor-fails'),
-            unlinked('doctor-ok'),
-        ]);
-        prisma.doctoraliaDoctor.findUnique
-            .mockResolvedValueOnce({ doctoraliaFacilityId: 'facility-fails' })
-            .mockResolvedValueOnce({ doctoraliaFacilityId: 'facility-ok' });
-        client.getAddresses
-            .mockRejectedValueOnce(new Error('403 with patient data that must not be logged'))
-            .mockResolvedValueOnce({ _items: [{ id: 'address-ok' }] });
+    it('não ultrapassa as facilities permitidas pelo orçamento frio', async () => {
+        const { service, client } = setup([unlinked('doctor-1')]);
+        client.getFacilities.mockResolvedValue({
+            _items: Array.from({ length: 40 }, (_, index) => ({ id: `facility-${index}` })),
+        });
 
         await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
 
-        expect(client.getBookings).toHaveBeenCalledWith(
-            'facility-ok', 'doctor-ok', 'address-ok', expect.any(String), expect.any(String),
+        expect(client.getDoctors).toHaveBeenCalledTimes(16);
+        expect(client.getFacilities).toHaveBeenCalledTimes(1);
+        expect(new Set(client.getDoctors.mock.calls.map(([facilityId]) => facilityId)).size)
+            .toBe(16);
+    });
+
+    it('alcança médico autorizado somente na 26ª facility em ciclos sucessivos', async () => {
+        const { service, client } = setup([unlinked('doctor-1')]);
+        client.getFacilities.mockResolvedValue({
+            _items: Array.from({ length: 26 }, (_, index) => ({ id: `facility-${index}` })),
+        });
+        client.getDoctors.mockImplementation(async (facilityId: string) => ({
+            _items: facilityId === 'facility-25' ? [{ id: 'doctor-1' }] : [],
+        }));
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect(client.getDoctors).toHaveBeenCalledWith('facility-25');
+        expect(client.getAddresses).toHaveBeenCalledWith('facility-25', 'doctor-1');
+        expect(client.getDoctors.mock.calls.filter(
+            ([facilityId]) => facilityId === 'facility-25',
+        )).toHaveLength(1);
+    });
+
+    it('alcança facility tardia mesmo acima do limite global do cache estável', async () => {
+        const facilityIds = Array.from(
+            { length: 2_001 },
+            (_, index) => `facility-${String(index).padStart(4, '0')}`,
+        );
+        const lastFacilityId = facilityIds.at(-1)!;
+        const records = Array.from(
+            { length: 400 },
+            (_, index) => unlinked('doctor-1', `sync-${String(index).padStart(3, '0')}`),
+        );
+        records.push(unlinked('doctor-2', 'sync-doctor-2'));
+        const { service, prisma, client } = buildService();
+        configureRecords({ service, prisma, client } as any, records);
+        (service as any).logger = {
+            log: jest.fn(),
+            warn: jest.fn(),
+            debug: jest.fn(),
+            error: jest.fn(),
+        };
+        (service as any).stableDataCache.logger = { debug: jest.fn() };
+        client.getFacilities.mockResolvedValue({
+            _items: facilityIds.map(id => ({ id })),
+        });
+        client.getDoctors.mockImplementation(async (facilityId: string) => ({
+            _items:
+                facilityId === facilityIds[0] || facilityId === lastFacilityId
+                    ? [{ id: 'doctor-1' }]
+                    : [],
+        }));
+        client.getAddresses.mockImplementation(async (facilityId: string) => ({
+            _items: [{ id: `address-${facilityId}` }],
+        }));
+        client.getBookings.mockImplementation(async (facilityId: string) => ({
+            _items: facilityId === lastFacilityId
+                ? [{
+                    id: 'booking-late-facility',
+                    start_at: records[0].startAt.toISOString(),
+                    status: 'booked',
+                }]
+                : [],
+        }));
+
+        for (
+            let cycle = 0;
+            cycle < 600 && client.getAddresses.mock.calls.filter(
+                ([facilityId]) => facilityId === lastFacilityId,
+            ).length < 2;
+            cycle++
+        ) {
+            await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        }
+
+        expect(client.getDoctors).toHaveBeenCalledWith(lastFacilityId);
+        expect(client.getAddresses).toHaveBeenCalledWith(lastFacilityId, 'doctor-1');
+        expect(client.getAddresses.mock.calls.filter(
+            ([facilityId]) => facilityId === lastFacilityId,
+        )).toHaveLength(2);
+        expect(prisma.bookingSync.findMany.mock.calls.some(
+            ([args]: any[]) =>
+                args?.where?.doctoraliaDoctorId === 'doctor-1'
+                && args?.where?.id?.gt === 'sync-199',
+        )).toBe(true);
+        expect(prisma.bookingSync.updateMany).toHaveBeenCalledWith(
+            expect.objectContaining({
+                data: expect.objectContaining({
+                    doctoraliaBookingId: 'booking-late-facility',
+                    doctoraliaFacilityId: lastFacilityId,
+                }),
+            }),
+        );
+        const continuationCallIndex = prisma.bookingSync.findMany.mock.calls.findIndex(
+            ([args]: any[]) =>
+                args?.where?.doctoraliaDoctorId === 'doctor-1'
+                && args?.where?.id?.gt === 'sync-199',
+        );
+        expect(prisma.bookingSync.updateMany.mock.invocationCallOrder[0]).toBeLessThan(
+            prisma.bookingSync.findMany.mock.invocationCallOrder[continuationCallIndex],
+        );
+        const secondDoctorCallIndex = prisma.bookingSync.findMany.mock.calls.findIndex(
+            ([args]: any[]) => args?.where?.doctoraliaDoctorId === 'doctor-2',
+        );
+        if (secondDoctorCallIndex >= 0) {
+            expect(prisma.bookingSync.updateMany.mock.invocationCallOrder[0]).toBeLessThan(
+                prisma.bookingSync.findMany.mock.invocationCallOrder[secondDoctorCallIndex],
+            );
+        }
+    });
+
+    it('avança a segunda página quando a autorização existe só no primeiro chunk', async () => {
+        const facilityIds = Array.from(
+            { length: 26 },
+            (_, index) => `facility-${String(index).padStart(2, '0')}`,
+        );
+        const firstFacilityId = facilityIds[0];
+        const records = Array.from(
+            { length: 400 },
+            (_, index) => unlinked('doctor-a', `a-${String(index).padStart(3, '0')}`),
+        );
+        const { service, prisma, client } = buildService();
+        configureRecords({ service, prisma, client } as any, records);
+        client.getFacilities.mockResolvedValue({
+            _items: facilityIds.map(id => ({ id })),
+        });
+        client.getDoctors.mockImplementation(async (facilityId: string) => ({
+            _items: facilityId === firstFacilityId ? [{ id: 'doctor-a' }] : [],
+        }));
+
+        for (let cycle = 0; cycle < 6; cycle++) {
+            await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        }
+
+        expect(prisma.bookingSync.findMany.mock.calls.some(
+            ([args]: any[]) =>
+                args?.where?.doctoraliaDoctorId === 'doctor-a'
+                && args?.where?.id?.gt === 'a-199',
+        )).toBe(true);
+        expect(client.getAddresses.mock.calls.filter(
+            ([facilityId, doctorId]) =>
+                facilityId === firstFacilityId && doctorId === 'doctor-a',
+        )).toHaveLength(2);
+    });
+
+    it('reinicia facilities quando o offset da página é expulso pelo LRU global', async () => {
+        const facilityIds = Array.from(
+            { length: 26 },
+            (_, index) => `facility-${String(index).padStart(2, '0')}`,
+        );
+        const firstFacilityId = facilityIds[0];
+        const records = Array.from(
+            { length: 400 },
+            (_, index) => ({
+                ...unlinked('doctor-a', `a-${String(index).padStart(3, '0')}`),
+                startAt: new Date(Date.UTC(2026, 7, 20, 12, index)),
+            }),
+        );
+        const { service, prisma, client } = buildService();
+        configureRecords({ service, prisma, client } as any, records);
+        client.getFacilities.mockResolvedValue({
+            _items: facilityIds.map(id => ({ id })),
+        });
+        client.getDoctors.mockImplementation(async (facilityId: string) => ({
+            _items: facilityId === firstFacilityId ? [{ id: 'doctor-a' }] : [],
+        }));
+        client.getAddresses.mockResolvedValue({
+            _items: [{ id: 'address-early' }],
+        });
+        client.getBookings.mockResolvedValue({
+            _items: [{
+                id: 'booking-early-page',
+                start_at: records[0].startAt.toISOString(),
+                status: 'booked',
+            }],
+        });
+        const cursor = {
+            recordOffsetByDoctor: new Map<string, string>(),
+            touchedAt: Date.now(),
+        };
+        (service as any).reconcileDoctorCursorByClinic.set(clinicId, cursor);
+        (service as any).setReconcileOffset(
+            clinicId,
+            cursor,
+            'doctor-a',
+            'a-199',
+        );
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        expect(prisma.bookingSync.updateMany).not.toHaveBeenCalled();
+
+        for (let index = 0; index < 10_000; index++) {
+            const pressureCursor = {
+                recordOffsetByDoctor: new Map<string, string>(),
+                touchedAt: Date.now(),
+            };
+            (service as any).setReconcileOffset(
+                `pressure-clinic-${index}`,
+                pressureCursor,
+                'pressure-doctor',
+                `pressure-offset-${index}`,
+            );
+        }
+        expect(cursor.recordOffsetByDoctor.has('doctor-a')).toBe(false);
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect(client.getAddresses.mock.calls.filter(
+            ([facilityId]) => facilityId === firstFacilityId,
+        )).toHaveLength(2);
+        expect(prisma.bookingSync.updateMany).toHaveBeenCalledWith(
+            expect.objectContaining({
+                data: expect.objectContaining({
+                    doctoraliaBookingId: 'booking-early-page',
+                    doctoraliaFacilityId: firstFacilityId,
+                }),
+            }),
         );
     });
 
-    it('isola erro no lookup local de um médico e continua com o próximo', async () => {
-        const { service, prisma, client } = setup([
-            unlinked('doctor-fails'),
-            unlinked('doctor-ok'),
-        ]);
-        prisma.doctoraliaDoctor.findUnique
-            .mockRejectedValueOnce(new Error('database unavailable'))
-            .mockResolvedValueOnce({ doctoraliaFacilityId: 'facility-ok' });
-        client.getAddresses.mockResolvedValue({ _items: [{ id: 'address-ok' }] });
+    it('alcança o 501º médico retornado pela mesma facility', async () => {
+        const { service, client } = setup([unlinked('doctor-500')]);
+        client.getDoctors.mockResolvedValue({
+            _items: Array.from(
+                { length: 501 },
+                (_, index) => ({ id: `doctor-${String(index).padStart(3, '0')}` }),
+            ),
+        });
 
         await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
 
-        expect(client.getAddresses).toHaveBeenCalledTimes(1);
-        expect(client.getBookings).toHaveBeenCalledWith(
-            'facility-ok', 'doctor-ok', 'address-ok', expect.any(String), expect.any(String),
-        );
+        expect(client.getAddresses).toHaveBeenCalledWith('facility-1', 'doctor-500');
     });
 
-    it('isola falha de endereço e vincula o match válido sem atravessar clínica', async () => {
-        const record = unlinked('doctor-1');
-        const { service, prisma, client } = setup([record]);
-        prisma.doctoraliaDoctor.findUnique.mockResolvedValue({ doctoraliaFacilityId: 'facility-1' });
-        client.getAddresses.mockResolvedValue({ _items: [{ id: 'address-fails' }, { id: 'address-ok' }] });
-        client.getBookings
-            .mockRejectedValueOnce(new Error('forbidden'))
+    it('preserva continuação quando facilities e médicos só mudam de ordem ou duplicam IDs', async () => {
+        const records = Array.from(
+            { length: 400 },
+            (_, index) => unlinked('doctor-1', `sync-${String(index).padStart(3, '0')}`),
+        );
+        const { service, prisma, client } = buildService();
+        configureRecords({ service, prisma, client } as any, records);
+        client.getFacilities.mockResolvedValueOnce({
+            _items: [{ id: 'facility-2' }, { id: 'facility-1' }],
+        });
+        client.getDoctors
+            .mockResolvedValueOnce({ _items: [{ id: 'doctor-z' }, { id: 'doctor-1' }] })
+            .mockResolvedValueOnce({ _items: [{ id: 'doctor-1' }, { id: 'doctor-a' }] });
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        (service as any).stableDataCache.clear();
+        client.getFacilities.mockResolvedValueOnce({
+            _items: [{ id: 'facility-1' }, { id: 'facility-2' }, { id: 'facility-1' }],
+        });
+        client.getDoctors
             .mockResolvedValueOnce({
-                _items: [{ id: 'booking-1', start_at: startAt.toISOString() }],
+                _items: [{ id: 'doctor-1' }, { id: 'doctor-z' }, { id: 'doctor-z' }],
+            })
+            .mockResolvedValueOnce({
+                _items: [{ id: 'doctor-a' }, { id: 'doctor-1' }, { id: 'doctor-1' }],
             });
 
         await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
 
-        expect(prisma.bookingSync.updateMany).toHaveBeenCalledWith({
-            where: {
-                id: record.id,
-                clinicId,
-                doctoraliaDoctorId: 'doctor-1',
-                doctoraliaBookingId: null,
-                status: { in: ['BOOKED', 'CONFIRMED'] },
-            },
-            data: {
-                doctoraliaBookingId: 'booking-1',
-                doctoraliaAddressId: 'address-ok',
-                doctoraliaFacilityId: 'facility-1',
-                syncedToDoctoralia: true,
-            },
-        });
+        const cursor = (service as any).reconcileDoctorCursorByClinic.get(clinicId);
+        expect(cursor.recordOffsetByDoctor.get('doctor-1')).toBe('sync-399');
+        expect(client.getAddresses).toHaveBeenCalledWith('facility-1', 'doctor-1');
+        expect(client.getAddresses).toHaveBeenCalledWith('facility-2', 'doctor-1');
     });
 
-    it('não adota quando o registro muda entre a seleção e a persistência', async () => {
+    it('não consulta endereços nem bookings quando getDoctors não confirma o médico', async () => {
+        const { service, prisma, client } = setup([unlinked('doctor-1')]);
+        client.getDoctors.mockResolvedValue({ _items: [{ id: 'other-doctor' }] });
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect(client.getAddresses).not.toHaveBeenCalled();
+        expect(client.getBookings).not.toHaveBeenCalled();
+        expect(prisma.bookingSync.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('mantém médicos distintos isolados e não cruza chamadas', async () => {
+        const { service, client } = setup([unlinked('doctor-1'), unlinked('doctor-2')]);
+        client.getAddresses.mockResolvedValue({ _items: [{ id: 'address-current' }] });
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect(client.getAddresses.mock.calls).toEqual([
+            ['facility-1', 'doctor-1'],
+            ['facility-1', 'doctor-2'],
+        ]);
+    });
+
+    it('aceita o mesmo médico em duas facilities confirmadas', async () => {
+        const { service, client } = setup([unlinked('doctor-1')]);
+        client.getFacilities.mockResolvedValue({ _items: [{ id: 'facility-1' }, { id: 'facility-2' }] });
+        client.getDoctors.mockResolvedValue({ _items: [{ id: 'doctor-1' }] });
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect(client.getDoctors.mock.calls).toEqual([['facility-1'], ['facility-2']]);
+        expect(client.getAddresses.mock.calls).toEqual([
+            ['facility-1', 'doctor-1'],
+            ['facility-2', 'doctor-1'],
+        ]);
+    });
+
+    it('consulta endereços somente na segunda facility quando apenas ela confirma o médico', async () => {
+        const { service, client } = setup([unlinked('doctor-1')]);
+        client.getFacilities.mockResolvedValue({
+            _items: [{ id: 'facility-without-doctor' }, { id: 'facility-authorized' }],
+        });
+        client.getDoctors.mockImplementation(async (facilityId: string) => ({
+            _items: facilityId === 'facility-authorized' ? [{ id: 'doctor-1' }] : [],
+        }));
+        client.getAddresses.mockResolvedValue({ _items: [{ id: 'current-address' }] });
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect(client.getAddresses.mock.calls).toEqual([
+            ['facility-authorized', 'doctor-1'],
+        ]);
+        expect(client.getAddresses).not.toHaveBeenCalledWith(
+            'facility-without-doctor',
+            expect.anything(),
+        );
+        expect(client.getBookings).not.toHaveBeenCalledWith(
+            'facility-without-doctor',
+            expect.anything(),
+            expect.anything(),
+            expect.anything(),
+            expect.anything(),
+        );
+    });
+
+    it('isola falha de getDoctors por facility e continua nas demais', async () => {
+        const { service, client } = setup([unlinked('doctor-1')]);
+        client.getFacilities.mockResolvedValue({ _items: [{ id: 'facility-fails' }, { id: 'facility-ok' }] });
+        client.getDoctors
+            .mockRejectedValueOnce(new Error('temporary failure'))
+            .mockResolvedValueOnce({ _items: [{ id: 'doctor-1' }] });
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect(client.getAddresses).toHaveBeenCalledTimes(1);
+        expect(client.getAddresses).toHaveBeenCalledWith('facility-ok', 'doctor-1');
+        expect(client.getAddresses).not.toHaveBeenCalledWith(
+            'facility-fails',
+            expect.anything(),
+        );
+    });
+
+    it('isola 403 de getAddresses, não usa histórico e não altera a conexão', async () => {
+        const { service, prisma, client } = setup([unlinked('doctor-1')]);
+        client.getAddresses.mockRejectedValue(new Error('403 private response'));
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect(client.getBookings).not.toHaveBeenCalled();
+        expect(prisma.bookingSync.updateMany).not.toHaveBeenCalled();
+        expect(prisma.integrationConnection.update).not.toHaveBeenCalled();
+    });
+
+    it('falha fechada se a descoberta de facilities falhar sem alterar a conexão', async () => {
+        const { service, prisma, client } = setup([unlinked('doctor-1')]);
+        client.getFacilities.mockRejectedValue(new Error('slow upstream timeout'));
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect(client.getDoctors).not.toHaveBeenCalled();
+        expect(client.getAddresses).not.toHaveBeenCalled();
+        expect(client.getBookings).not.toHaveBeenCalled();
+        expect(prisma.bookingSync.updateMany).not.toHaveBeenCalled();
+        expect(prisma.integrationConnection.update).not.toHaveBeenCalled();
+    });
+
+    it('não cacheia timeout de facilities e permite nova tentativa no ciclo seguinte', async () => {
+        const timeout = Object.assign(new Error('request timed out'), { name: 'AbortError' });
+        const { service, prisma, client } = setup([
+            unlinked('doctor-1'),
+            unlinked('doctor-2'),
+        ]);
+        client.getFacilities
+            .mockRejectedValueOnce(timeout)
+            .mockResolvedValueOnce({ _items: [] });
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect(client.getFacilities).toHaveBeenCalledTimes(2);
+        expect(prisma.integrationConnection.update).not.toHaveBeenCalled();
+    });
+
+    it('limita bookings processados por endereço', async () => {
+        const { service, prisma, client } = setup([unlinked('doctor-1')]);
+        client.getAddresses.mockResolvedValue({ _items: [{ id: 'address-1' }] });
+        client.getBookings.mockResolvedValue({
+            _items: [
+                ...Array.from({ length: 500 }, (_, index) => ({
+                    id: `cancelled-${index}`,
+                    start_at: startAt.toISOString(),
+                    status: 'cancelled',
+                })),
+                { id: 'beyond-limit', start_at: startAt.toISOString() },
+            ],
+        });
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect(prisma.bookingSync.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('respeita o orçamento agregado de 20 chamadas externas por ciclo', async () => {
+        const records = Array.from({ length: 200 }, (_, index) => unlinked(`doctor-${index}`));
+        const { service, rateLimiter, client } = setup(records);
+        client.getFacilities.mockResolvedValue({
+            _items: Array.from({ length: 25 }, (_, index) => ({ id: `facility-${index}` })),
+        });
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect(rateLimiter.acquire).toHaveBeenCalledTimes(20);
+        expect(
+            client.getFacilities.mock.calls.length
+            + client.getDoctors.mock.calls.length
+            + client.getAddresses.mock.calls.length
+            + client.getBookings.mock.calls.length,
+        ).toBe(20);
+    });
+
+    it('não inicia nova chamada externa depois do soft deadline de 15 segundos', async () => {
+        jest.useFakeTimers().setSystemTime(new Date('2026-08-28T12:00:00.000Z'));
+        try {
+            const { service, prisma, client } = setup([unlinked('doctor-1')]);
+            prisma.bookingSync.findFirst.mockImplementation(async () => {
+                jest.setSystemTime(new Date('2026-08-28T12:00:15.000Z'));
+                return { doctoraliaDoctorId: 'doctor-1' };
+            });
+
+            await expect((service as any).reconcileUnlinkedWithDoctoralia(clinicId))
+                .resolves.toBeUndefined();
+
+            expect(client.getFacilities).not.toHaveBeenCalled();
+            expect(client.getDoctors).not.toHaveBeenCalled();
+            expect(client.getAddresses).not.toHaveBeenCalled();
+            expect(client.getBookings).not.toHaveBeenCalled();
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+
+    it('não despacha a chamada se o deadline expirar enquanto aguarda o limiter', async () => {
+        jest.useFakeTimers().setSystemTime(new Date('2026-08-28T12:00:00.000Z'));
+        try {
+            const { service, rateLimiter, client } = setup([unlinked('doctor-1')]);
+            rateLimiter.acquire.mockImplementation(async () => {
+                jest.setSystemTime(new Date('2026-08-28T12:00:15.000Z'));
+            });
+
+            await expect((service as any).reconcileUnlinkedWithDoctoralia(clinicId))
+                .resolves.toBeUndefined();
+
+            expect(rateLimiter.acquire).toHaveBeenCalledTimes(1);
+            expect(client.getFacilities).not.toHaveBeenCalled();
+            expect(client.getDoctors).not.toHaveBeenCalled();
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+
+    it('reutiliza facilities e doctors entre ciclos, mas nunca cacheia addresses', async () => {
+        const firstPage = [unlinked('doctor-a', 'sync-a')];
+        const secondPage = [unlinked('doctor-b', 'sync-b')];
+        const { service, prisma, rateLimiter, client } = buildService();
+        configureRecords({ service, prisma, rateLimiter, client } as any, [...firstPage, ...secondPage]);
+        client.getFacilities.mockResolvedValue({ _items: [{ id: 'facility-1' }] });
+        client.getDoctors.mockResolvedValue({ _items: [{ id: 'doctor-a' }, { id: 'doctor-b' }] });
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        const firstCycleCalls = rateLimiter.acquire.mock.calls.length;
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        const secondCycleCalls = rateLimiter.acquire.mock.calls.length - firstCycleCalls;
+
+        expect(firstCycleCalls).toBe(3);
+        expect(secondCycleCalls).toBe(1);
+        expect(client.getFacilities).toHaveBeenCalledTimes(1);
+        expect(client.getDoctors).toHaveBeenCalledTimes(1);
+        expect(client.getAddresses.mock.calls).toEqual([
+            ['facility-1', 'doctor-a'],
+            ['facility-1', 'doctor-b'],
+        ]);
+    });
+
+    it('mudança da identidade da conexão força cache miss', async () => {
+        const firstPage = [unlinked('doctor-a', 'sync-a')];
+        const secondPage = [unlinked('doctor-b', 'sync-b')];
+        const { service, prisma, client } = buildService();
+        configureRecords({ service, prisma, client } as any, [...firstPage, ...secondPage]);
+        prisma.integrationConnection.findFirst
+            .mockResolvedValueOnce({ ...conn, clientId: 'client-a' })
+            .mockResolvedValueOnce({ ...conn, clientId: 'client-b' })
+            .mockResolvedValueOnce({ ...conn, clientId: 'client-b' });
+        client.getCacheIdentity
+            .mockReturnValueOnce('www.doctoralia.com.br|client-a')
+            .mockReturnValueOnce('www.doctoralia.com.br|client-b')
+            .mockReturnValueOnce('www.doctoralia.com.br|client-b');
+        client.getFacilities.mockResolvedValue({ _items: [{ id: 'facility-1' }] });
+        client.getDoctors.mockResolvedValue({ _items: [{ id: 'doctor-a' }, { id: 'doctor-b' }] });
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect(client.getFacilities).toHaveBeenCalledTimes(2);
+        expect(client.getDoctors).toHaveBeenCalledTimes(2);
+    });
+
+    it('avança por grupos de médico, visita o excedente após 200 e faz wrap-around', async () => {
+        const records = [
+            ...Array.from({ length: 220 }, (_, index) => unlinked('doctor-a', `a-${String(index).padStart(3, '0')}`)),
+            ...Array.from({ length: 10 }, (_, index) => unlinked('doctor-b', `b-${String(index).padStart(3, '0')}`)),
+        ];
+        const { service, prisma, client } = buildService();
+        configureRecords({ service, prisma, client } as any, records);
+        client.getFacilities.mockResolvedValue({ _items: [{ id: 'facility-1' }] });
+        client.getDoctors.mockResolvedValue({ _items: [{ id: 'doctor-a' }, { id: 'doctor-b' }] });
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect(client.getAddresses.mock.calls).toEqual([
+            ['facility-1', 'doctor-a'],
+            ['facility-1', 'doctor-b'],
+            ['facility-1', 'doctor-a'],
+        ]);
+        const doctorQueries = prisma.bookingSync.findFirst.mock.calls
+            .map(([args]: any[]) => args);
+        expect(doctorQueries[0].where.doctoraliaDoctorId).toEqual({ not: null });
+        expect(doctorQueries[1].where.doctoraliaDoctorId).toEqual({ not: null, gt: 'doctor-a' });
+        expect(doctorQueries[2].where.doctoraliaDoctorId).toEqual({ not: null, gt: 'doctor-b' });
+        expect(doctorQueries[3].where.doctoraliaDoctorId).toEqual({ not: null });
+        expect(doctorQueries[0].orderBy).toEqual([
+            { doctoraliaDoctorId: 'asc' },
+            { id: 'asc' },
+        ]);
+        const resumedGroupQuery = prisma.bookingSync.findMany.mock.calls
+            .map(([args]: any[]) => args)
+            .find((args: any) => args?.where?.id?.gt === 'a-199');
+        expect(resumedGroupQuery).toBeDefined();
+    });
+
+    it('não causa starvation em cinco ciclos quando o primeiro médico falha sempre', async () => {
+        const records = [
+            unlinked('doctor-1'),
+            unlinked('doctor-2'),
+            unlinked('doctor-3'),
+        ];
+        const { service, client } = setup(records);
+        client.getAddresses.mockImplementation(async (_facilityId: string, doctorId: string) => {
+            if (doctorId === 'doctor-1') throw new Error('recurring doctor failure');
+            return { _items: [] };
+        });
+        const visitedByCycle: Array<string | null> = [];
+
+        for (let cycle = 0; cycle < 5; cycle++) {
+            const callsBefore = client.getAddresses.mock.calls.length;
+            await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+            const cycleCalls = client.getAddresses.mock.calls.slice(callsBefore);
+            visitedByCycle.push(cycleCalls[0]?.[1] ?? null);
+        }
+
+        expect(visitedByCycle).toEqual([
+            'doctor-1',
+            'doctor-2',
+            'doctor-3',
+            null,
+            'doctor-1',
+        ]);
+        expect(client.getAddresses.mock.calls.map(([, doctorId]) => doctorId)).toEqual([
+            'doctor-1',
+            'doctor-2',
+            'doctor-3',
+            'doctor-1',
+        ]);
+    });
+
+    it('reinicia cobertura após falha de address sem bloquear outro médico', async () => {
+        const facilityIds = Array.from(
+            { length: 26 },
+            (_, index) => `facility-${String(index).padStart(2, '0')}`,
+        );
+        const firstFacilityId = facilityIds[0];
+        const lastFacilityId = facilityIds.at(-1)!;
+        const records = [
+            ...Array.from(
+                { length: 200 },
+                (_, index) => unlinked('doctor-a', `a-${String(index).padStart(3, '0')}`),
+            ),
+            unlinked('doctor-b', 'b-000'),
+        ];
+        const { service, prisma, client } = buildService();
+        configureRecords({ service, prisma, client } as any, records);
+        client.getFacilities.mockResolvedValue({
+            _items: facilityIds.map(id => ({ id })),
+        });
+        client.getDoctors.mockImplementation(async (facilityId: string) => ({
+            _items: facilityId === firstFacilityId || facilityId === lastFacilityId
+                ? [{ id: 'doctor-a' }, { id: 'doctor-b' }]
+                : [],
+        }));
+        let failedFirstAddress = false;
+        client.getAddresses.mockImplementation(
+            async (facilityId: string, doctorId: string) => {
+                if (
+                    doctorId === 'doctor-a'
+                    && facilityId === firstFacilityId
+                    && !failedFirstAddress
+                ) {
+                    failedFirstAddress = true;
+                    throw new Error('transient address failure');
+                }
+                return { _items: [{ id: `address-${facilityId}` }] };
+            },
+        );
+        client.getBookings.mockImplementation(
+            async (facilityId: string, doctorId: string) => ({
+                _items:
+                    doctorId === 'doctor-a' && facilityId === lastFacilityId
+                        ? [{
+                            id: 'booking-after-address-retry',
+                            start_at: records[0].startAt.toISOString(),
+                            status: 'booked',
+                        }]
+                        : [],
+            }),
+        );
+
+        for (
+            let cycle = 0;
+            cycle < 10 && prisma.bookingSync.updateMany.mock.calls.length === 0;
+            cycle++
+        ) {
+            await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        }
+
+        expect(prisma.bookingSync.updateMany).toHaveBeenCalledWith(
+            expect.objectContaining({
+                data: expect.objectContaining({
+                    doctoraliaBookingId: 'booking-after-address-retry',
+                    doctoraliaFacilityId: lastFacilityId,
+                }),
+            }),
+        );
+        expect(client.getAddresses.mock.calls.filter(
+            ([facilityId, doctorId]) =>
+                facilityId === firstFacilityId && doctorId === 'doctor-a',
+        )).toHaveLength(2);
+        const secondDoctorQueryIndex = prisma.bookingSync.findMany.mock.calls.findIndex(
+            ([args]: any[]) => args?.where?.doctoraliaDoctorId === 'doctor-b',
+        );
+        expect(secondDoctorQueryIndex).toBeGreaterThanOrEqual(0);
+        expect(
+            prisma.bookingSync.findMany.mock.invocationCallOrder[secondDoctorQueryIndex],
+        ).toBeLessThan(prisma.bookingSync.updateMany.mock.invocationCallOrder[0]);
+        const prematureContinuation = prisma.bookingSync.findMany.mock.calls.findIndex(
+            ([args]: any[]) =>
+                args?.where?.doctoraliaDoctorId === 'doctor-a'
+                && args?.where?.id?.gt === 'a-199',
+        );
+        expect(prematureContinuation).toBe(-1);
+    });
+
+    it('repete página exata de 200 após falha de addresses e limpa offset ao encontrar continuação vazia', async () => {
+        const doctorId = 'doctor-exact-200';
+        const records = Array.from(
+            { length: 200 },
+            (_, index) => unlinked(doctorId, `exact-${String(index).padStart(3, '0')}`),
+        );
+        const { service, prisma, client } = setup(records);
+        client.getAddresses
+            .mockRejectedValueOnce(new Error('temporary addresses failure'))
+            .mockResolvedValue({ _items: [{ id: 'address-1' }] });
+        client.getBookings.mockResolvedValue({
+            _items: [{ id: 'booking-retried', start_at: startAt.toISOString() }],
+        });
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        const firstPageQueries = prisma.bookingSync.findMany.mock.calls
+            .map(([args]: any[]) => args)
+            .filter((args: any) => args?.where?.doctoraliaDoctorId === doctorId);
+        expect(firstPageQueries[0].where.id).toBeUndefined();
+        expect(firstPageQueries[1].where.id).toBeUndefined();
+        expect(prisma.bookingSync.updateMany).toHaveBeenCalled();
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        const cursor = (service as any).reconcileDoctorCursorByClinic.get(clinicId);
+        expect(cursor.recordOffsetByDoctor.has(doctorId)).toBe(false);
+    });
+
+    it('repete primeira página de 400 após falha de bookings e só então avança para a segunda', async () => {
+        const doctorId = 'doctor-exact-400';
+        const records = Array.from(
+            { length: 400 },
+            (_, index) => unlinked(doctorId, `page-${String(index).padStart(3, '0')}`),
+        );
+        const { service, prisma, client } = setup(records);
+        client.getAddresses.mockResolvedValue({ _items: [{ id: 'address-1' }] });
+        client.getBookings
+            .mockRejectedValueOnce(new Error('temporary bookings failure'))
+            .mockResolvedValue({
+                _items: [{ id: 'booking-after-retry', start_at: startAt.toISOString() }],
+            });
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        const groupQueries = prisma.bookingSync.findMany.mock.calls
+            .map(([args]: any[]) => args)
+            .filter((args: any) => args?.where?.doctoraliaDoctorId === doctorId);
+        expect(groupQueries[0].where.id).toBeUndefined();
+        expect(groupQueries[1].where.id).toBeUndefined();
+        expect(groupQueries[2].where.id).toEqual({ gt: 'page-199' });
+        expect(prisma.bookingSync.updateMany).toHaveBeenCalled();
+    });
+
+    it('não perde continuações quando mais de 100 médicos têm grupos oversized', async () => {
+        const doctorIds = Array.from(
+            { length: 101 },
+            (_, index) => `doctor-${String(index).padStart(3, '0')}`,
+        );
+        const records = doctorIds.flatMap(doctorId =>
+            Array.from(
+                { length: 201 },
+                (_, index) => unlinked(doctorId, `${doctorId}-${String(index).padStart(3, '0')}`),
+            ),
+        );
+        const { service, prisma, client } = buildService();
+        configureRecords({ service, prisma, client } as any, records);
+        client.getFacilities.mockResolvedValue({ _items: [{ id: 'facility-1' }] });
+        client.getDoctors.mockResolvedValue({
+            _items: doctorIds.map(id => ({ id })),
+        });
+
+        for (let cycle = 0; cycle < doctorIds.length * 2 + 1; cycle++) {
+            await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        }
+
+        const resumedDoctors = new Set(
+            prisma.bookingSync.findMany.mock.calls
+                .map(([args]: any[]) => args?.where)
+                .filter((where: any) => where?.id?.gt)
+                .map((where: any) => where.doctoraliaDoctorId),
+        );
+        expect(resumedDoctors.size).toBe(101);
+        expect(resumedDoctors.has('doctor-000')).toBe(true);
+        expect(resumedDoctors.has('doctor-100')).toBe(true);
+    });
+
+    it('faz todos os 501 médicos oversized alcançarem a continuação sob limite de 500 offsets', async () => {
+        const doctorIds = Array.from(
+            { length: 501 },
+            (_, index) => `doctor-${String(index).padStart(3, '0')}`,
+        );
+        const { service, prisma, client } = buildService();
+        (service as any).logger = {
+            log: jest.fn(),
+            warn: jest.fn(),
+            debug: jest.fn(),
+            error: jest.fn(),
+        };
+        (service as any).stableDataCache.logger = { debug: jest.fn() };
+        prisma.bookingSync.findFirst.mockImplementation(async (args: any) => {
+            const after = args?.where?.doctoraliaDoctorId?.gt;
+            const doctorId = doctorIds.find(id => !after || id > after);
+            return doctorId ? { doctoraliaDoctorId: doctorId } : null;
+        });
+        prisma.bookingSync.findMany.mockImplementation(async (args: any) => {
+            if (args?.select?.doctoraliaBookingId) return [];
+            const doctorId = args?.where?.doctoraliaDoctorId;
+            if (typeof doctorId !== 'string') return [];
+            const afterId = args?.where?.id?.gt;
+            const startIndex = afterId
+                ? Number(String(afterId).split('-').at(-1)) + 1
+                : 0;
+            const count = Math.min(200, 201 - startIndex);
+            return Array.from(
+                { length: Math.max(0, count) },
+                (_, index) => unlinked(
+                    doctorId,
+                    `${doctorId}-${String(startIndex + index).padStart(3, '0')}`,
+                ),
+            );
+        });
+        client.getFacilities.mockResolvedValue({
+            _items: [{ id: 'facility-1' }, { id: 'facility-2' }],
+        });
+        client.getDoctors.mockImplementation(async (facilityId: string) => ({
+            _items: (facilityId === 'facility-1' ? doctorIds.slice(0, 500) : doctorIds.slice(500))
+                .map(id => ({ id })),
+        }));
+
+        for (let cycle = 0; cycle < doctorIds.length * 3 + 2; cycle++) {
+            await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        }
+
+        const resumedDoctors = new Set(
+            prisma.bookingSync.findMany.mock.calls
+                .map(([args]: any[]) => args?.where)
+                .filter((where: any) => where?.id?.gt)
+                .map((where: any) => where.doctoraliaDoctorId),
+        );
+        expect(doctorIds.filter(doctorId => !resumedDoctors.has(doctorId))).toEqual([]);
+        expect((service as any).reconcileOffsetLru.size).toBeLessThanOrEqual(500);
+    });
+
+    it('não admite offset de médico unconfirmed nem expulsa continuação válida', async () => {
+        const staleDoctorId = 'doctor-unconfirmed';
+        const records = Array.from(
+            { length: 200 },
+            (_, index) => unlinked(staleDoctorId, `stale-${String(index).padStart(3, '0')}`),
+        );
+        const { service, client } = setup(records);
+        client.getDoctors.mockResolvedValue({ _items: [] });
+        const existingOffsets = new Map(
+            Array.from(
+                { length: 500 },
+                (_, index) => [`confirmed-${index}`, `offset-${index}`],
+            ),
+        );
+        (service as any).reconcileDoctorCursorByClinic.set(clinicId, {
+            recordOffsetByDoctor: existingOffsets,
+            touchedAt: Date.now(),
+        });
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        const cursor = (service as any).reconcileDoctorCursorByClinic.get(clinicId);
+        expect(cursor.recordOffsetByDoctor.size).toBe(500);
+        expect(cursor.recordOffsetByDoctor.has('confirmed-0')).toBe(true);
+        expect(cursor.recordOffsetByDoctor.has(staleDoctorId)).toBe(false);
+    });
+
+    it('reinicia offsets atomicamente quando a geração de descoberta muda', async () => {
+        const doctorId = 'doctor-new-generation';
+        const records = Array.from(
+            { length: 200 },
+            (_, index) => unlinked(doctorId, `new-${String(index).padStart(3, '0')}`),
+        );
+        const { service, prisma, client } = setup(records);
+        const existingOffsets = new Map(
+            Array.from(
+                { length: 500 },
+                (_, index) => [`old-confirmed-${index}`, `offset-${index}`],
+            ),
+        );
+        (service as any).reconcileDoctorCursorByClinic.set(clinicId, {
+            recordOffsetByDoctor: existingOffsets,
+            discoveryGeneration: 'old-generation',
+            touchedAt: Date.now(),
+        });
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        let cursor = (service as any).reconcileDoctorCursorByClinic.get(clinicId);
+        expect(cursor.recordOffsetByDoctor.size).toBe(0);
+        expect(cursor.lastDoctorId).toBeUndefined();
+        expect(client.getAddresses).not.toHaveBeenCalled();
+        expect(prisma.bookingSync.updateMany).not.toHaveBeenCalled();
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        cursor = (service as any).reconcileDoctorCursorByClinic.get(clinicId);
+        expect(cursor.recordOffsetByDoctor.get(doctorId)).toBe('new-199');
+        expect(client.getAddresses).toHaveBeenCalledWith('facility-1', doctorId);
+    });
+
+    it('não altera offsets no limite quando a descoberta de médicos é parcial', async () => {
+        const doctorId = 'doctor-partial';
+        const records = Array.from(
+            { length: 200 },
+            (_, index) => unlinked(doctorId, `partial-${String(index).padStart(3, '0')}`),
+        );
+        const { service, client } = setup(records);
+        client.getFacilities.mockResolvedValue({
+            _items: [{ id: 'facility-ok' }, { id: 'facility-fails' }],
+        });
+        client.getDoctors
+            .mockResolvedValueOnce({ _items: [{ id: doctorId }] })
+            .mockRejectedValueOnce(new Error('partial discovery failure'));
+        const existingOffsets = new Map(
+            Array.from(
+                { length: 500 },
+                (_, index) => [`confirmed-${index}`, `offset-${index}`],
+            ),
+        );
+        (service as any).reconcileDoctorCursorByClinic.set(clinicId, {
+            recordOffsetByDoctor: existingOffsets,
+            discoveryGeneration: 'stable-generation',
+            touchedAt: Date.now(),
+        });
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        const cursor = (service as any).reconcileDoctorCursorByClinic.get(clinicId);
+        expect(cursor.recordOffsetByDoctor.size).toBe(500);
+        expect(cursor.recordOffsetByDoctor.has('confirmed-0')).toBe(true);
+        expect(cursor.recordOffsetByDoctor.has(doctorId)).toBe(false);
+    });
+
+    it('mantém no máximo 500 offsets por clínica e remove somente o LRU', () => {
+        const { service } = buildService();
+        const cursor = {
+            recordOffsetByDoctor: new Map<string, string>(),
+            touchedAt: Date.now(),
+        };
+        (service as any).reconcileDoctorCursorByClinic.set(clinicId, cursor);
+        for (let index = 0; index < 500; index++) {
+            (service as any).setReconcileOffset(
+                clinicId,
+                cursor,
+                `doctor-${index}`,
+                `offset-${index}`,
+            );
+        }
+
+        expect((service as any).getReconcileOffset(clinicId, cursor, 'doctor-0'))
+            .toBe('offset-0');
+        (service as any).setReconcileOffset(clinicId, cursor, 'doctor-500', 'offset-500');
+
+        expect(cursor.recordOffsetByDoctor.size).toBe(499);
+        expect(cursor.recordOffsetByDoctor.has('doctor-0')).toBe(true);
+        expect(cursor.recordOffsetByDoctor.has('doctor-1')).toBe(false);
+        expect(cursor.recordOffsetByDoctor.has('doctor-500')).toBe(false);
+
+        (service as any).setReconcileOffset(clinicId, cursor, 'doctor-500', 'offset-500');
+        expect(cursor.recordOffsetByDoctor.size).toBe(500);
+        expect(cursor.recordOffsetByDoctor.has('doctor-500')).toBe(true);
+    });
+
+    it('mantém no máximo 10.000 offsets globais com eviction LRU pontual', () => {
+        const { service } = buildService();
+        for (let clinicIndex = 0; clinicIndex < 20; clinicIndex++) {
+            const testClinicId = `clinic-${clinicIndex}`;
+            const cursor = {
+                recordOffsetByDoctor: new Map<string, string>(),
+                touchedAt: Date.now(),
+            };
+            (service as any).reconcileDoctorCursorByClinic.set(testClinicId, cursor);
+            for (let doctorIndex = 0; doctorIndex < 500; doctorIndex++) {
+                (service as any).setReconcileOffset(
+                    testClinicId,
+                    cursor,
+                    `doctor-${doctorIndex}`,
+                    `offset-${doctorIndex}`,
+                );
+            }
+        }
+        const firstCursor = (service as any).reconcileDoctorCursorByClinic.get('clinic-0');
+        expect((service as any).getReconcileOffset('clinic-0', firstCursor, 'doctor-0'))
+            .toBe('offset-0');
+        const finalCursor = {
+            recordOffsetByDoctor: new Map<string, string>(),
+            touchedAt: Date.now(),
+        };
+        (service as any).reconcileDoctorCursorByClinic.set('clinic-20', finalCursor);
+        (service as any).setReconcileOffset(
+            'clinic-20',
+            finalCursor,
+            'doctor-0',
+            'offset-0',
+        );
+
+        expect((service as any).reconcileOffsetLru.size).toBe(9_999);
+        expect(finalCursor.recordOffsetByDoctor.has('doctor-0')).toBe(false);
+        expect(
+            (service as any).reconcileDoctorCursorByClinic
+                .get('clinic-0')
+                .recordOffsetByDoctor.has('doctor-1'),
+        ).toBe(false);
+
+        (service as any).setReconcileOffset(
+            'clinic-20',
+            finalCursor,
+            'doctor-0',
+            'offset-0',
+        );
+
+        const cursors = [...(service as any).reconcileDoctorCursorByClinic.values()];
+        const totalOffsets = cursors.reduce(
+            (total: number, cursor: any) => total + cursor.recordOffsetByDoctor.size,
+            0,
+        );
+        expect((service as any).reconcileOffsetLru.size).toBe(10_000);
+        expect(totalOffsets).toBe(10_000);
+        expect(
+            (service as any).reconcileDoctorCursorByClinic
+                .get('clinic-0')
+                .recordOffsetByDoctor.size,
+        ).toBe(499);
+        expect(
+            (service as any).reconcileDoctorCursorByClinic
+                .get('clinic-0')
+                .recordOffsetByDoctor.has('doctor-0'),
+        ).toBe(true);
+        expect(
+            (service as any).reconcileDoctorCursorByClinic
+                .get('clinic-1')
+                .recordOffsetByDoctor.size,
+        ).toBe(500);
+        expect(finalCursor.recordOffsetByDoctor.get('doctor-0')).toBe('offset-0');
+    });
+
+    it('expira cursor ocioso e remove seus offsets do índice global', async () => {
+        const { service } = buildService();
+        const expiredClinicId = 'clinic-expired';
+        const expiredCursor = {
+            recordOffsetByDoctor: new Map<string, string>(),
+            touchedAt: Date.now() - 24 * 60 * 60 * 1000 - 1,
+        };
+        (service as any).reconcileDoctorCursorByClinic.set(expiredClinicId, expiredCursor);
+        (service as any).setReconcileOffset(
+            expiredClinicId,
+            expiredCursor,
+            'doctor-expired',
+            'offset-expired',
+        );
+
+        await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        expect((service as any).reconcileDoctorCursorByClinic.has(expiredClinicId))
+            .toBe(false);
+        expect((service as any).reconcileOffsetLru.size).toBe(0);
+    });
+
+    it('um novo processo sem cursor recomeça deterministicamente sem alterar registros', async () => {
+        const first = setup([unlinked('doctor-a', 'sync-a')]);
+        const restarted = setup([unlinked('doctor-a', 'sync-a')]);
+
+        await (first.service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        await (restarted.service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+
+        const firstQuery = restarted.prisma.bookingSync.findFirst.mock.calls[0][0];
+        expect(firstQuery.where.doctoraliaDoctorId).toEqual({ not: null });
+        expect(restarted.prisma.bookingSync.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('inclui startAt na adoção atômica e não adota quando o registro mudou', async () => {
         const record = unlinked('doctor-1');
         const { service, prisma, client } = setup([record]);
-        prisma.doctoraliaDoctor.findUnique.mockResolvedValue({ doctoraliaFacilityId: 'facility-1' });
         prisma.bookingSync.updateMany.mockResolvedValue({ count: 0 });
         client.getAddresses.mockResolvedValue({ _items: [{ id: 'address-1' }] });
         client.getBookings.mockResolvedValue({
@@ -222,7 +1249,26 @@ describe('BookingSyncService — reconciliação Doctoralia com vínculos atuais
 
         await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
 
+        expect(prisma.bookingSync.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+            where: expect.objectContaining({ id: record.id, clinicId, startAt }),
+        }));
         expect(record.doctoraliaBookingId).toBeNull();
+    });
+
+    it('não compartilha descoberta entre clínicas ou credenciais', async () => {
+        const first = setup([unlinked('doctor-1')]);
+        const second = setup([{ ...unlinked('doctor-1'), clinicId: 'clinic-2' }]);
+        second.prisma.integrationConnection.findFirst.mockResolvedValue({
+            ...conn, clinicId: 'clinic-2', clientId: 'other-client',
+        });
+
+        await (first.service as any).reconcileUnlinkedWithDoctoralia(clinicId);
+        await (second.service as any).reconcileUnlinkedWithDoctoralia('clinic-2');
+
+        expect(first.client.getFacilities).toHaveBeenCalledTimes(1);
+        expect(second.client.getFacilities).toHaveBeenCalledTimes(1);
+        expect(first.client.getDoctors).toHaveBeenCalledTimes(1);
+        expect(second.client.getDoctors).toHaveBeenCalledTimes(1);
     });
 });
 

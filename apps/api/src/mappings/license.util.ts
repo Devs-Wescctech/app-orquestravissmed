@@ -170,7 +170,7 @@ export function extractDoctoraliaLicenseStrings(doc: any): string[] {
  */
 export function buildDoctoraliaDoctorUpsertData(doc: any, facilityId: string): {
     create: { doctoraliaDoctorId: string; doctoraliaFacilityId: string; name: string; licenseNumbers: string[]; syncedAt: Date };
-    update: { doctoraliaFacilityId: string; name: string; licenseNumbers: string[]; syncedAt: Date };
+    update: { name: string; licenseNumbers: string[]; syncedAt: Date };
 } {
     const docId = String(doc.id);
     const name = doc.surname ? `${doc.name} ${doc.surname}` : (doc.name || doc.title || `Doctor #${docId}`);
@@ -178,6 +178,6 @@ export function buildDoctoraliaDoctorUpsertData(doc: any, facilityId: string): {
     const syncedAt = new Date();
     return {
         create: { doctoraliaDoctorId: docId, doctoraliaFacilityId: facilityId, name, licenseNumbers, syncedAt },
-        update: { doctoraliaFacilityId: facilityId, name, licenseNumbers, syncedAt },
+        update: { name, licenseNumbers, syncedAt },
     };
 }

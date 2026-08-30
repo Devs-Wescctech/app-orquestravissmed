@@ -55,6 +55,7 @@ function buildService(options: {
     const rateLimiter = {
         acquire: jest.fn().mockResolvedValue(undefined),
     };
+    const guard = new ClinicConcurrencyGuard();
     const service = new BookingSyncService(
         prisma,
         {} as any,
@@ -62,7 +63,7 @@ function buildService(options: {
         {} as any,
         rateLimiter as any,
         {} as any,
-        new ClinicConcurrencyGuard(),
+        guard,
         {} as any,
     );
     const logger = { log: jest.fn(), warn: jest.fn(), debug: jest.fn(), error: jest.fn() };
@@ -96,6 +97,7 @@ function buildService(options: {
         reconcileWithoutVismedId,
         propagateCancellation,
         syncBreak,
+        guard,
     };
 }
 
@@ -119,6 +121,31 @@ describe('normalizeVismedAppointmentRecoveryIds', () => {
 });
 
 describe('BookingSyncService — polling VisMed por contrato de feed', () => {
+    it('libera POLLING após reconciliação de 15s simulados e não acumula POLL_SKIPPED_POLL_ACTIVE', async () => {
+        jest.useFakeTimers().setSystemTime(new Date('2026-08-28T12:00:00.000Z'));
+        try {
+            const { service, conn, reconcileUnlinked, guard, logger } = buildService({
+                feedMode: 'INCREMENTAL',
+                response: [],
+            });
+            reconcileUnlinked.mockImplementation(async () => {
+                jest.advanceTimersByTime(15_000);
+            });
+
+            await service.pollVismedClinic(conn);
+            await service.pollVismedClinic(conn);
+            await service.pollVismedClinic(conn);
+
+            expect(reconcileUnlinked).toHaveBeenCalledTimes(3);
+            expect(guard.isActive(clinicId, 'POLLING')).toBe(false);
+            expect(logger.warn).not.toHaveBeenCalledWith(
+                expect.stringContaining('POLL_SKIPPED_POLL_ACTIVE'),
+            );
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+
     it('isola o poll ao conjunto autoritativo da empresa/base e deduplica IDs válidos', async () => {
         const { service, conn, prisma, vismedService, reconcileDisappeared } = buildService();
         prisma.vismedUnit.findMany.mockResolvedValue([{ vismedId: 999 }]);

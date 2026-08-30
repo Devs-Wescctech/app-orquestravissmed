@@ -10,16 +10,35 @@ import { getDoctoraliaMetricsService, concurrencyActorOf } from '../metrics/doct
 import { ClinicConcurrencyGuard } from './clinic-concurrency-guard';
 import { isDoctoraliaCircuitOpenError } from '../integrations/doctoralia-circuit-breaker';
 import { isDoctoraliaQueueError } from '../integrations/doctoralia-queue.errors';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { BookingClaimService, ClaimDeferError } from './booking-claim.service';
 import { resolveVismedAppointmentFeedContract } from './vismed-appointment-feed-mode';
 import { normalizeVismedAppointmentRecoveryIds } from './vismed-appointment-feed-recovery';
+import { StableDataCacheService, STABLE_DATA_TTLS } from '../integrations/stable-data-cache.service';
+import { Prisma } from '@prisma/client';
 
 const POLL_BASE_INTERVAL_MS = 30 * 1000;
 const STAGGER_PER_CLINIC_MS = 2000;
 const STARTUP_DELAY_MS = 5_000;
 
 type VismedReplacementResult = 'adopted' | 'absent' | 'ambiguous' | 'error' | 'deferred';
+type ReconcileDoctorCursor = {
+    lastDoctorId?: string;
+    lastDiscoveryFacilityId?: string;
+    discoveryPassHash?: string;
+    facilityGeneration?: string;
+    discoveryPageDoctorId?: string;
+    discoveryPageOffset?: string;
+    discoveryPageHadAuthorizedFacility?: boolean;
+    discoveryPageFailed?: boolean;
+    recordOffsetByDoctor: Map<string, string>;
+    discoveryGeneration?: string;
+    touchedAt: number;
+};
+type ReconcileOffsetRef = {
+    clinicId: string;
+    doctorId: string;
+};
 
 function parsePositiveSafeIntegerId(value: unknown): number | null {
     if (typeof value === 'number') {
@@ -51,6 +70,8 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
     private clinicTimers: NodeJS.Timeout[] = [];
     private startupTimeout: NodeJS.Timeout | null = null;
     private isShuttingDown = false;
+    private readonly reconcileDoctorCursorByClinic = new Map<string, ReconcileDoctorCursor>();
+    private readonly reconcileOffsetLru = new Map<string, ReconcileOffsetRef>();
 
     constructor(
         private prisma: PrismaService,
@@ -61,7 +82,92 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         private matchingEngine: MatchingEngineService,
         private concurrencyGuard: ClinicConcurrencyGuard,
         private bookingClaimService: BookingClaimService,
+        private stableDataCache: StableDataCacheService = new StableDataCacheService(),
     ) {}
+
+    private reconcileOffsetKey(clinicId: string, doctorId: string): string {
+        return JSON.stringify([clinicId, doctorId]);
+    }
+
+    private getReconcileOffset(
+        clinicId: string,
+        cursor: ReconcileDoctorCursor,
+        doctorId: string,
+    ): string | undefined {
+        const offset = cursor.recordOffsetByDoctor.get(doctorId);
+        if (offset === undefined) return undefined;
+        cursor.recordOffsetByDoctor.delete(doctorId);
+        cursor.recordOffsetByDoctor.set(doctorId, offset);
+        const key = this.reconcileOffsetKey(clinicId, doctorId);
+        this.reconcileOffsetLru.delete(key);
+        this.reconcileOffsetLru.set(key, { clinicId, doctorId });
+        return offset;
+    }
+
+    private deleteReconcileOffset(
+        clinicId: string,
+        cursor: ReconcileDoctorCursor,
+        doctorId: string,
+    ): void {
+        cursor.recordOffsetByDoctor.delete(doctorId);
+        this.reconcileOffsetLru.delete(this.reconcileOffsetKey(clinicId, doctorId));
+    }
+
+    private setReconcileOffset(
+        clinicId: string,
+        cursor: ReconcileDoctorCursor,
+        doctorId: string,
+        offset: string,
+    ): void {
+        const existingOffset = cursor.recordOffsetByDoctor.has(doctorId);
+        if (existingOffset) {
+            this.deleteReconcileOffset(clinicId, cursor, doctorId);
+            cursor.recordOffsetByDoctor.set(doctorId, offset);
+            const existingKey = this.reconcileOffsetKey(clinicId, doctorId);
+            this.reconcileOffsetLru.set(existingKey, { clinicId, doctorId });
+            return;
+        }
+
+        let deferAdmission = false;
+        if (cursor.recordOffsetByDoctor.size >= 500) {
+            const oldestDoctorId = cursor.recordOffsetByDoctor.keys().next().value as string | undefined;
+            if (oldestDoctorId !== undefined) {
+                this.deleteReconcileOffset(clinicId, cursor, oldestDoctorId);
+                deferAdmission = true;
+            }
+        }
+        if (this.reconcileOffsetLru.size >= 10_000) {
+            const oldestKey = this.reconcileOffsetLru.keys().next().value as string | undefined;
+            if (oldestKey !== undefined) {
+                const oldest = this.reconcileOffsetLru.get(oldestKey);
+                this.reconcileOffsetLru.delete(oldestKey);
+                if (oldest) {
+                    this.reconcileDoctorCursorByClinic
+                        .get(oldest.clinicId)
+                        ?.recordOffsetByDoctor.delete(oldest.doctorId);
+                }
+                deferAdmission = true;
+            }
+        }
+        if (deferAdmission) return;
+
+        cursor.recordOffsetByDoctor.set(doctorId, offset);
+        const key = this.reconcileOffsetKey(clinicId, doctorId);
+        this.reconcileOffsetLru.set(key, { clinicId, doctorId });
+    }
+
+    private clearReconcileOffsets(clinicId: string, cursor: ReconcileDoctorCursor): void {
+        for (const doctorId of cursor.recordOffsetByDoctor.keys()) {
+            this.reconcileOffsetLru.delete(this.reconcileOffsetKey(clinicId, doctorId));
+        }
+        cursor.recordOffsetByDoctor.clear();
+    }
+
+    private deleteReconcileCursor(clinicId: string): void {
+        const cursor = this.reconcileDoctorCursorByClinic.get(clinicId);
+        if (cursor) this.clearReconcileOffsets(clinicId, cursor);
+        this.reconcileDoctorCursorByClinic.delete(clinicId);
+    }
 
     // Normaliza qualquer status vindo da Doctoralia para detectar cancelamento de forma robusta
     // (lida com 'canceled', 'cancelled', 'CANCELLED', 'deleted' e flags cancelled_at/canceled_at).
@@ -1223,16 +1329,99 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
     }
 
     private async reconcileUnlinkedWithDoctoralia(clinicId: string) {
-        const unlinked = await this.prisma.bookingSync.findMany({
+        const startedAt = Date.now();
+        const MAX_UNLINKED = 200;
+        const MAX_ADDRESSES_PER_DOCTOR = 25;
+        const MAX_BOOKINGS_PER_ADDRESS = 500;
+        const MAX_EXTERNAL_CALLS = 20;
+        const MAX_DISCOVERY_EXTERNAL_CALLS = 17;
+        const SOFT_DEADLINE_MS = 15_000;
+        const MAX_CURSOR_CLINICS = 1000;
+        const CURSOR_IDLE_TTL_MS = 24 * 60 * 60 * 1000;
+        for (const [storedClinicId, storedCursor] of this.reconcileDoctorCursorByClinic) {
+            if (storedCursor.touchedAt < startedAt - CURSOR_IDLE_TTL_MS) {
+                this.deleteReconcileCursor(storedClinicId);
+            }
+        }
+        const eligibleWhere: Prisma.BookingSyncWhereInput = {
+            clinicId,
+            doctoraliaBookingId: null,
+            status: { in: ['BOOKED', 'CONFIRMED'] },
+            doctoraliaDoctorId: { not: null },
+            startAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
+        };
+        const cursor = this.reconcileDoctorCursorByClinic.get(clinicId) || {
+            recordOffsetByDoctor: new Map<string, string>(),
+            touchedAt: startedAt,
+        };
+        const nextDoctor = await this.prisma.bookingSync.findFirst({
             where: {
-                clinicId,
-                doctoraliaBookingId: null,
-                status: { in: ['BOOKED', 'CONFIRMED'] },
-                doctoraliaDoctorId: { not: null },
-                startAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
+                ...eligibleWhere,
+                ...(cursor.lastDoctorId
+                    ? { doctoraliaDoctorId: { not: null, gt: cursor.lastDoctorId } }
+                    : {}),
             },
+            orderBy: [
+                { doctoraliaDoctorId: 'asc' },
+                { id: 'asc' },
+            ],
+            select: { doctoraliaDoctorId: true },
         });
 
+        if (!nextDoctor?.doctoraliaDoctorId) {
+            if (cursor.lastDoctorId) {
+                cursor.lastDoctorId = undefined;
+                cursor.touchedAt = startedAt;
+                this.reconcileDoctorCursorByClinic.delete(clinicId);
+                this.reconcileDoctorCursorByClinic.set(clinicId, cursor);
+            } else {
+                this.deleteReconcileCursor(clinicId);
+            }
+            return;
+        }
+
+        const doctorId = nextDoctor.doctoraliaDoctorId;
+        const recordOffset = this.getReconcileOffset(clinicId, cursor, doctorId);
+        const discoveryPageOffset = recordOffset ?? '';
+        if (
+            cursor.discoveryPageDoctorId !== doctorId
+            || cursor.discoveryPageOffset !== discoveryPageOffset
+        ) {
+            cursor.lastDiscoveryFacilityId = undefined;
+            cursor.discoveryPassHash = undefined;
+            cursor.discoveryPageDoctorId = doctorId;
+            cursor.discoveryPageOffset = discoveryPageOffset;
+            cursor.discoveryPageHadAuthorizedFacility = false;
+            cursor.discoveryPageFailed = false;
+        }
+        const unlinked = await this.prisma.bookingSync.findMany({
+            where: {
+                ...eligibleWhere,
+                doctoraliaDoctorId: doctorId,
+                ...(recordOffset ? { id: { gt: recordOffset } } : {}),
+            },
+            orderBy: { id: 'asc' },
+            take: MAX_UNLINKED,
+        });
+
+        if (unlinked.length === 0) {
+            this.deleteReconcileOffset(clinicId, cursor, doctorId);
+            cursor.lastDoctorId = doctorId;
+            cursor.touchedAt = startedAt;
+            this.reconcileDoctorCursorByClinic.delete(clinicId);
+            this.reconcileDoctorCursorByClinic.set(clinicId, cursor);
+            return;
+        }
+        const hasContinuation = unlinked.length >= MAX_UNLINKED;
+        const continuationOffset = hasContinuation ? unlinked[unlinked.length - 1].id : undefined;
+        cursor.touchedAt = startedAt;
+        this.reconcileDoctorCursorByClinic.delete(clinicId);
+        this.reconcileDoctorCursorByClinic.set(clinicId, cursor);
+        while (this.reconcileDoctorCursorByClinic.size > MAX_CURSOR_CLINICS) {
+            const oldestClinicId = this.reconcileDoctorCursorByClinic.keys().next().value as string | undefined;
+            if (!oldestClinicId) break;
+            this.deleteReconcileCursor(oldestClinicId);
+        }
         if (unlinked.length === 0) return;
 
         const docConn = await this.prisma.integrationConnection.findFirst({
@@ -1246,26 +1435,196 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             docConn.clientSecret || '',
         );
 
-        const doctorIds = [...new Set(unlinked.map(r => r.doctoraliaDoctorId!))];
+        const doctorIds = [doctorId];
+        const wantedDoctorIds = new Set(doctorIds);
+        const facilitiesByDoctor = new Map<string, string[]>();
+        let externalCalls = 0;
+        const budgetStopped = new Error('RECONCILE_BUDGET_STOPPED');
+        const canStartExternalCall = () =>
+            externalCalls < MAX_EXTERNAL_CALLS
+            && Date.now() - startedAt < SOFT_DEADLINE_MS;
+        const runExternalCall = async <T>(fetchFn: () => Promise<T>): Promise<T> => {
+            if (!canStartExternalCall()) throw budgetStopped;
+            externalCalls++;
+            await this.rateLimiter.acquire('doctoralia');
+            if (Date.now() - startedAt >= SOFT_DEADLINE_MS) throw budgetStopped;
+            return fetchFn();
+        };
+        const clientIdentity = client.getCacheIdentity();
+        const abandonDiscoveryPage = () => {
+            cursor.lastDoctorId = doctorId;
+            cursor.lastDiscoveryFacilityId = undefined;
+            cursor.discoveryPassHash = undefined;
+            cursor.discoveryPageDoctorId = undefined;
+            cursor.discoveryPageOffset = undefined;
+            cursor.discoveryPageHadAuthorizedFacility = false;
+            cursor.discoveryPageFailed = false;
+        };
 
+        let facilityIds: string[];
+        try {
+            const cacheKey = `${clinicId}|${clientIdentity}|facilities`;
+            const response = await this.stableDataCache.getOrFetch(
+                cacheKey,
+                STABLE_DATA_TTLS.facilities,
+                () => runExternalCall(() => client.getFacilities()),
+            );
+            const items = response?._items || (Array.isArray(response) ? response : []);
+            facilityIds = [];
+            const seenFacilityIds = new Set<string>();
+            if (Array.isArray(items)) {
+                for (const facility of items) {
+                    const facilityId = String(facility?.id || '').trim();
+                    if (!facilityId || seenFacilityIds.has(facilityId)) continue;
+                    seenFacilityIds.add(facilityId);
+                    facilityIds.push(facilityId);
+                }
+            }
+            facilityIds.sort();
+        } catch (error) {
+            if (error === budgetStopped) return;
+            this.logger.warn(
+                `[RECONCILE] clinicId=${clinicId} stage=get_facilities action=skip calls=${externalCalls}`,
+            );
+            return;
+        }
+
+        const facilityGeneration = createHash('sha256')
+            .update(clientIdentity)
+            .update(JSON.stringify(facilityIds))
+            .digest('hex');
+        if (
+            cursor.facilityGeneration
+            && cursor.facilityGeneration !== facilityGeneration
+        ) {
+            cursor.lastDoctorId = undefined;
+            cursor.lastDiscoveryFacilityId = undefined;
+            cursor.discoveryPassHash = undefined;
+            cursor.discoveryGeneration = undefined;
+            cursor.discoveryPageDoctorId = undefined;
+            cursor.discoveryPageOffset = undefined;
+            cursor.discoveryPageHadAuthorizedFacility = false;
+            cursor.discoveryPageFailed = false;
+            cursor.facilityGeneration = facilityGeneration;
+            this.clearReconcileOffsets(clinicId, cursor);
+            cursor.touchedAt = Date.now();
+            this.reconcileDoctorCursorByClinic.delete(clinicId);
+            this.reconcileDoctorCursorByClinic.set(clinicId, cursor);
+            return;
+        }
+        cursor.facilityGeneration = facilityGeneration;
+        let discoveryStartIndex = 0;
+        if (cursor.lastDiscoveryFacilityId) {
+            const previousIndex = facilityIds.indexOf(cursor.lastDiscoveryFacilityId);
+            discoveryStartIndex = previousIndex >= 0 ? previousIndex + 1 : 0;
+        }
+        if (discoveryStartIndex >= facilityIds.length) {
+            discoveryStartIndex = 0;
+            cursor.lastDiscoveryFacilityId = undefined;
+            cursor.discoveryPassHash = undefined;
+        }
+
+        let doctorDiscoveryIncomplete = false;
+        let doctorDiscoveryFailed = false;
+        let discoveryPassHash = cursor.discoveryPassHash
+            || createHash('sha256')
+                .update(clientIdentity)
+                .update(facilityGeneration)
+                .digest('hex');
+        for (let facilityIndex = discoveryStartIndex; facilityIndex < facilityIds.length; facilityIndex++) {
+            const facilityId = facilityIds[facilityIndex];
+            if (externalCalls >= MAX_DISCOVERY_EXTERNAL_CALLS) {
+                doctorDiscoveryIncomplete = true;
+                break;
+            }
+            try {
+                const cacheKey = `${clinicId}|${clientIdentity}|doctors|${facilityId}`;
+                const response = await this.stableDataCache.getOrFetch(
+                    cacheKey,
+                    STABLE_DATA_TTLS.doctors,
+                    () => runExternalCall(() => client.getDoctors(facilityId)),
+                );
+                const items = response?._items || (Array.isArray(response) ? response : []);
+                const uniqueDoctorIds = new Set<string>();
+                if (Array.isArray(items)) {
+                    for (const doctor of items) {
+                        const discoveredDoctorId = String(doctor?.id || '').trim();
+                        if (!discoveredDoctorId) continue;
+                        uniqueDoctorIds.add(discoveredDoctorId);
+                    }
+                }
+                const canonicalDoctorIds = [...uniqueDoctorIds].sort();
+                discoveryPassHash = createHash('sha256')
+                    .update(discoveryPassHash)
+                    .update(facilityId)
+                    .update(JSON.stringify(canonicalDoctorIds))
+                    .digest('hex');
+                cursor.lastDiscoveryFacilityId = facilityId;
+                cursor.discoveryPassHash = discoveryPassHash;
+                const facilityContainsWantedDoctor = canonicalDoctorIds.some(
+                    discoveredDoctorId => wantedDoctorIds.has(discoveredDoctorId),
+                );
+                if (facilityContainsWantedDoctor) {
+                    const doctorFacilities = facilitiesByDoctor.get(doctorId) || [];
+                    doctorFacilities.push(facilityId);
+                    facilitiesByDoctor.set(doctorId, doctorFacilities);
+                }
+            } catch (error) {
+                if (error === budgetStopped) {
+                    doctorDiscoveryIncomplete = true;
+                    break;
+                }
+                doctorDiscoveryIncomplete = true;
+                doctorDiscoveryFailed = true;
+                this.logger.warn(
+                    `[RECONCILE] clinicId=${clinicId} facilityId=${facilityId} stage=get_doctors action=skip calls=${externalCalls}`,
+                );
+            }
+        }
+
+        if (!doctorDiscoveryIncomplete) {
+            const discoveryGeneration = discoveryPassHash;
+            if (
+                cursor.discoveryGeneration
+                && cursor.discoveryGeneration !== discoveryGeneration
+            ) {
+                cursor.lastDoctorId = undefined;
+                this.clearReconcileOffsets(clinicId, cursor);
+                cursor.discoveryGeneration = discoveryGeneration;
+                cursor.discoveryPageDoctorId = undefined;
+                cursor.discoveryPageOffset = undefined;
+                cursor.discoveryPageHadAuthorizedFacility = false;
+                cursor.discoveryPageFailed = false;
+                cursor.touchedAt = Date.now();
+                this.reconcileDoctorCursorByClinic.delete(clinicId);
+                this.reconcileDoctorCursorByClinic.set(clinicId, cursor);
+                return;
+            }
+            cursor.discoveryGeneration = discoveryGeneration;
+            cursor.lastDiscoveryFacilityId = undefined;
+            cursor.discoveryPassHash = undefined;
+        } else if (doctorDiscoveryFailed) {
+            cursor.lastDiscoveryFacilityId = undefined;
+            cursor.discoveryPassHash = undefined;
+            cursor.discoveryPageHadAuthorizedFacility = false;
+            cursor.discoveryPageFailed = false;
+            cursor.lastDoctorId = doctorId;
+        }
+
+        const alreadyLinked = new Set(
+            (await this.prisma.bookingSync.findMany({
+                where: { clinicId, doctoraliaBookingId: { not: null } },
+                select: { doctoraliaBookingId: true },
+                take: 5000,
+            })).map(r => r.doctoraliaBookingId!),
+        );
+
+        const accumulatePageCoverage = !doctorDiscoveryFailed;
         for (const doctorId of doctorIds) {
             const doctorUnlinked = unlinked.filter(r => r.doctoraliaDoctorId === doctorId);
             if (doctorUnlinked.length === 0) continue;
-
-            let doctor: { doctoraliaFacilityId: string } | null;
-            try {
-                doctor = await this.prisma.doctoraliaDoctor.findUnique({
-                    where: { doctoraliaDoctorId: doctorId },
-                    select: { doctoraliaFacilityId: true },
-                });
-            } catch {
-                this.logger.warn(
-                    `[RECONCILE] clinicId=${clinicId} doctorId=${doctorId} stage=resolve_doctor action=skip_error`,
-                );
-                continue;
-            }
-            const facilityId = doctor?.doctoraliaFacilityId?.trim();
-            if (!facilityId) {
+            const authorizedFacilityIds = facilitiesByDoctor.get(doctorId) ?? [];
+            if (authorizedFacilityIds.length === 0) {
                 this.logger.warn(
                     `[RECONCILE] clinicId=${clinicId} doctorId=${doctorId} stage=resolve_doctor action=skip`,
                 );
@@ -1282,98 +1641,136 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             const minStart = toBrtIso(minStartDate);
             const maxEnd = toBrtIso(maxEndDate);
 
-            let addresses: any[];
-            try {
-                await this.rateLimiter.acquire('doctoralia');
-                const response = await client.getAddresses(facilityId, doctorId);
-                const items = response?._items || (Array.isArray(response) ? response : []);
-                addresses = Array.isArray(items) ? items : [];
-            } catch {
-                this.logger.warn(
-                    `[RECONCILE] clinicId=${clinicId} doctorId=${doctorId} facilityId=${facilityId} stage=get_addresses action=skip`,
-                );
-                continue;
-            }
-
-            if (addresses.length === 0) {
-                this.logger.warn(
-                    `[RECONCILE] clinicId=${clinicId} doctorId=${doctorId} facilityId=${facilityId} stage=get_addresses action=skip_empty`,
-                );
-                continue;
-            }
-
-            for (const addr of addresses) {
-                const addressId = String(addr?.id || '').trim();
-                if (!addressId) continue;
-
+            for (const facilityId of authorizedFacilityIds) {
+                if (accumulatePageCoverage) {
+                    cursor.discoveryPageHadAuthorizedFacility = true;
+                }
+                let addresses: any[];
                 try {
-                    await this.rateLimiter.acquire('doctoralia');
-                    const res = await client.getBookings(
-                        facilityId,
-                        doctorId,
-                        addressId,
-                        minStart,
-                        maxEnd,
+                    const response = await runExternalCall(() => client.getAddresses(facilityId, doctorId));
+                    const items = response?._items || (Array.isArray(response) ? response : []);
+                    addresses = Array.isArray(items) ? items.slice(0, MAX_ADDRESSES_PER_DOCTOR) : [];
+                } catch (error) {
+                    if (accumulatePageCoverage) cursor.discoveryPageFailed = true;
+                    if (error === budgetStopped) {
+                        abandonDiscoveryPage();
+                        return;
+                    }
+                    this.logger.warn(
+                        `[RECONCILE] clinicId=${clinicId} doctorId=${doctorId} facilityId=${facilityId} stage=get_addresses action=skip calls=${externalCalls}`,
                     );
+                    continue;
+                }
 
-                    const bookings = res?._items || (Array.isArray(res) ? res : []);
-                    if (!Array.isArray(bookings) || bookings.length === 0) continue;
-
-                    const alreadyLinked = new Set(
-                        (await this.prisma.bookingSync.findMany({
-                            where: { clinicId, doctoraliaBookingId: { not: null } },
-                            select: { doctoraliaBookingId: true },
-                        })).map(r => r.doctoraliaBookingId!),
+                if (addresses.length === 0) {
+                    this.logger.warn(
+                        `[RECONCILE] clinicId=${clinicId} doctorId=${doctorId} facilityId=${facilityId} stage=get_addresses action=skip_empty`,
                     );
+                    continue;
+                }
 
-                    for (const booking of bookings) {
-                        const bid = String(booking.id || '');
-                        if (!bid || alreadyLinked.has(bid)) continue;
-                        if (this.isDoctoraliaCancelled(booking)) continue;
+                for (const addr of addresses) {
+                    const addressId = String(addr?.id || '').trim();
+                    if (!addressId) continue;
 
-                        const bookingStart = new Date(booking.start_at);
-                        const toleranceMs = 120 * 1000;
-
-                        const match = doctorUnlinked.find(r =>
-                            Math.abs(r.startAt.getTime() - bookingStart.getTime()) <= toleranceMs
-                            && !r.doctoraliaBookingId,
+                    try {
+                        const res = await runExternalCall(
+                            () => client.getBookings(
+                                facilityId,
+                                doctorId,
+                                addressId,
+                                minStart,
+                                maxEnd,
+                            ),
                         );
 
-                        if (match) {
-                            const adopted = await this.prisma.bookingSync.updateMany({
-                                where: {
-                                    id: match.id,
-                                    clinicId,
-                                    doctoraliaDoctorId: doctorId,
-                                    doctoraliaBookingId: null,
-                                    status: { in: ['BOOKED', 'CONFIRMED'] },
-                                },
-                                data: {
-                                    doctoraliaBookingId: bid,
-                                    doctoraliaAddressId: addressId,
-                                    doctoraliaFacilityId: facilityId,
-                                    syncedToDoctoralia: true,
-                                },
-                            });
-                            if (adopted.count !== 1) {
-                                this.logger.warn(
-                                    `[RECONCILE] clinicId=${clinicId} doctorId=${doctorId} facilityId=${facilityId} addressId=${addressId} bookingSyncId=${match.id} doctoraliaBookingId=${bid} stage=match action=skip_changed`,
-                                );
-                                continue;
-                            }
-                            match.doctoraliaBookingId = bid;
-                            alreadyLinked.add(bid);
-                            this.logger.log(
-                                `[RECONCILE] clinicId=${clinicId} doctorId=${doctorId} facilityId=${facilityId} addressId=${addressId} bookingSyncId=${match.id} doctoraliaBookingId=${bid} stage=match action=linked`,
+                        const items = res?._items || (Array.isArray(res) ? res : []);
+                        const bookings = Array.isArray(items) ? items.slice(0, MAX_BOOKINGS_PER_ADDRESS) : [];
+                        if (bookings.length === 0) continue;
+
+                        for (const booking of bookings) {
+                            const bid = String(booking.id || '');
+                            if (!bid || alreadyLinked.has(bid)) continue;
+                            if (this.isDoctoraliaCancelled(booking)) continue;
+
+                            const bookingStart = new Date(booking.start_at);
+                            const toleranceMs = 120 * 1000;
+
+                            const match = doctorUnlinked.find(r =>
+                                Math.abs(r.startAt.getTime() - bookingStart.getTime()) <= toleranceMs
+                                && !r.doctoraliaBookingId,
                             );
+
+                            if (match) {
+                                const adopted = await this.prisma.bookingSync.updateMany({
+                                    where: {
+                                        id: match.id,
+                                        clinicId,
+                                        doctoraliaDoctorId: doctorId,
+                                        doctoraliaBookingId: null,
+                                        status: { in: ['BOOKED', 'CONFIRMED'] },
+                                        startAt: match.startAt,
+                                    },
+                                    data: {
+                                        doctoraliaBookingId: bid,
+                                        doctoraliaAddressId: addressId,
+                                        doctoraliaFacilityId: facilityId,
+                                        syncedToDoctoralia: true,
+                                    },
+                                });
+                                if (adopted.count !== 1) {
+                                    this.logger.warn(
+                                        `[RECONCILE] clinicId=${clinicId} doctorId=${doctorId} facilityId=${facilityId} addressId=${addressId} bookingSyncId=${match.id} doctoraliaBookingId=${bid} stage=match action=skip_changed`,
+                                    );
+                                    continue;
+                                }
+                                match.doctoraliaBookingId = bid;
+                                alreadyLinked.add(bid);
+                                this.logger.log(
+                                    `[RECONCILE] clinicId=${clinicId} doctorId=${doctorId} facilityId=${facilityId} addressId=${addressId} bookingSyncId=${match.id} doctoraliaBookingId=${bid} stage=match action=linked`,
+                                );
+                            }
                         }
+                    } catch (error) {
+                        if (accumulatePageCoverage) cursor.discoveryPageFailed = true;
+                        if (error === budgetStopped) {
+                            abandonDiscoveryPage();
+                            return;
+                        }
+                        this.logger.warn(
+                            `[RECONCILE] clinicId=${clinicId} doctorId=${doctorId} facilityId=${facilityId} addressId=${addressId} stage=get_bookings action=skip calls=${externalCalls}`,
+                        );
                     }
-                } catch {
-                    this.logger.warn(
-                        `[RECONCILE] clinicId=${clinicId} doctorId=${doctorId} facilityId=${facilityId} addressId=${addressId} stage=get_bookings action=skip`,
-                    );
                 }
             }
+        }
+
+        if (cursor.discoveryPageFailed) {
+            abandonDiscoveryPage();
+            return;
+        }
+
+        if (!doctorDiscoveryIncomplete) {
+            let pageCoverageSucceeded = false;
+            if (
+                cursor.discoveryPageHadAuthorizedFacility
+                && !cursor.discoveryPageFailed
+            ) {
+                pageCoverageSucceeded = true;
+                if (hasContinuation) {
+                    this.setReconcileOffset(clinicId, cursor, doctorId, continuationOffset!);
+                } else {
+                    this.deleteReconcileOffset(clinicId, cursor, doctorId);
+                }
+            } else if (!cursor.discoveryPageHadAuthorizedFacility) {
+                pageCoverageSucceeded = true;
+                this.deleteReconcileOffset(clinicId, cursor, doctorId);
+            }
+            if (pageCoverageSucceeded) cursor.lastDoctorId = doctorId;
+            cursor.discoveryPageDoctorId = undefined;
+            cursor.discoveryPageOffset = undefined;
+            cursor.discoveryPageHadAuthorizedFacility = false;
+            cursor.discoveryPageFailed = false;
         }
     }
 
