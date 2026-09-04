@@ -17,6 +17,171 @@ export interface ParsedLicense {
     digits: string;
 }
 
+export type ShadowLicenseStatus = 'PARSED' | 'AMBIGUOUS' | 'UNPARSEABLE' | 'ABSENT';
+
+export interface ShadowLicenseCredential {
+    council: string;
+    uf: string | null;
+    regional: string | null;
+    number: string;
+}
+
+export interface ShadowLicenseResult {
+    /** Exact input reference/value; never trimmed or persisted. */
+    raw: string | null | undefined;
+    status: ShadowLicenseStatus;
+    credential: ShadowLicenseCredential | null;
+    rqes: string[];
+    reason: string;
+    observations: Array<'crm_rj_52_prefix' | 'embedded_rqe' | 'separate_rqe' | 'crn_numeric_region'>;
+}
+
+export type LicenseShadowCounter =
+    | 'parsed' | 'absent' | 'ambiguous' | 'unparseable'
+    | 'crm_rj_52_prefix' | 'embedded_rqe' | 'separate_rqe' | 'crn_numeric_region'
+    | 'legacy_parseable_conservative_blocked'
+    | 'legacy_unparseable_conservative_parsed';
+
+const LICENSE_SHADOW_COUNTERS: Record<LicenseShadowCounter, number> = {
+    parsed: 0,
+    absent: 0,
+    ambiguous: 0,
+    unparseable: 0,
+    crm_rj_52_prefix: 0,
+    embedded_rqe: 0,
+    separate_rqe: 0,
+    crn_numeric_region: 0,
+    legacy_parseable_conservative_blocked: 0,
+    legacy_unparseable_conservative_parsed: 0,
+};
+
+const MAX_SHADOW_LICENSE_LENGTH = 256;
+
+function shadowResult(
+    raw: string | null | undefined,
+    status: ShadowLicenseStatus,
+    reason: string,
+    credential: ShadowLicenseCredential | null = null,
+    rqes: string[] = [],
+    observations: ShadowLicenseResult['observations'] = [],
+): ShadowLicenseResult {
+    return { raw, status, credential, rqes, reason, observations };
+}
+
+function normalizeShadowNumber(value: string): string | null {
+    if (!/^[0-9]+(?:[.][0-9]+)*$/.test(value)) return null;
+    const digits = value.replace(/[.]/g, '').replace(/^0+/, '');
+    return digits || null;
+}
+
+/**
+ * Conservative parser used only for shadow observation. It intentionally accepts
+ * a small set of anchored ASCII grammars and fails closed for everything else.
+ */
+export function parseLicenseStringConservative(
+    raw?: string | null,
+    councilHint?: string | null,
+): ShadowLicenseResult {
+    if (raw == null) return shadowResult(raw, 'ABSENT', 'absent');
+    if (raw.length > MAX_SHADOW_LICENSE_LENGTH) return shadowResult(raw, 'UNPARSEABLE', 'input_too_long');
+    if (/[^\x20-\x7Eº°]/.test(raw)) return shadowResult(raw, 'UNPARSEABLE', 'non_ascii_character');
+    const value = raw.trim().toUpperCase();
+    if (value === '') return shadowResult(raw, 'ABSENT', 'absent');
+    const hint = normalizeCouncil(councilHint);
+    const rqePattern = /(?:^|[\s,;])(RQE(?:\s+([0-9]+)|:\s*([0-9]+)|\s+N[º°]:\s*([0-9]+)))(?=$|[\s,;])/g;
+    const rqeTokens = Array.from(value.matchAll(rqePattern));
+    const valueWithoutRecognizedRqe = rqeTokens.reduce((remaining, token) => remaining.replace(token[1], ''), value);
+    if (/[º°]/.test(valueWithoutRecognizedRqe)) {
+        return shadowResult(raw, 'UNPARSEABLE', 'non_ascii_character');
+    }
+    const malformedRqe = /(?:^|[\s,;])RQE(?:$|[\s,;:])/.test(value) && rqeTokens.length === 0;
+    if (malformedRqe) return shadowResult(raw, 'UNPARSEABLE', 'malformed_rqe');
+    if (rqeTokens.length > 1) return shadowResult(raw, 'AMBIGUOUS', 'multiple_rqes');
+
+    const rqes = rqeTokens.map(token => (token[2] || token[3] || token[4]).replace(/^0+/, ''));
+    if (rqes.some(rqe => rqe === '')) {
+        return shadowResult(raw, 'UNPARSEABLE', 'zero_rqe', null, [], [
+            value.startsWith('RQE') ? 'separate_rqe' : 'embedded_rqe',
+        ]);
+    }
+    let main = value;
+    if (rqeTokens.length === 1) {
+        main = value.replace(rqeTokens[0][0], '').trim().replace(/[,;]$/, '').trim();
+        if (!main) return shadowResult(raw, 'UNPARSEABLE', 'rqe_without_primary', null, rqes, ['separate_rqe']);
+    }
+    const observations: ShadowLicenseResult['observations'] = rqes.length ? ['embedded_rqe'] : [];
+
+    if (hint === 'CRM' && /^52-/.test(main)) {
+        const remainder = main.slice(3);
+        const crmRjNumber = /^([0-9]+)(?:-([0-9]))?$/.exec(remainder);
+        if (!crmRjNumber) return shadowResult(raw, 'UNPARSEABLE', 'invalid_crm_rj_52_number', null, rqes);
+        const number = normalizeShadowNumber(crmRjNumber[1] + (crmRjNumber[2] || ''));
+        if (!number || number.length < 2) return shadowResult(raw, 'UNPARSEABLE', 'invalid_crm_rj_52_number', null, rqes);
+        return shadowResult(raw, 'PARSED', 'crm_rj_52_prefix', {
+            council: 'CRM', uf: 'RJ', regional: null, number,
+        }, rqes, [...observations, 'crm_rj_52_prefix']);
+    }
+    if (/^52[- ]/.test(main) || main.includes(' 52-')) {
+        return shadowResult(raw, 'UNPARSEABLE', 'unsupported_52_prefix', null, rqes);
+    }
+
+    const crn = /^CRN(?:-?([0-9]+))?\/([0-9]+(?:[.][0-9]+)*)$/.exec(main);
+    if (crn) {
+        if (hint && hint !== 'CRN') return shadowResult(raw, 'AMBIGUOUS', 'council_contradicts_document_type', null, rqes);
+        const number = normalizeShadowNumber(crn[2]);
+        if (!number) return shadowResult(raw, 'UNPARSEABLE', 'zero_number', null, rqes);
+        const obs = crn[1] ? [...observations, 'crn_numeric_region' as const] : observations;
+        return shadowResult(raw, 'PARSED', crn[1] ? 'crn_numeric_region' : 'explicit_council', {
+            council: 'CRN', uf: null, regional: crn[1] || null, number,
+        }, rqes, obs);
+    }
+
+    const explicit = /^(CREFITO|CRBIO|COREN|CRESS|CRFA|CRMV|CRBM|CREF|CRTR|CRM|CRP|CRO|CRN|CRF|CRQ|OAB|CFM)(?:\/?([A-Z]{2}))?[\s/]+([0-9]+(?:[.][0-9]+)*)$/.exec(main)
+        || /^(CREFITO|CRBIO|COREN|CRESS|CRFA|CRMV|CRBM|CREF|CRTR|CRM|CRP|CRO|CRN|CRF|CRQ|OAB|CFM)([A-Z]{2})\s+([0-9]+(?:[.][0-9]+)*)$/.exec(main);
+    if (explicit) {
+        const council = explicit[1];
+        const uf = explicit[2] || null;
+        if (hint && hint !== council) return shadowResult(raw, 'AMBIGUOUS', 'council_contradicts_document_type', null, rqes);
+        if (uf && !BR_UFS.has(uf)) return shadowResult(raw, 'UNPARSEABLE', 'unknown_uf', null, rqes);
+        const number = normalizeShadowNumber(explicit[3]);
+        if (!number) return shadowResult(raw, 'UNPARSEABLE', 'zero_number', null, rqes);
+        return shadowResult(raw, 'PARSED', 'explicit_council', { council, uf, regional: null, number }, rqes, observations);
+    }
+
+    if (/^[0-9]+(?:[.][0-9]+)*$/.test(main)) {
+        if (!hint || !KNOWN_COUNCILS.includes(hint)) return shadowResult(raw, 'UNPARSEABLE', 'number_without_known_document_type', null, rqes);
+        const number = normalizeShadowNumber(main);
+        if (!number) return shadowResult(raw, 'UNPARSEABLE', 'zero_number', null, rqes);
+        return shadowResult(raw, 'PARSED', 'document_type_with_number', {
+            council: hint, uf: null, regional: null, number,
+        }, rqes, observations);
+    }
+
+    if (/\d+\s+\d+/.test(main)) return shadowResult(raw, 'AMBIGUOUS', 'multiple_unlabelled_numbers', null, rqes);
+    return shadowResult(raw, 'UNPARSEABLE', 'unsupported_grammar', null, rqes);
+}
+
+export function isLicenseShadowModeEnabled(envValue = process.env.LICENSE_NORMALIZER_SHADOW): boolean {
+    return envValue === '1' || envValue?.toLowerCase() === 'true';
+}
+
+export function observeLicenseShadow(raw?: string | null, councilHint?: string | null): void {
+    const result = parseLicenseStringConservative(raw, councilHint);
+    LICENSE_SHADOW_COUNTERS[result.status.toLowerCase() as Lowercase<ShadowLicenseStatus>]++;
+    for (const observation of result.observations) LICENSE_SHADOW_COUNTERS[observation]++;
+    const old = parseLicenseString(raw, councilHint);
+    if (old && result.status !== 'PARSED') LICENSE_SHADOW_COUNTERS.legacy_parseable_conservative_blocked++;
+    if (!old && result.status === 'PARSED') LICENSE_SHADOW_COUNTERS.legacy_unparseable_conservative_parsed++;
+}
+
+export function getLicenseShadowCounters(): Readonly<Record<LicenseShadowCounter, number>> {
+    return { ...LICENSE_SHADOW_COUNTERS };
+}
+
+export function resetLicenseShadowCounters(): void {
+    for (const key of Object.keys(LICENSE_SHADOW_COUNTERS) as LicenseShadowCounter[]) LICENSE_SHADOW_COUNTERS[key] = 0;
+}
+
 const BR_UFS = new Set([
     'AC', 'AL', 'AP', 'AM', 'BA', 'CE', 'DF', 'ES', 'GO', 'MA', 'MT', 'MS',
     'MG', 'PA', 'PB', 'PR', 'PE', 'PI', 'RJ', 'RN', 'RS', 'RO', 'RR', 'SC',

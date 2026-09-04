@@ -6,6 +6,7 @@
  */
 import { Injectable, Logger } from '@nestjs/common';
 import { DoctoraliaOrigin } from './doctoralia-call-context';
+import { getLicenseShadowCounters, resetLicenseShadowCounters } from '../mappings/license.util';
 
 // ──────────────────────────── Tipos públicos ─────────────────────────────────
 
@@ -381,6 +382,7 @@ export class DoctoraliaMetricsService {
                 waitCount: 0, totalWaitMs: 0, maxWaitMs: 0,
                 lastOccupancyPct: 0, lastAppliedAt: null,
             };
+            resetLicenseShadowCounters();
             this.startedAt = Date.now();
         } catch (err: any) {
             this.logger.warn(`[METRICS] reset() error: ${err?.message}`);
@@ -1065,6 +1067,13 @@ export class DoctoraliaMetricsService {
                     p95: percentile(rlWaitMs, 95),
                     max: rlWaitMs[rlWaitMs.length - 1] ?? 0,
                 },
+            },
+            // Task 254: somente dez contadores globais de baixa cardinalidade.
+            // Nenhum valor bruto, nome, documento ou identificador é retido.
+            licenseNormalizerShadow: {
+                enabled: process.env.LICENSE_NORMALIZER_SHADOW === '1'
+                    || process.env.LICENSE_NORMALIZER_SHADOW?.toLowerCase() === 'true',
+                counters: getLicenseShadowCounters(),
             },
             // WP-05: GETs idênticos que se juntaram a um voo em andamento (não consumiram
             // slot WAF nem posição na fila). Seção aditiva — não altera métricas atuais.

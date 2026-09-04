@@ -2,7 +2,10 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import * as stringSimilarity from 'string-similarity';
 import { MatchType } from '@prisma/client';
-import { parseLicenseString, councilsCompatible, ParsedLicense } from './license.util';
+import {
+    parseLicenseString, councilsCompatible, ParsedLicense,
+    isLicenseShadowModeEnabled, observeLicenseShadow,
+} from './license.util';
 
 @Injectable()
 export class MatchingEngineService {
@@ -763,6 +766,14 @@ export class MatchingEngineService {
         doc: { id: string; name: string; documentNumber?: string | null; documentType?: string | null },
         dDoctors: Array<{ id: string; doctoraliaDoctorId: string; name: string; licenseNumbers?: string[] | null }>,
     ): Promise<'LINKED' | 'REVIEW' | 'NONE'> {
+        // SHADOW ONLY. Bloqueio para ativação decisória futura: antes de usar este
+        // resultado, os candidatos Doctoralia precisam ser isolados por clínica.
+        if (isLicenseShadowModeEnabled()) {
+            observeLicenseShadow(doc.documentNumber, doc.documentType);
+            for (const doctor of dDoctors) {
+                for (const raw of (doctor.licenseNumbers || [])) observeLicenseShadow(raw);
+            }
+        }
         const vLic = parseLicenseString(doc.documentNumber, doc.documentType);
         // Sem conselho identificável no lado VisMed, não há identidade confiável.
         if (!vLic || !vLic.council) return 'NONE';
