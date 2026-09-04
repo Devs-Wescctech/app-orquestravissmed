@@ -53,6 +53,11 @@ interface CachedToken {
 
 @Injectable()
 export class DocplannerClient implements OnModuleDestroy {
+    private catalogAttemptGuard?: () => Promise<void>;
+
+    setCatalogAttemptGuard(guard: (() => Promise<void>) | undefined): void {
+        this.catalogAttemptGuard = guard;
+    }
     private readonly logger = new Logger(DocplannerClient.name);
 
     /**
@@ -1148,6 +1153,7 @@ export class DocplannerClient implements OnModuleDestroy {
         // de outra requisição concorrente).
         try {
             DocplannerClient.guardRetryDispatch(attemptState);
+            if (method === 'GET' && this.catalogAttemptGuard) await this.catalogAttemptGuard();
         } catch (blocked) {
             DocplannerClient.releaseRateSlotGrant(slotGrant);
             throw blocked;
@@ -1379,6 +1385,78 @@ export class DocplannerClient implements OnModuleDestroy {
         // Task 141: extensão doctor.license_numbers traz o registro profissional
         // (ex.: "CRM/SP 12345") na MESMA requisição, sem custo extra de rate limit.
         return this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors?with[]=doctor.license_numbers`);
+    }
+
+    /**
+     * Task 261: enumeração paginada usada exclusivamente para publicar o catálogo
+     * tenant-safe. Cada página passa pelo coordenador GET normal de request(); o
+     * budget adicional limita a operação lógica, sem criar uma fila paralela.
+     */
+    async enumerateFacilitiesAndDoctors(maxGetRequests = 40, assertContinue?: () => Promise<void>): Promise<{
+        facilities: any[];
+        doctorsByFacility: Map<string, any[]>;
+        getRequests: number;
+    }> {
+        const budget = {
+            remaining: Math.min(500, Math.max(1, Math.trunc(maxGetRequests))),
+            used: 0,
+        };
+        const fetchAll = async (initialPath: string, allowedPrefix: string): Promise<any[]> => {
+            const items: any[] = [];
+            let path: string | null = initialPath;
+            const visited = new Set<string>();
+            while (path) {
+                if (assertContinue) await assertContinue();
+                if (budget.remaining <= 0) {
+                    throw new Error(`Doctoralia catalog GET budget exceeded (${budget.used}/${maxGetRequests})`);
+                }
+                if (visited.has(path)) throw new Error('Doctoralia catalog pagination cycle detected');
+                visited.add(path);
+                budget.remaining--;
+                budget.used++;
+                const page = await this.request('GET', path);
+                if (assertContinue) await assertContinue();
+                if (!page || !Array.isArray(page._items)) {
+                    throw new Error('Doctoralia catalog page has no _items array');
+                }
+                items.push(...page._items);
+                path = this.catalogNextPagePath(page, allowedPrefix);
+            }
+            return items;
+        };
+
+        const facilitiesPath = '/api/v3/integration/facilities';
+        const facilities = await fetchAll(facilitiesPath, facilitiesPath);
+        const doctorsByFacility = new Map<string, any[]>();
+        for (const facility of facilities) {
+            const facilityId = String(facility?.id ?? '').trim();
+            if (!facilityId) throw new Error('Doctoralia catalog facility without id');
+            const prefix = `/api/v3/integration/facilities/${encodeURIComponent(facilityId)}/doctors`;
+            doctorsByFacility.set(
+                facilityId,
+                await fetchAll(`${prefix}?with[]=doctor.license_numbers`, prefix),
+            );
+        }
+        return { facilities, doctorsByFacility, getRequests: budget.used };
+    }
+
+    private catalogNextPagePath(page: any, allowedPrefix: string): string | null {
+        const raw = page?._links?.next?.href ?? page?._links?.next ?? page?.links?.next;
+        if (raw == null || raw === '') return null;
+        if (typeof raw !== 'string') throw new Error('Doctoralia catalog next link is not a string');
+        let path: string;
+        try {
+            const base = new URL(this.getBaseUrl());
+            const parsed = new URL(raw, base);
+            if (parsed.host !== base.host) throw new Error('cross-host next link');
+            path = `${parsed.pathname}${parsed.search}`;
+        } catch (e: any) {
+            throw new Error(`Invalid Doctoralia catalog next link: ${e?.message}`);
+        }
+        if (!(path === allowedPrefix || path.startsWith(`${allowedPrefix}?`))) {
+            throw new Error('Doctoralia catalog next link left the requested collection');
+        }
+        return path;
     }
 
     async getAddresses(facilityId: string, doctorId: string): Promise<any> {

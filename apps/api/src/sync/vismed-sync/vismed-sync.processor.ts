@@ -261,6 +261,13 @@ export class VismedSyncProcessor extends WorkerHost {
                     }
                 });
 
+                // Tenant-safe matching must see a truly absent Mapping. The
+                // following placeholder upsert is deliberately AFTER it and
+                // cannot overwrite a LINKED row created atomically.
+                if (typeof this.matchingEngine.runMatchingForDoctor === 'function') {
+                    await this.matchingEngine.runMatchingForDoctor(doctor.id, clinicId);
+                }
+
                 // Garantir Entrada no Mapping para o dashboard e UI de Mappings
                 await this.prisma.mapping.upsert({
                     where: {

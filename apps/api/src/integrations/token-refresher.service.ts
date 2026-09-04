@@ -3,6 +3,7 @@ import { Cron } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
 import { DocplannerService } from './docplanner.service';
 import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
+import { DoctoraliaCatalogService } from '../mappings/doctoralia-catalog.service';
 
 /**
  * Renovador de token OAuth Doctoralia em segundo plano.
@@ -28,6 +29,7 @@ export class TokenRefresherService implements OnModuleInit {
     constructor(
         private readonly prisma: PrismaService,
         private readonly docplanner: DocplannerService,
+        private readonly catalog?: DoctoraliaCatalogService,
     ) {}
 
     onModuleInit() {
@@ -44,6 +46,10 @@ export class TokenRefresherService implements OnModuleInit {
         if (this.isRunning) return;
         this.isRunning = true;
         try {
+            // Deliberately detached: catalog enumeration must never delay token
+            // renewal. It has independent DB lease/budget fail-closed guards.
+            this.catalog?.refreshAllowlistedCycle().catch(err =>
+                this.logger.warn(`[DOCTORALIA-CATALOG] cycle failed: ${err?.message}`));
             const conns = await this.prisma.integrationConnection.findMany({
                 where: {
                     provider: 'doctoralia',

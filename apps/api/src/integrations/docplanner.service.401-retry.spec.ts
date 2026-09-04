@@ -90,6 +90,39 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('DocplannerClient — retry 401', () => {
+    it('catalog guard consumes both actual GET attempts across a 401 retry', async () => {
+        const { client } = buildClient();
+        const guard = jest.fn().mockResolvedValue(undefined);
+        client.setCatalogAttemptGuard(guard);
+        const fetchMock = jest.fn()
+            .mockResolvedValueOnce(UNAUTH())
+            .mockResolvedValueOnce(OK_200());
+        global.fetch = fetchMock;
+
+        await (client as any).request(
+            'GET',
+            '/api/v3/integration/facilities/1/doctors/2/addresses/3/bookings',
+        );
+
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(guard).toHaveBeenCalledTimes(2);
+    });
+
+    it('catalog guard rejection releases admission and never dispatches fetch', async () => {
+        const { client } = buildClient();
+        client.setCatalogAttemptGuard(jest.fn().mockRejectedValue(new Error('shared cap exhausted')));
+        const fetchMock = jest.fn();
+        global.fetch = fetchMock;
+        const release = jest.spyOn(DocplannerClient as any, 'releaseRateSlotGrant');
+
+        await expect((client as any).request(
+            'GET',
+            '/api/v3/integration/facilities/1/doctors',
+        )).rejects.toThrow('shared cap exhausted');
+
+        expect(release).toHaveBeenCalledTimes(1);
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
 
     // ─── Cenário 1 ──────────────────────────────────────────────────────────
     it('1. GET: retry após 401 — fetch chamado 2×, getToken(true) chamado, resolve com sucesso', async () => {

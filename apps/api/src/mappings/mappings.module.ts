@@ -3,11 +3,12 @@ import { MappingsService } from './mappings.service';
 import { MappingsController } from './mappings.controller';
 import { PrismaModule } from '../prisma/prisma.module';
 import { MatchingEngineService } from './matching-engine.service';
+import { DoctoraliaCatalogService } from './doctoralia-catalog.service';
 
 @Module({
     imports: [PrismaModule],
     controllers: [MappingsController],
-    providers: [MappingsService, MatchingEngineService],
-    exports: [MappingsService, MatchingEngineService]
+    providers: [MappingsService, MatchingEngineService, DoctoraliaCatalogService],
+    exports: [MappingsService, MatchingEngineService, DoctoraliaCatalogService]
 })
 export class MappingsModule { }

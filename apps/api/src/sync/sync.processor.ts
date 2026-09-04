@@ -364,7 +364,7 @@ export class SyncProcessor extends WorkerHost {
 
             this.logger.log('Sincronização de Entidades Padrão concluídas. Acionando Rescan de Matching...');
             await this.updateSyncStatus(syncRunId, 'running_matching_engine');
-            await this.matchingEngine.runMatchingForUnmatched();
+            await this.matchingEngine.runMatchingForUnmatched(clinicId);
 
             // 5. Reverse Sync: Push To Doctoralia
             this.logger.log('Iniciando envio Bidirecional para a Doctoralia...');

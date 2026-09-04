@@ -400,6 +400,11 @@ export class SyncService {
                     }
                 });
 
+                // Attempt tenant-safe creation while Mapping is truly absent.
+                // The later upsert has update={} and preserves LINKED/UNLINKED.
+                if (typeof this.matchingEngine.runMatchingForDoctor === 'function') {
+                    await this.matchingEngine.runMatchingForDoctor(doctor.id, clinicId);
+                }
                 await this.prisma.mapping.upsert({
                     where: {
                         clinicId_entityType_vismedId: { clinicId, entityType: 'DOCTOR', vismedId: doctor.id }
@@ -813,7 +818,7 @@ export class SyncService {
             }
 
             await this.updateSyncStatus(syncRunId, 'running_matching_engine');
-            await this.matchingEngine.runMatchingForUnmatched();
+            await this.matchingEngine.runMatchingForUnmatched(clinicId);
 
             this.logger.log('Iniciando envio bidirecional para Doctoralia...');
             await this.updateSyncStatus(syncRunId, 'push_to_doctoralia');

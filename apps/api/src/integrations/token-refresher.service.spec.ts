@@ -78,4 +78,17 @@ describe('TokenRefresherService — DISABLE_TOKEN_REFRESHER', () => {
         expect(client.forceTokenRefresh).not.toHaveBeenCalled();
         expect(docplanner.createClient).toHaveBeenCalledTimes(1);
     });
+
+    it('starts the catalog cycle without awaiting it or delaying token refresh', async () => {
+        delete process.env.DISABLE_TOKEN_REFRESHER;
+        const { prisma, docplanner, client } = buildDeps([
+            { id: '1', clientId: 'cid1', clientSecret: 's', domain: null, tokenExpiresAt: new Date(Date.now() - HOUR) },
+        ]);
+        const never = new Promise<void>(() => undefined);
+        const catalog = { refreshAllowlistedCycle: jest.fn().mockReturnValue(never) } as any;
+        const svc = new TokenRefresherService(prisma, docplanner, catalog);
+        await svc.refreshAll();
+        expect(catalog.refreshAllowlistedCycle).toHaveBeenCalledTimes(1);
+        expect(client.authenticate).toHaveBeenCalledTimes(1);
+    });
 });

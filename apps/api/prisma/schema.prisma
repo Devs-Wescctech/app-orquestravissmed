@@ -27,7 +27,7 @@ model Clinic {
   email     String?
   phone     String?
   timezone  String   @default("America/Sao_Paulo")
-  
+
   // Custom Address Fields for Push to Docplanner
   addressStreet       String?
   addressNumber       String?
@@ -46,6 +46,8 @@ model Clinic {
   mappings     Mapping[]
   syncRuns     SyncRun[]
   appointments Appointment[]
+  doctoraliaCatalogGenerations DoctoraliaCatalogGeneration[]
+  doctoraliaCatalogLeases      DoctoraliaCatalogLease[]
 }
 
 enum Role {
@@ -84,8 +86,84 @@ model IntegrationConnection {
   // Contrato de get-agendamento-filtros por clínica. NULL preserva LEGACY;
   // somente INCREMENTAL explícito é interpretado pelo polling de agendamentos.
   vismedAppointmentFeedMode String?
+  // Versão pública do escopo autorizado do catálogo. Não deriva nem contém
+  // hashes/segredos; muda somente quando identidade/escopo é reautorizado.
+  catalogScopeVersion Int      @default(1)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
+
+  doctoraliaCatalogGenerations DoctoraliaCatalogGeneration[]
+  doctoraliaCatalogLease       DoctoraliaCatalogLease?
+
+  @@unique([id, clinicId])
+}
+
+// Snapshot imutável e tenant-safe obtido por enumeração COMPLETA das facilities
+// e médicos autorizados para uma conexão Doctoralia específica.
+model DoctoraliaCatalogGeneration {
+  id                  String                    @id @default(uuid())
+  clinic              Clinic                    @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  clinicId            String
+  connection          IntegrationConnection     @relation(fields: [connectionId, clinicId], references: [id, clinicId], onDelete: Cascade)
+  connectionId        String
+  catalogScopeVersion Int
+  facilityCount       Int
+  doctorCount         Int
+  publishedAt         DateTime                  @default(now())
+  expiresAt           DateTime
+  members             DoctoraliaCatalogMember[]
+
+  @@index([clinicId, connectionId, catalogScopeVersion, publishedAt])
+  @@index([expiresAt])
+}
+
+model DoctoraliaCatalogLease {
+  connection   IntegrationConnection @relation(fields: [connectionId, clinicId], references: [id, clinicId], onDelete: Cascade)
+  connectionId String                @id
+  clinic       Clinic                @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  clinicId     String
+  owner        String
+  expiresAt    DateTime
+  updatedAt    DateTime              @updatedAt
+
+  @@index([clinicId, expiresAt])
+  @@unique([connectionId, clinicId])
+}
+
+model DoctoraliaCatalogAttemptBucket {
+  bucketStart DateTime @id
+  attempts    Int      @default(0)
+  updatedAt   DateTime @updatedAt
+}
+
+model DoctoraliaCatalogMember {
+  id                   String                      @id @default(uuid())
+  generation           DoctoraliaCatalogGeneration @relation(fields: [generationId], references: [id], onDelete: Cascade)
+  generationId         String
+  facilityId           String
+  doctoraliaDoctor     DoctoraliaDoctor            @relation(fields: [doctoraliaDoctorId], references: [id], onDelete: Restrict)
+  doctoraliaDoctorId   String
+  doctoraliaExternalId String
+  createdAt            DateTime                    @default(now())
+  credentials          DoctoraliaCatalogCredential[]
+
+  @@unique([generationId, facilityId, doctoraliaExternalId])
+  @@index([generationId, doctoraliaDoctorId])
+}
+
+model DoctoraliaCatalogCredential {
+  id        String                   @id @default(uuid())
+  member    DoctoraliaCatalogMember  @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  memberId  String
+  council   String
+  number    String
+  uf        String?
+  regional  String?
+  createdAt DateTime                 @default(now())
+
+  @@unique([memberId, council, number, uf, regional])
+  @@index([council, number, uf, regional])
+  @@index([memberId])
 }
 
 enum MappingEntityType {
@@ -125,7 +203,7 @@ model Mapping {
 model VismedUnit {
   id             String         @id @default(uuid())
   vismedId       Int            @unique // idunidade na API VisMed
-  codUnidade     Int?           
+  codUnidade     Int?
   name           String         // nomeunidade
   cnpj           String?
   cityName       String?        // nomecidade
@@ -141,12 +219,12 @@ model VismedDoctor {
   vismedId       Int            @unique // idprofissional na API VisMed
   name           String         // nomecompleto
   formalName     String?        // nomeformal
-  cpf            String?        
+  cpf            String?
   documentNumber String?        // numerodocumento (CRM etc)
   documentType   String?        // siglaprofissionaltipodocumento
   gender         String?        // sexo
   isActive       Boolean        @default(true) // ativo: "1" ou "0"
-  unitId         String?        // idunidadevinculada -> VismedUnit 
+  unitId         String?        // idunidadevinculada -> VismedUnit
   unit           VismedUnit?    @relation(fields: [unitId], references: [id], onDelete: SetNull)
   turnoM         String?        // turno_m: horário manhã (ex: "08:00 - 12:00")
   turnoT         String?        // turno_t: horário tarde (ex: "13:00 - 18:00")
@@ -266,7 +344,7 @@ model SyncRun {
   endedAt     DateTime?
   totalRecords Int     @default(0)
   metrics     Json?
-  
+
   events      SyncEvent[]
 }
 
@@ -324,6 +402,7 @@ model DoctoraliaDoctor {
 
   addressServices      DoctoraliaAddressService[]
   unifiedMappings      ProfessionalUnifiedMapping[]
+  catalogMembers       DoctoraliaCatalogMember[]
 }
 
 model DoctoraliaService {

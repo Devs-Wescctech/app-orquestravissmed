@@ -27,6 +27,26 @@ export class ClinicsService {
         }
     }
 
+    private sanitizeIntegrationArgs(integrationArgs: any): { data: any; explicitReauthorization: boolean } {
+        if (!integrationArgs) return { data: integrationArgs, explicitReauthorization: false };
+        const {
+            catalogScopeVersion: _ignoredVersion,
+            reauthorize,
+            ...data
+        } = integrationArgs;
+        return { data, explicitReauthorization: reauthorize === true };
+    }
+
+    private doctoraliaScopeChanged(existing: any, next: any, explicitReauthorization: boolean): boolean {
+        if ((next.provider ?? existing.provider) !== 'doctoralia') return false;
+        if (explicitReauthorization) return true;
+        const identityScopeFields = ['domain', 'clientId', 'clientSecret', 'facilityId'];
+        return identityScopeFields.some(field =>
+            Object.prototype.hasOwnProperty.call(next, field)
+            && (next[field] ?? null) !== (existing[field] ?? null),
+        );
+    }
+
     async findAll() {
         return this.prisma.clinic.findMany({
             include: {
@@ -81,8 +101,9 @@ export class ClinicsService {
         });
 
         if (integrationArgs) {
+            const sanitized = this.sanitizeIntegrationArgs(integrationArgs);
             await this.prisma.integrationConnection.create({
-                data: { ...integrationArgs, clinicId: clinic.id },
+                data: { ...sanitized.data, clinicId: clinic.id },
             });
         }
 
@@ -102,17 +123,25 @@ export class ClinicsService {
         });
 
         if (integrationArgs) {
+            const sanitized = this.sanitizeIntegrationArgs(integrationArgs);
             const existing = await this.prisma.integrationConnection.findFirst({
-                where: { clinicId: id, provider: integrationArgs.provider || 'doctoralia' },
+                where: { clinicId: id, provider: sanitized.data.provider || 'doctoralia' },
             });
             if (existing) {
                 await this.prisma.integrationConnection.update({
                     where: { id: existing.id },
-                    data: integrationArgs,
+                    data: {
+                        ...sanitized.data,
+                        ...(this.doctoraliaScopeChanged(
+                            existing,
+                            sanitized.data,
+                            sanitized.explicitReauthorization,
+                        ) ? { catalogScopeVersion: { increment: 1 } } : {}),
+                    },
                 });
             } else {
                 await this.prisma.integrationConnection.create({
-                    data: { ...integrationArgs, clinicId: id },
+                    data: { ...sanitized.data, clinicId: id },
                 });
             }
         }

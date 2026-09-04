@@ -5,6 +5,7 @@ import { MatchType } from '@prisma/client';
 import {
     parseLicenseString, councilsCompatible, ParsedLicense,
     isLicenseShadowModeEnabled, observeLicenseShadow,
+    parseLicenseStringConservative,
 } from './license.util';
 
 @Injectable()
@@ -541,7 +542,7 @@ export class MatchingEngineService {
         }
     }
 
-    async runMatchingForUnmatched(): Promise<number> {
+    async runMatchingForUnmatched(clinicId?: string): Promise<number> {
         this.logger.log('Iniciando Rescan de Matching para Especialidades VisMed Órfãs...');
 
         const unmatchedSpecialties = await this.prisma.vismedSpecialty.findMany({
@@ -565,19 +566,29 @@ export class MatchingEngineService {
 
         // --- DOCTORS ---
         let newDocsCount = 0;
-        const unmatchedDoctors = await this.prisma.vismedDoctor.findMany({
+        let unmatchedDoctors = await this.prisma.vismedDoctor.findMany({
             where: {
                 unifiedMappings: {
                     none: { isActive: true }
-                }
+                },
             }
         });
+        if (clinicId && this.isTenantSafeDoctorMatchingEnabled(clinicId)) {
+            // The caller's VissMed clinic context is materialized by its local
+            // Mapping rows; never scan unrelated global VismedDoctor rows.
+            const contextual = await this.prisma.mapping.findMany({
+                where: { clinicId, entityType: 'DOCTOR', vismedId: { not: null } },
+                select: { vismedId: true },
+            });
+            const ids = new Set(contextual.map(row => row.vismedId).filter(Boolean));
+            unmatchedDoctors = unmatchedDoctors.filter(doc => ids.has(doc.id));
+        }
 
         if (unmatchedDoctors.length === 0) {
             this.logger.log('Nenhum Médico VisMed Órfão encontrado.');
         } else {
             for (const doc of unmatchedDoctors) {
-                const matched = await this.runMatchingForDoctor(doc.id);
+                const matched = await this.runMatchingForDoctor(doc.id, clinicId);
                 if (matched) newDocsCount++;
             }
             this.logger.log(`Rescan Profissionais: ${newDocsCount} novos matches encontrados dentre ${unmatchedDoctors.length} órfãos.`);
@@ -652,12 +663,35 @@ export class MatchingEngineService {
         return short.every(t => longSet.has(t));
     }
 
-    async runMatchingForDoctor(vismedDoctorId: string): Promise<boolean> {
+    async runMatchingForDoctor(vismedDoctorId: string, clinicId?: string): Promise<boolean> {
         const doc = await this.prisma.vismedDoctor.findUnique({
             where: { id: vismedDoctorId }
         });
 
         if (!doc || !doc.name) return false;
+
+        // Frozen callers may not carry clinicId. Once any tenant-safe clinic is
+        // enabled, derive scope only from Mapping evidence; absence/multiplicity
+        // is not permission to fall back to global/PUM matching.
+        if (!clinicId) {
+            const allowlisted = this.tenantSafeDoctorMatchingAllowlist();
+            if (allowlisted.size > 0) {
+                const evidence = await this.prisma.mapping.findMany({
+                    where: { entityType: 'DOCTOR', vismedId: vismedDoctorId },
+                    select: { clinicId: true },
+                });
+                const clinics = [...new Set(evidence.map(row => row.clinicId))];
+                if (clinics.length !== 1) return false;
+                if (allowlisted.has(clinics[0])) {
+                    return this.runTenantSafeDoctorMatch(doc, clinics[0]);
+                }
+                // Exactly one, explicitly non-allowlisted clinic preserves legacy.
+            }
+        }
+
+        if (clinicId && this.isTenantSafeDoctorMatchingEnabled(clinicId)) {
+            return this.runTenantSafeDoctorMatch(doc, clinicId);
+        }
 
         const normDoc = this.normalizeString(doc.name);
 
@@ -749,6 +783,166 @@ export class MatchingEngineService {
 
         this.logger.debug(`No match found for doctor: ${doc.name}`);
         return false;
+    }
+
+    private isTenantSafeDoctorMatchingEnabled(clinicId: string): boolean {
+        return this.tenantSafeDoctorMatchingAllowlist().has(clinicId);
+    }
+
+    private tenantSafeDoctorMatchingAllowlist(): Set<string> {
+        return new Set((process.env.DOCTORALIA_TENANT_SAFE_DOCTOR_MATCH_CLINIC_IDS ?? '')
+            .split(',')
+            .map(value => value.trim())
+            .filter(Boolean));
+    }
+
+    /**
+     * Decisive Task 261 path. It only reads the immutable current generation and
+     * never calls Doctoralia. Legacy name/PUM/global-facility evidence is ignored.
+     */
+    private async runTenantSafeDoctorMatch(
+        doc: { id: string; name: string; documentNumber?: string | null; documentType?: string | null },
+        clinicId: string,
+    ): Promise<boolean> {
+        const vismedConnections = await this.prisma.integrationConnection.findMany({
+            where: { clinicId, provider: 'vismed' },
+            select: { id: true, status: true },
+        });
+        const doctoraliaConnections = await this.prisma.integrationConnection.findMany({
+            where: { clinicId, provider: 'doctoralia' },
+            select: { id: true, status: true, catalogScopeVersion: true },
+        });
+        if (
+            vismedConnections.length !== 1
+            || vismedConnections[0].status !== 'connected'
+            || doctoraliaConnections.length !== 1
+            || doctoraliaConnections[0].status !== 'connected'
+        ) return false;
+        const connection = doctoraliaConnections[0];
+        const now = new Date();
+        const generation = await this.prisma.doctoraliaCatalogGeneration.findFirst({
+            where: {
+                clinicId,
+                connectionId: connection.id,
+                catalogScopeVersion: connection.catalogScopeVersion,
+                expiresAt: { gt: now },
+            },
+            orderBy: { publishedAt: 'desc' },
+            include: { members: { include: { credentials: true } } },
+        });
+        if (!generation || generation.doctorCount <= 0 || generation.members.length === 0) return false;
+
+        const mappings = await this.prisma.mapping.findMany({
+            where: { clinicId, entityType: 'DOCTOR', vismedId: doc.id },
+        });
+        if (mappings.length > 1) return false;
+
+        const parsedVismed = parseLicenseStringConservative(doc.documentNumber, doc.documentType);
+        if (parsedVismed.status !== 'PARSED' || !parsedVismed.credential) return false;
+        if (!this.isStrongScopedCredential(parsedVismed.credential)) return false;
+        const keyMatches = new Map<string, (typeof generation.members)[number]>();
+        for (const member of generation.members) {
+            // Generation credentials are immutable normalized rows; never consult
+            // raw/mutable DoctoraliaDoctor data while making this decision.
+            for (const parsed of member.credentials || []) {
+                if (!this.isStrongScopedCredential(parsed)) continue;
+                const left = parsedVismed.credential;
+                const sameStrongIdentity =
+                    left.council === parsed.council
+                    && left.number === parsed.number
+                    && left.regional === parsed.regional
+                    && left.uf === parsed.uf;
+                if (sameStrongIdentity) keyMatches.set(member.doctoraliaExternalId, member);
+            }
+        }
+        if (keyMatches.size !== 1) return false;
+        const candidate = [...keyMatches.values()][0];
+
+        if (mappings.length === 1) {
+            const existing = mappings[0];
+            return existing.status === 'LINKED'
+                && existing.externalId === candidate.doctoraliaExternalId;
+        }
+
+        try {
+            return await this.prisma.$transaction(async tx => {
+                const [currentVismed, currentDoctoralia] = await Promise.all([
+                    tx.integrationConnection.findMany({
+                        where: { clinicId, provider: 'vismed' },
+                        select: { id: true, status: true },
+                    }),
+                    tx.integrationConnection.findMany({
+                        where: { clinicId, provider: 'doctoralia' },
+                        select: { id: true, status: true, catalogScopeVersion: true },
+                    }),
+                ]);
+                if (
+                    currentVismed.length !== 1
+                    || currentVismed[0].id !== vismedConnections[0].id
+                    || currentVismed[0].status !== 'connected'
+                    || currentDoctoralia.length !== 1
+                    || currentDoctoralia[0].id !== connection.id
+                    || currentDoctoralia[0].status !== 'connected'
+                    || currentDoctoralia[0].catalogScopeVersion !== connection.catalogScopeVersion
+                ) return false;
+                const concurrentMappings = await tx.mapping.findMany({
+                    where: { clinicId, entityType: 'DOCTOR', vismedId: doc.id },
+                    select: { id: true },
+                });
+                if (concurrentMappings.length !== 0) return false;
+                const stillCurrent = await tx.doctoraliaCatalogGeneration.count({
+                    where: {
+                        id: generation.id,
+                        clinicId,
+                        connectionId: connection.id,
+                        catalogScopeVersion: connection.catalogScopeVersion,
+                        expiresAt: { gt: new Date() },
+                        connection: { catalogScopeVersion: connection.catalogScopeVersion },
+                    },
+                });
+                if (stillCurrent !== 1) return false;
+                await tx.mapping.create({
+                    data: {
+                        clinicId,
+                        entityType: 'DOCTOR',
+                        vismedId: doc.id,
+                        externalId: candidate.doctoraliaExternalId,
+                        status: 'LINKED',
+                        lastSyncAt: new Date(),
+                        conflictData: {
+                            source: 'TENANT_SAFE_CATALOG',
+                            catalogGenerationId: generation.id,
+                            catalogScopeVersion: connection.catalogScopeVersion,
+                        },
+                    },
+                });
+                return true;
+            }, { isolationLevel: 'Serializable' });
+        } catch (error: any) {
+            // Unique/serialization races are expected fail-closed outcomes.
+            this.logger.warn(`[TENANT-SAFE-DOCTOR-MATCH] concurrent write blocked clinicId=${clinicId}: ${error?.code ?? error?.message}`);
+            return false;
+        }
+    }
+
+    private isStrongScopedCredential(credential: {
+        council: string; number: string; uf: string | null; regional: string | null;
+    }): boolean {
+        // CRN identity is council + numeric regional + number. UF is not used.
+        if (credential.council === 'CRN') {
+            return credential.uf === null
+                && credential.regional !== null
+                && /^[0-9]+$/.test(credential.regional);
+        }
+        // State councils require UF on both sides. CFM and unknown/federal
+        // councils intentionally fail closed until an explicit safe rule exists.
+        const stateCouncils = new Set([
+            'CRM', 'CRP', 'CRO', 'CRF', 'CRQ', 'CRMV', 'CRBM', 'COREN',
+            'CREF', 'CREFITO', 'CRBIO', 'CRFA', 'CRESS', 'CRTR', 'OAB',
+        ]);
+        return stateCouncils.has(credential.council)
+            && credential.uf !== null
+            && credential.regional === null;
     }
 
     /**
