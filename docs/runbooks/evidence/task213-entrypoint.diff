@@ -1,0 +1,80 @@
+diff --git a/docker-entrypoint.sh b/docker-entrypoint.sh
+index df0d997..df02d60 100644
+--- a/docker-entrypoint.sh
++++ b/docker-entrypoint.sh
+@@ -3,3 +3 @@
+-# - Aplica o schema no Postgres do HOST (idempotente, sem --accept-data-loss).
+-# - Roda o seed (idempotente: usa upsert/findFirst).
+-# - Sobe API e Web no mesmo container; encerra o container se qualquer um cair.
++# O unico schema mutavel por este entrypoint e o da Task 261, com opt-in explicito.
+@@ -8 +6 @@ set -euo pipefail
+-SCHEMA="/app/apps/api/prisma/schema.prisma"
++TASK261_RUNNER="/app/apps/api/scripts/task261/cli.js"
+@@ -12 +10 @@ if [ -z "${DATABASE_URL:-}" ]; then
+-  exit 1
++  exit 23
+@@ -15,4 +13,17 @@ fi
+-# --- 1) Schema do banco (pode ser pulado com SKIP_DB_INIT=true) ---
+-if [ "${SKIP_DB_INIT:-false}" != "true" ]; then
+-  echo "[entrypoint] Aplicando schema no banco (prisma db push, sem data loss)..."
+-  npx prisma db push --schema="$SCHEMA" --skip-generate
++case "${1:-}" in
++  migrate-task261)
++    echo "[entrypoint] Executando migration controlada da Task 261 (one-shot)..."
++    exec node "$TASK261_RUNNER" migrate
++    ;;
++  preflight-task261)
++    echo "[entrypoint] Executando preflight read-only da Task 261..."
++    exec node "$TASK261_RUNNER" preflight
++    ;;
++  "")
++    ;;
++  *)
++    echo "[entrypoint] ERRO: comando desconhecido." >&2
++    echo "[entrypoint] Use migrate-task261, preflight-task261 ou nenhum comando para o boot normal." >&2
++    exit 23
++    ;;
++esac
+@@ -20,13 +31,5 @@ if [ "${SKIP_DB_INIT:-false}" != "true" ]; then
+-  # Índice único parcial SyncJob_dedupKey_active_key: db push não o cria (nem o remove).
+-  # A migration é idempotente (IF NOT EXISTS) e ABORTA com relatório se houver duplicatas
+-  # ativas de dedupKey — nesse caso o boot para AQUI (set -e) e a API não sobe.
+-  echo "[entrypoint] Aplicando migration P1 do SyncJob (indice parcial de dedup, idempotente)..."
+-  if ! npx prisma db execute \
+-      --file /app/apps/api/prisma/migrations/20260809_syncjob_dedup_lease/migration.sql \
+-      --schema="$SCHEMA"; then
+-    echo "[entrypoint] ERRO: migration P1 do SyncJob falhou (veja o relatorio acima)." >&2
+-    echo "[entrypoint] Se houver duplicatas ativas de dedupKey, resolva-as manualmente antes de subir a API." >&2
+-    exit 1
+-  fi
+-else
+-  echo "[entrypoint] SKIP_DB_INIT=true -> pulando prisma db push e a migration P1 do SyncJob."
++# O runner tambem exige o opt-in. Flags legadas de inicializacao sao ignoradas:
++# nao ha db push, seed, replay ou bypass do preflight neste entrypoint.
++if [ "${APPLY_TASK261_MIGRATION:-false}" = "true" ]; then
++  echo "[entrypoint] Opt-in confirmado; executando migration controlada da Task 261..."
++  node "$TASK261_RUNNER" migrate
+@@ -35,7 +38,2 @@ fi
+-# --- 2) Seed idempotente (pode ser pulado com SKIP_SEED=true) ---
+-if [ "${SKIP_SEED:-false}" != "true" ]; then
+-  echo "[entrypoint] Rodando seed idempotente..."
+-  node /app/apps/api/prisma/seed.js || echo "[entrypoint] AVISO: seed falhou (nao-fatal), seguindo o boot."
+-else
+-  echo "[entrypoint] SKIP_SEED=true -> pulando seed."
+-fi
++echo "[entrypoint] Validando schema da Task 261 (read-only)..."
++node "$TASK261_RUNNER" preflight
+@@ -43 +40,0 @@ fi
+-# --- 3) Sobe API e Web ---
+@@ -51 +48 @@ echo "[entrypoint] Iniciando Web na porta 5000..."
+-( cd /app/apps/web && npx next start -p 5000 -H 0.0.0.0 ) &
++( cd /app/apps/web && exec node /app/node_modules/next/dist/bin/next start -p 5000 -H 0.0.0.0 ) &
+@@ -63 +60,3 @@ trap term_handler SIGTERM SIGINT
+-# Se qualquer processo terminar, derruba o container para o Portainer reiniciar.
++# Se qualquer processo terminar, derruba o outro e colhe ambos. O set -e precisa
++# ser suspenso ao redor de wait -n para que uma falha ainda passe pela limpeza.
++set +e
+@@ -65,0 +65 @@ EXIT_CODE=$?
++set -e
+@@ -67,0 +68 @@ kill -TERM "$API_PID" "$WEB_PID" 2>/dev/null || true
++wait "$API_PID" "$WEB_PID" 2>/dev/null || true

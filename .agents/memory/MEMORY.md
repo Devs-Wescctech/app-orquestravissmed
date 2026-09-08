@@ -1,0 +1,15 @@
+- [VisMed agenda blocks → Doctoralia slots](vismed-slot-availability.md) — scheduleDay is the slot source-of-truth; anti-wipe rules for the replaceSlots PUT + hash-determinism for incremental skip.
+- [VisMed cancelamento por desaparecimento + break órfão](vismed-cancellation-disappearance.md) — reconcile guard não pode exigir lista não-vazia; cancelar origin=VISMED precisa apagar o BREAK, não só o booking.
+- [scheduleDay como fonte de bloqueio](vismed-schedule-day-blocks.md) — scheduleDay reflete bloqueio (latência do cron); categorias podem voltar vazias por config VisMed → skipped_empty é fail-safe correto, não bug.
+- [WAF Doctoralia é por taxa; cachear token OAuth](doctoralia-waf-token-cache.md) — 405+captcha = desafio por volume (auth a cada 30s), não IP fixo bloqueado; token deve viver ~1h no cache global.
+- [Doctoralia exige host www](doctoralia-www-redirect.md) — domínio raiz 301 → POST OAuth vira GET → 405 + página WAF; parece bloqueio mas é redirect; sempre usar www.
+- [Doctoralia API gotchas (convênio/slots)](doctoralia-api-gotchas.md) — insurance_support só 3 enums; slot/endereço exigem insurance_plans senão página pública vira "só particular".
+- [Booking sync reconciliação bidirecional](booking-sync-reconciliation.md) — APIs não notificam de forma confiável; verdade = estado reconciliado a cada poll, com graces p/ distinguir move de cancelamento.
+- [Vigia de bloqueios fast-lane 10min](block-watcher-fast-lane.md) — endpoint de bloqueios é só detector de mudança (gatilho); retry real do push vive no SlotPushState; só rollback do hash em exceção, não em success:false.
+- [Dois "prods" distintos](prod-environments-confusion.md) — PROD_DATABASE_URL/executeSql(production) = deployment de teste do Replit, NÃO o prod do Portainer; validar Portainer pelo console/logs do container.
+- [Histórico de schema no Portainer](portainer-schema-policy.md) — migrations pendentes não provam DDL ausente no banco legado; não aplicar nem resolver todo o histórico no boot.
+- [Raw SQL + timestamp sem fuso](raw-sql-timezone-trap.md) — banco do Portainer em -03: Date param em $queryRaw vs coluna naive-UTC atrasa comparações em exatamente 3h; usar now() AT TIME ZONE 'utc'.
+- [Fila Doctoralia com prioridade](doctoralia-rate-queue-priority.md) — fluxos pequenos/urgentes (varredura, UI) usam runWithPriority; teto 400/5min inalterado; UI nunca espera a fila (banco + background).
+- [Tela Agendamentos mistura fontes](appointments-merge-illusion.md) — entradas só da lista ao vivo da Doctoralia aparecem "BOOKED"+"Paciente" genérico sem existir no orquestrador; médico UNLINKED descarta notificações silenciosamente.
+- [Status 'error' desliga polling/sweep](integration-status-error-gate.md) — teste de conexão falho grava status 'error' e tira a clínica do polling e da varredura silenciosamente; resto do sistema ignora o status.
+- [VisMed horário final malformado](vismed-malformed-time-fields.md) — horarioagendamentofinal pode vir inválido (ex.: 012:0); construir Date com guard isNaN, pular se início inválido, fallback +30min se fim inválido.

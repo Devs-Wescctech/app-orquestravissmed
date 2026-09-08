@@ -87,7 +87,7 @@ O container acessa o Postgres do host via `host.docker.internal`. Libere o acess
 6. **Runtime & Resources → Add an entry to /etc/hosts** (extra hosts):
    - `host.docker.internal:host-gateway`
    (Isso faz o container enxergar o Postgres do host.)
-7. **Restart policy**: `Unless stopped`.
+7. **Restart policy**: `On failure`, com máximo de **3** tentativas.
 8. **Deploy the container**.
 
 > Alternativa por CLI (equivalente ao passo acima):
@@ -95,7 +95,7 @@ O container acessa o Postgres do host via `host.docker.internal`. Libere o acess
 > docker run -d --name vismed \
 >   -p 5000:5000 \
 >   --add-host=host.docker.internal:host-gateway \
->   --restart unless-stopped \
+>   --restart on-failure:3 \
 >   --env-file vismed.env \
 >   vismed:latest
 > ```
@@ -123,55 +123,105 @@ Opcionais / com default:
 |---|---|---|
 | `VISMED_API_PORT` | `3000` | porta interna da API (o proxy do web usa a mesma) |
 | `NODE_ENV` | `production` | já definido na imagem |
-| `SKIP_DB_INIT` | `false` | `true` pula o `prisma db push` no start |
-| `SKIP_SEED` | `false` | `true` pula o seed no start |
+| `APPLY_TASK261_MIGRATION` | `false` | Somente o valor exato `true` autoriza o runner restrito da Task 261. Não persista após a aplicação. |
 | `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` | — | opcionais (BullMQ). Sem Redis, o sync roda inline; `ECONNREFUSED 6379` nos logs é esperado e não-fatal. |
 | `DISABLE_SYNC_CRON` | — | `true` desliga o scheduler de sync |
 
 > **Credenciais das integrações (VisMed / Doctoralia)** não são env vars: ficam no
-> banco (`IntegrationConnection`) e são criadas pelo seed / pela UI. Nada a configurar
+> banco (`IntegrationConnection`) e são criadas pela UI. Nada a configurar
 > no container além do `DATABASE_URL` apontando para o banco correto.
 
 ---
 
-## 5. Inicialização do banco (o que o container faz no start)
+## 5. Preflight e migration controlada da Task 261
 
-No boot, o `docker-entrypoint.sh`:
-1. Roda `prisma db push` (idempotente, **sem** `--accept-data-loss`) — cria/atualiza o
-   schema sem apagar dados. Pule com `SKIP_DB_INIT=true`.
-2. Roda a **migration P1 do SyncJob** (`prisma db execute --file
-   prisma/migrations/20260809_syncjob_dedup_lease/migration.sql`) — cria o índice
-   único parcial `SyncJob_dedupKey_active_key` (dedup atômica de jobs), que o
-   `db push` não cria. É idempotente: re-runs são no-op (`IF NOT EXISTS`).
-   **Se existirem duplicatas ativas de dedupKey**, a migration ABORTA com um
-   relatório nos logs (nenhum job é alterado — rollback total) e o **container
-   encerra antes da API subir** — a API nunca processa SyncJobs com o banco
-   inconsistente. Resolva as duplicatas manualmente e reinicie o container.
-   Também é pulada com `SKIP_DB_INIT=true`.
-3. Roda o `seed.js` (idempotente — `upsert`/`findFirst`). Pule com `SKIP_SEED=true`.
-4. Sobe API (`node dist/main.js`) e Web (`next start -p 5000`) juntos; se um cair, o
-   container encerra e a *restart policy* reinicia.
+Contrato detalhado e inventário:
+[task261-controlled-schema.md](docs/runbooks/task261-controlled-schema.md).
 
-**Passo manual (alternativa)** — se preferir controlar a migração fora do boot, setar
-`SKIP_DB_INIT=true` e `SKIP_SEED=true` e rodar uma vez:
+O boot exige `DATABASE_URL` e sempre executa o preflight read-only da Task 261
+antes de iniciar API/Web. Não há bypass legado: o entrypoint não executa
+`prisma db push`, seeds, migrations antigas, replay do histórico ou escrita em
+`_prisma_migrations`.
+
+Contrato do preflight:
+
+| Código | Estado |
+|---:|---|
+| `0` | schema da Task 261 aplicado |
+| `20` | objetos da Task 261 ausentes |
+| `21` | aplicação parcial ou objetos divergentes |
+| `22` | baseline incompatível |
+| `23` | configuração inválida |
+| `24` | falha de runtime |
+
+Antes da janela, faça um **backup restaurável e validado**. Diagnostique em
+modo one-off, sem iniciar os serviços:
+
 ```bash
-docker exec -it vismed npx prisma db push --schema=/app/apps/api/prisma/schema.prisma --skip-generate
-docker exec -it vismed npx prisma db execute \
-  --file /app/apps/api/prisma/migrations/20260809_syncjob_dedup_lease/migration.sql \
-  --schema=/app/apps/api/prisma/schema.prisma
-docker exec -it vismed node /app/apps/api/prisma/seed.js
+docker compose -f docker-compose.portainer.yml run --rm --no-deps vismed preflight-task261
 ```
+
+Somente se o resultado for `absent` (código 20), aplique a migration permitida:
+
+```bash
+docker compose -f docker-compose.portainer.yml run --rm --no-deps \
+  -e APPLY_TASK261_MIGRATION=true vismed migrate-task261
+```
+
+Para uma imagem criada via **Add container**, os equivalentes exatos são:
+
+```bash
+docker run --rm --env-file vismed.env \
+  --add-host=host.docker.internal:host-gateway \
+  vismed:latest preflight-task261
+
+docker run --rm --env-file vismed.env \
+  --add-host=host.docker.internal:host-gateway \
+  -e APPLY_TASK261_MIGRATION=true \
+  vismed:latest migrate-task261
+```
+
+O runner exige internamente o valor exato `true`, só aplica em estado ausente,
+é transacional e uma segunda execução é no-op. Após sucesso, remova
+`APPLY_TASK261_MIGRATION` das variáveis do Portainer; não a deixe no boot
+normal. Faça então deploy/start normal: o preflight retornará `0` e os serviços
+subirão. Não use `migrate deploy`, `migrate resolve`, `db push`,
+`--accept-data-loss`, seed ou replay das migrations históricas.
+
+Estados parcial/divergente ou baseline incompatível bloqueiam o boot e exigem
+diagnóstico manual. A política `on-failure:3` limita o loop por configuração ou
+schema inválido sem eliminar tentativas de recuperação de crashes.
+
+**Containers existentes:** a saída do entrypoint não muda uma política
+`unless-stopped` já configurada. Antes da janela, pare o container antigo e
+configure explicitamente `on-failure` com no máximo **3** tentativas (ou
+`no` durante diagnóstico) no Portainer. Aplique a política da versão nova ao
+recriar o container/stack. Não basta trocar somente a imagem. Os comandos
+one-shot com `--rm` não ficam reiniciando. Depois de esgotadas as tentativas,
+investigue os logs e reinicie manualmente; essa política não oferece recuperação
+ilimitada nem reinício automático após reboot do daemon.
+
+O preflight verifica o contrato estrutural restrito da Task 261 e seus
+pré-requisitos, não certifica todo o schema histórico da aplicação. Ele não
+consulta registros de pacientes nem `_prisma_migrations`. Banco vazio não é um
+baseline válido. A configuração `?schema=...` em `DATABASE_URL` define o
+namespace inspecionado e alterado, sem fallback para outro schema.
+
+Falhas antes do commit têm rollback transacional automático. Após sucesso, a
+reversão é manual e pode apagar dados: reverta primeiro a versão do aplicativo,
+preserve os dados e prefira restaurar o backup validado. Só considere
+`apps/api/prisma/migrations/20260904_doctoralia_tenant_catalog/rollback.sql`
+depois de revisar e aprovar explicitamente seus `DROP`; nunca o automatize.
 
 ---
 
 ## 6. Validação pós-deploy
 
 1. Logs: `docker logs -f vismed` → deve mostrar API na porta 3000 e Web na 5000 (interna).
-2. Acesse `http://HOST:5400` e faça login com as credenciais padrão do seed:
+2. Acesse `http://HOST:5400` e faça login com uma conta já provisionada:
    > A porta **interna** do container é sempre 5000; o `docker-compose.portainer.yml` publica
    > no host em **5400** porque a 5000 do host já é usada por outros apps neste servidor
    > (ex.: `app-politicall` → `5000:5000`). Ajuste o lado esquerdo do mapeamento se precisar.
-   - **Email:** `admin@vismed.com` · **Senha:** `admin123`
 3. Confirme o proxy: o login chama `POST /api/auth/login`, que o Next.js roteia para a
    API local — se o login funciona, o proxy `/api/*` está ok.
 

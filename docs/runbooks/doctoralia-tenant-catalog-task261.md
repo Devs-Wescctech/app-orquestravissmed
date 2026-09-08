@@ -76,29 +76,45 @@ Para clínicas explicitamente habilitadas, o novo caminho:
 `DOCTORALIA_TENANT_SAFE_DOCTOR_MATCH_CLINIC_IDS`, lista CSV vazia por padrão.
 Não há valor padrão no código nem em arquivo de ambiente.
 
-## Aplicação e rollback (não executar como parte da Task 261)
+## Aplicação controlada e rollback
 
-Dry-run de schema:
+O inventário estrutural verificado e os limites do preflight estão em
+[task261-controlled-schema.md](task261-controlled-schema.md).
 
-```sh
-cd apps/api
-npx prisma validate
-npx prisma migrate diff --from-url "$DATABASE_URL" \
-  --to-schema-datamodel prisma/schema.prisma --script
-```
-
-Aplicar somente em janela aprovada:
+Faça e valide um backup restaurável antes da janela. O preflight é somente
+leitura e pode ser executado sem iniciar API/Web:
 
 ```sh
-npx prisma migrate deploy
+docker compose -f docker-compose.portainer.yml run --rm --no-deps vismed preflight-task261
 ```
 
-Rollback manual: remover primeiro a versão do aplicativo que lê o catálogo e
-executar `apps/api/prisma/migrations/20260904_doctoralia_tenant_catalog/rollback.sql`.
-Isso remove as cinco tabelas novas (`DoctoraliaCatalogAttemptBucket`,
-`DoctoraliaCatalogLease`, `DoctoraliaCatalogCredential`,
-`DoctoraliaCatalogMember`, `DoctoraliaCatalogGeneration`) e
-`catalogScopeVersion`.
+Com estado `absent` e backup aprovado, aplique **somente** a migration da Task
+261 em um container one-off:
+
+```sh
+docker compose -f docker-compose.portainer.yml run --rm --no-deps \
+  -e APPLY_TASK261_MIGRATION=true vismed migrate-task261
+```
+
+O runner exige que o opt-in seja exatamente `true`, aplica apenas em estado
+`absent`, usa uma única transação e não escreve em `_prisma_migrations`. Ele não
+executa migrations históricas, seed, `migrate deploy`, `migrate resolve`,
+`db push` ou `--accept-data-loss`. Depois do sucesso, remova/não defina
+`APPLY_TASK261_MIGRATION` na configuração normal; ela não deve ficar persistida.
+Suba normalmente e deixe o boot repetir o preflight read-only.
+
+Contrato de saída do preflight: `0` aplicado, `20` ausente, `21` parcial ou
+divergente, `22` baseline incompatível, `23` configuração inválida e `24` falha
+de runtime. Estados parcial/baseline exigem investigação manual; não tente
+replay do histórico para “corrigi-los”.
+
+Uma falha antes do commit sofre rollback transacional automático. Depois de um
+commit bem-sucedido, rollback é uma reversão manual e potencialmente destrutiva:
+primeiro reverta o aplicativo que lê o catálogo, preserve os dados necessários
+e prefira restaurar o backup validado. Só execute
+`apps/api/prisma/migrations/20260904_doctoralia_tenant_catalog/rollback.sql`
+após revisar o SQL e aprovar explicitamente a perda das cinco tabelas novas e
+de `catalogScopeVersion` e do índice composto da conexão; nunca o use como retry automático.
 
 ## Canário
 

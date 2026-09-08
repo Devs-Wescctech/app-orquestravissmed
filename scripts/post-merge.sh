@@ -1,6 +1,7 @@
 #!/bin/bash
 # Post-merge setup para o monorepo VisMed (npm workspaces).
-# Reconciliação idempotente após merge de task: deps + Prisma client + schema + build da API.
+# Reconciliação idempotente após merge: deps + Prisma client + build da API.
+# Nunca conecta ou altera bancos; schema exige operação explícita separada.
 # Não-interativo (stdin fechado) e fail-fast.
 set -euo pipefail
 
@@ -12,15 +13,7 @@ npm install --no-audit --no-fund
 echo "[post-merge] Gerando Prisma Client..."
 npm run --workspace=apps/api exec -- prisma generate 2>/dev/null || (cd apps/api && npx prisma generate)
 
-echo "[post-merge] Sincronizando schema do banco (prisma db push, idempotente)..."
-# Sem migration_lock.toml o caminho é db push (não migrate deploy). SEM --accept-data-loss
-# de propósito: mudanças destrutivas devem falhar aqui em vez de apagar dados silenciosamente.
-(cd apps/api && npx prisma db push --skip-generate)
-
-echo "[post-merge] Aplicando índices parciais (não representáveis no schema Prisma)..."
-# Índice único parcial SyncJob_dedupKey_active_key: db push não o cria (nem o remove).
-# A migration é idempotente (IF NOT EXISTS) e aborta com relatório se houver duplicatas ativas.
-(cd apps/api && npx prisma db execute --file prisma/migrations/20260809_syncjob_dedup_lease/migration.sql --schema prisma/schema.prisma)
+echo "[post-merge] Schema não é alterado no merge; use o procedimento controlado documentado."
 
 echo "[post-merge] Buildando a API (tsc → apps/api/dist)..."
 # A API builda com tsc (não há nest-cli.json). O workflow roda apps/api/dist/main.js.

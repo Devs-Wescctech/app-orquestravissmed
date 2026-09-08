@@ -26,15 +26,18 @@ services:
       # WP3 (#188) — admin block-break sync; defaults mantêm o sync desligado:
       ADMIN_BLOCK_BREAK_SYNC_MODE: ${ADMIN_BLOCK_BREAK_SYNC_MODE:-off}
       ADMIN_BLOCK_BREAK_SYNC_ACTIVE_CLINICS: ${ADMIN_BLOCK_BREAK_SYNC_ACTIVE_CLINICS:-}
+      # Migration/boot nao autorizam ativacao de matching em nenhuma clinica.
+      DOCTORALIA_TENANT_SAFE_DOCTOR_MATCH_CLINIC_IDS: ""
+      # APPLY_TASK261_MIGRATION nao deve permanecer na stack. Use-o somente no
+      # comando one-off documentado, depois de backup aprovado.
       # Opcionais (descomente/defina se precisar):
-      # SKIP_DB_INIT: "false"
-      # SKIP_SEED: "false"
       # DISABLE_SYNC_CRON: "true"
       # REDIS_PASSWORD: ""
     extra_hosts:
       # Faz o container enxergar o PostgreSQL rodando no host.
       - "host.docker.internal:host-gateway"
-    restart: unless-stopped
+    # Limita loops de boot por configuracao/schema, preservando retry de crashes.
+    restart: on-failure:3
     depends_on:
       redis:
         condition: service_healthy

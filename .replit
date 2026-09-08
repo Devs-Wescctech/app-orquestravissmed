@@ -25,6 +25,10 @@ args = "api-schema-build"
 task = "workflow.run"
 args = "vismed-feed-regression"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "task261-boot-safety"
+
 [[workflows.workflow]]
 name = "Start application"
 author = "agent"
@@ -52,9 +56,20 @@ isValidation = true
 name = "vismed-feed-regression"
 author = "agent"
 
+[workflows.workflow.metadata]
+isValidation = true
+
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "cd apps/api && npm test -- --runInBand src/bookings/booking-sync.service.vismed-feed-mode.spec.ts src/clinics/clinics.service.vismed-feed-mode.spec.ts src/bookings/booking-sync.service.vismed-rebind.spec.ts src/bookings/booking-sync.doctoralia-ingestion.spec.ts src/bookings/booking-safety-sweep.service.spec.ts src/bookings/doctoralia-poll-concurrency.spec.ts src/bookings/clinic-concurrency-guard.spec.ts src/bookings/wp04-global-slot-sync-concurrency.spec.ts src/bookings/booking-sync.service.break-dedup.spec.ts src/bookings/integration-status-gate.spec.ts src/bookings/booking-sync.empresa-guard.spec.ts src/bookings/booking-claim.service.spec.ts src/bookings/queue.vismed-timeout.spec.ts"
+args = "bash scripts/test-api-isolated.sh src/bookings/booking-sync.service.vismed-feed-mode.spec.ts src/clinics/clinics.service.vismed-feed-mode.spec.ts src/bookings/booking-sync.service.vismed-rebind.spec.ts src/bookings/booking-sync.doctoralia-ingestion.spec.ts src/bookings/booking-safety-sweep.service.spec.ts src/bookings/doctoralia-poll-concurrency.spec.ts src/bookings/clinic-concurrency-guard.spec.ts src/bookings/wp04-global-slot-sync-concurrency.spec.ts src/bookings/booking-sync.service.break-dedup.spec.ts src/bookings/integration-status-gate.spec.ts src/bookings/booking-sync.empresa-guard.spec.ts src/bookings/booking-claim.service.spec.ts src/bookings/queue.vismed-timeout.spec.ts"
+
+[[workflows.workflow]]
+name = "task261-boot-safety"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "node --test apps/api/scripts/task261-tests/integration.test.js"
 
 [workflows.workflow.metadata]
 isValidation = true

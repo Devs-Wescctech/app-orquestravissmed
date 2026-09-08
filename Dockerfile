@@ -40,6 +40,7 @@ RUN apt-get update \
 
 ENV NODE_ENV=production
 ENV VISMED_API_PORT=3000
+ENV APPLY_TASK261_MIGRATION=false
 WORKDIR /app
 
 # Dependencias de producao (com Prisma Client ja gerado).
@@ -51,7 +52,7 @@ COPY --from=builder /app/package-lock.json ./package-lock.json
 COPY --from=builder /app/apps/api/package.json ./apps/api/package.json
 COPY --from=builder /app/apps/api/dist ./apps/api/dist
 COPY --from=builder /app/apps/api/prisma ./apps/api/prisma
-# Scripts de manutencao/migracao one-off (ex.: fix-service-dict-ids.js).
+# Scripts de manutencao/migracao one-off, incluindo o runner restrito da Task 261.
 COPY --from=builder /app/apps/api/scripts ./apps/api/scripts
 
 # Artefatos e arquivos de runtime do Web.
@@ -60,7 +61,7 @@ COPY --from=builder /app/apps/web/.next ./apps/web/.next
 COPY --from=builder /app/apps/web/public ./apps/web/public
 COPY --from=builder /app/apps/web/next.config.js ./apps/web/next.config.js
 
-# Script de inicializacao (db push + seed idempotentes + sobe os dois processos).
+# Script de inicializacao (preflight obrigatorio + sobe os dois processos).
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh
 
