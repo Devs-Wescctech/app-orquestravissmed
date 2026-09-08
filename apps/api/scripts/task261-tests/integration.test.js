@@ -18,9 +18,19 @@ const migration = path.join(
   'prisma/migrations/20260904_doctoralia_tenant_catalog/migration.sql',
 );
 const schemaFile = path.join(apiRoot, 'prisma/schema.prisma');
+const { MIGRATION_SHA256, migrationSha256 } = require('../task261/cli');
 
 let cluster;
 let databaseSequence = 0;
+
+test('migration integrity hash accepts LF and CRLF representations of the authorized SQL', () => {
+  const lf = fs.readFileSync(migration, 'utf8').replace(/\r\n?/g, '\n');
+  const crlf = lf.replace(/\n/g, '\r\n');
+
+  assert.equal(migrationSha256(lf), MIGRATION_SHA256);
+  assert.equal(migrationSha256(crlf), MIGRATION_SHA256);
+  assert.notEqual(migrationSha256(`${lf}\n-- unauthorized change`), MIGRATION_SHA256);
+});
 
 function cleanEnvironment(extra = {}) {
   // Deliberately do not spread process.env: in particular, an inherited

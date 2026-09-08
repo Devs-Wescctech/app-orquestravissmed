@@ -63,7 +63,8 @@ COPY --from=builder /app/apps/web/next.config.js ./apps/web/next.config.js
 
 # Script de inicializacao (preflight obrigatorio + sobe os dois processos).
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
-RUN chmod +x /app/docker-entrypoint.sh
+RUN sed -i 's/\r$//' /app/docker-entrypoint.sh \
+    && chmod +x /app/docker-entrypoint.sh
 
 # Somente a porta do frontend precisa ser exposta (ele proxia /api/* para a API local).
 EXPOSE 5000

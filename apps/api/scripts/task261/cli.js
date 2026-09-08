@@ -143,9 +143,17 @@ const MIGRATION_PATH = path.resolve(
 );
 const MIGRATION_SHA256 = 'c0cbd06a3de7a4c49cf5769fb6aa3dd42d1ec416745f4965416e35e95213fce5';
 
+function migrationSha256(sql) {
+  // Git and Docker checkouts may materialize the same text with LF or CRLF.
+  // Hash the canonical SQL text so the integrity gate protects statements,
+  // rather than rejecting a platform-specific line-ending representation.
+  const canonicalSql = sql.replace(/\r\n?/g, '\n');
+  return crypto.createHash('sha256').update(canonicalSql, 'utf8').digest('hex');
+}
+
 function loadAuthorizedMigration() {
   const sql = fs.readFileSync(MIGRATION_PATH, 'utf8');
-  const hash = crypto.createHash('sha256').update(sql, 'utf8').digest('hex');
+  const hash = migrationSha256(sql);
   if (hash !== MIGRATION_SHA256) throw new Error('migration_sql_hash_mismatch');
   return sql;
 }
@@ -360,7 +368,13 @@ function inspectSnapshot(snapshot) {
         targetIssues.push(`target.column.${name}.${columnName}`);
       }
     }
-    const actualConstraintNames = constraints.filter((row) => row.table_name === name).map((row) => row.conname).sort();
+    // PostgreSQL 18 exposes NOT NULL constraints in pg_constraint (contype=n).
+    // Task 261 owns only the primary and foreign keys declared below, so those
+    // are the constraint kinds that must match exactly across supported majors.
+    const actualConstraintNames = constraints
+      .filter((row) => row.table_name === name && ['p', 'f'].includes(row.contype))
+      .map((row) => row.conname)
+      .sort();
     if (!sameArray(actualConstraintNames, Object.keys(definition.constraints).sort())) {
       targetIssues.push(`target.constraints.${name}`);
     }
@@ -526,6 +540,7 @@ module.exports = {
   MIGRATION_PATH,
   MIGRATION_SHA256,
   MIGRATION_SQL,
+  migrationSha256,
   loadAuthorizedMigration,
   CATALOG_SQL,
   schemaFromDatabaseUrl,
