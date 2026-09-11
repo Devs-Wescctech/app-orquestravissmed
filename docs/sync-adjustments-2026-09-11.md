@@ -59,7 +59,7 @@ Rollback da aplicação: retornar à imagem anterior preservando a coluna adicio
 - `npm ci` com lockfile da base; nenhuma dependência alterada.
 - Build API e build web aprovados; TypeScript web verificado separadamente, pois o build web desabilita essa checagem. O build web emitiu aviso existente de SWC/lockfile, sem impedir a construção.
 - 301 testes de sync em 23 suítes aprovados; incluem os dois pipelines com Prisma/PostgreSQL real e clientes externos simulados, prazo persistido, falha/repetição, contagens, limpeza segura e planos.
-- Dois testes de renderização do componente de relatório aprovados (`node --test apps/web/tests/sync-run-report.test.cjs`). Não houve E2E autenticado no navegador nem chamadas de escrita reais à Doctoralia.
+- Dois testes de renderização do componente de relatório aprovados (`node --test apps/web/tests/sync-run-report.test.cjs`). A validação posterior no navegador e a escrita na homologação estão descritas abaixo.
 - Suíte API ampliada: 1.117 aprovados, quatro falhas na montagem de dependências de AuthController/AuthService/UsersController/UsersService. Esses arquivos não fazem parte do ajuste.
 - ESLint dos quatro novos módulos de produção aprovado. ESLint dos arquivos legados alterados continua com violações de formatação/tipagem e exclusão de specs pelo tsconfig; o lint geral não está aprovado. Não foram importados os lotes suspensos de testes/lint/dependências.
 - Migration aplicada em PostgreSQL descartável, contexto Docker Desktop local, porta 55439/banco sync_test e dados fictícios. O schema desse banco de teste foi alinhado depois com `prisma db push` devido à lacuna preexistente do histórico. Isso não foi feito em banco de produção.
@@ -82,14 +82,32 @@ Verificações locais concluídas em 11/09/2026, após autorização do usuário
 - O Prisma gerado da base conseguiu criar, ler e atualizar um registro fictício no banco com a coluna adicional. A atualização antiga preservou os metadados e mudou o hash; a checagem de hash do candidato distingue esse histórico desatualizado. Isso valida compatibilidade do cliente de banco, não um rollback completo de imagem/serviço.
 - Fluxo web conferido no navegador local: login fictício, seleção de clínica fictícia, dashboard, abertura do histórico, expansão da composição e disparo manual contra servidor HTTP simulado. Confirmados a tabela, as agendas pendentes, o aviso de contagem antiga e o status parcial. Ajustada a apresentação do selo de pendência e a largura da composição. A mensagem sobre planos orienta conferência sem afirmar indisponibilidade universal.
 
-O usuário confirmou que a conta Doctoralia informada acessa o ambiente real da clínica. Não foi disponibilizada homologação com agendas fictícias. Nenhuma chamada de escrita de validação foi feita contra a Doctoralia real.
+### Homologação externa concluída
+
+Após a investigação inicial da conta real, o usuário confirmou a unidade Medical Center Bruno Mendes Test como ambiente de testes/homologação. Em 11/09/2026, das 15:37:58 às 15:38:06 (Brasília), o código compilado do candidato `93f20648aac084f2ccedc7bc7f67e49886247b1d` executou criação, repetição e remoção de um intervalo fictício com o cliente HTTP real da Doctoralia.
+
+- Profissional Aaron Gusmão Test; unidade 140548, profissional 1396868, endereço 1750984. Intervalo de 14/09/2026, 10:00–10:30.
+- Leitura inicial confirmou ausência de horários, reservas e bloqueios no dia. Criação retornou 201 e leitura posterior confirmou o horário.
+- Repetição sem alteração dispensou novo PUT. Remoção dos intervalos gerenciados retornou 201 e a leitura posterior confirmou retorno ao estado vazio inicial.
+- Calendário permaneceu habilitado. Nenhuma consulta real foi criada ou cancelada. Não foi necessária recuperação adicional.
+- O teste utilizou disponibilidade e persistência locais isoladas; não constitui teste integral de extração Vissmed nem restauração de uma agenda real preexistente. Valida envio, ausência de reenvio e remoção efetivos na integração externa.
+
+Evidências locais fora do Git: `sync-sandbox-write-result.json` e `sync-sandbox-write-report.md`, na pasta de trabalho Orquestrador. Não é necessário repetir a escrita para liberar o pacote.
+
+### Conferência operacional em 11/09/2026
+
+- Produção ainda executa imagem `sha256:16e4d41a0f7920c78d7a07d81426a721a76fd950558c3bed3aa0b09d982e45ac`, container iniciado em 08/09, sem reinícios contabilizados. O commit Git dessa imagem não foi identificado; não é inferido da main.
+- TAR preservado fora do repositório teve SHA-256 reconferido: `166a2dd5c09ef30cc4f486dc5cfe5708d881e771a98bdcc88d13b409caf52142`. Carregamento no Docker Desktop local retornou o mesmo ID de imagem. Execução isolada, sem rede e sem o entrypoint de produção, carregou Node e Prisma corretamente. Não equivale a ensaio completo de troca/retorno do serviço.
+- Consulta de metadados em transação READ ONLY no banco real confirmou todas as colunas escalares do Prisma da imagem atual. A lista dessas colunas é idêntica à do candidato excluindo apenas `SlotPushState.managedState` (hash comparativo `ad7897de991d388d910f2f54a1c915cfe92b7391bf1e225800accc14b21c88a9`). A nova coluna ainda está ausente, como esperado.
+- Não foi encontrada a coluna `public._prisma_migrations.migration_name`; não há ledger Prisma nesse schema. Aplicar somente a SQL específica aprovada antes do novo runtime, sem migrações globais. Nenhum ALTER foi executado em produção.
+- Backup informado pelo usuário: 11/09/2026 às 03:06. Escopo, referência/localização e confirmação de restauração pela infraestrutura ainda não foram informados.
 
 ### Condições que permanecem antes de publicar
 
-1. Infraestrutura conferir schema/migrations do banco real, backup com data/local/escopo e procedimento de restauração. A validação local não prova o estado do banco de produção.
-2. Identificar e preservar a imagem/configuração atualmente executada e revisar retorno somente do vismed, conforme AGENTS.md/PUBLICACAO.md. Não houve ensaio de rollback de imagem em produção.
-3. Obter ambiente/conta de teste Doctoralia para validar envio e remoção reais; na ausência dele, combinar explicitamente escopo e autorização de uma validação controlada, sem tratar o resultado simulado como homologação externa concluída.
+1. Infraestrutura confirmar escopo, referência/localização e procedimento de restauração do backup informado. O schema real já foi conferido em leitura.
+2. Completar preservação segura da configuração de runtime e confirmar o procedimento de substituição/retorno somente do vismed, conforme AGENTS.md/PUBLICACAO.md. Imagem preservada e carregamento local verificados; não houve ensaio de rollback no servidor. O commit de origem da imagem atual continua sem identificação.
+3. Na janela autorizada, aplicar exclusivamente a SQL da coluna nova antes de iniciar o candidato; o teste externo está concluído.
 4. Conferir os planos aceitos e os horários antigos pendentes com a clínica antes de qualquer correção manual desses dados. A aprovação do pacote não escolhe planos pela clínica.
 5. Solicitar autorização de envio Git/publicação após apresentar o pacote e a situação dos controles. Nenhum push, migration de produção ou deploy foi executado nesta revisão.
 
-Conclusão: verificações locais encerradas; publicação ainda depende dos controles operacionais e da definição da validação externa.
+Conclusão: validações de código e homologação externa encerradas; publicação ainda depende dos controles operacionais descritos e de autorização explícita.
