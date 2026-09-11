@@ -17,4 +17,7 @@ describe('managed availability cleanup', () => {
     it('does not widen to dates outside the complete source snapshot', () => {
         expect(managedClearPayload(managedSlotState(scope, 'hash', slots), 'hash', scope, ['2026-09-13'])).toBeNull();
     });
+    it('rejects malformed ranges before saving management evidence', () => {
+        expect(() => managedSlotState(scope, 'hash', [null])).toThrow('Invalid managed slot range');
+    });
 });

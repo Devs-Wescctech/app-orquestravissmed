@@ -690,7 +690,7 @@ export class SyncService {
                                     }
                                 });
                             }
-                        } catch (e) { await this.logEvent(syncRunId, 'SERVICE', 'fetch_error', 'Falha ao atualizar serviços de um endereço.'); }
+                        } catch { await this.logEvent(syncRunId, 'SERVICE', 'fetch_error', 'Falha ao atualizar serviços de um endereço.'); }
 
                         try {
                             const insRes = await client.getAddressInsuranceProviders(facilityId, docId, addrId);
@@ -754,7 +754,7 @@ export class SyncService {
 
     private async saveGenericMapping(clinicId: string, type: any, externalId: string, item: any, syncRunId: string) {
         const name = item.name || item.title || (item.surname ? `${item.name} ${item.surname}` : `Item #${externalId}`);
-        const existing = await this.prisma.mapping.findUnique({ where: { clinicId_entityType_externalId: { clinicId, entityType: type, externalId } } });
+        const existing = await this.prisma.mapping.findUnique({ where: { clinicId_entityType_externalId: { clinicId, entityType: type as import('@prisma/client').MappingEntityType, externalId } } });
         if (type === 'LOCATION') recordOutcome('facilities', externalId, !existing ? 'created' : existing.status === 'ORPHAN' ? 'updated' : 'unchanged');
         await differentialUpsert(this.prisma.mapping, '', {
             where: { clinicId_entityType_externalId: { clinicId, entityType: type, externalId } },

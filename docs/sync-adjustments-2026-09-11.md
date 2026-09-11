@@ -69,3 +69,27 @@ Para repetir os testes de integração, `SYNC_TEST_DATABASE=true` requer `DATABA
 Após uma publicação autorizada: conferir o primeiro ciclo e o seguinte, resultados de catálogo `catalog_*_refreshed`/`catalog_fresh`, duração, contagem e pendências por endereço. Confirmar com a clínica os planos aceitos quando houver opções múltiplas. Não estimar economia real sem essa medição.
 
 Referências do contrato Doctoralia: [documentação oficial](https://integrations.docplanner.com/docs/) e [modelo ReplaceSlotsRequestSlots do SDK oficial](https://github.com/DocPlanner/integrations-api-sdk-php/blob/develop/docs/Model/ReplaceSlotsRequestSlots.md). Consultadas em 11/09/2026.
+
+## Revisão adicional antes de produção
+
+Verificações locais concluídas em 11/09/2026, após autorização do usuário:
+
+- Criado checkout separado da base `f88bb85`, instalado com seu próprio `npm ci` e cliente Prisma gerado do schema anterior. Os mesmos quatro testes de AuthController/AuthService/UsersController/UsersService falham ali pela ausência de providers no TestingModule. Portanto não são regressões deste pacote. Não foram mescladas as branches suspensas nem corrigidos esses testes fora do escopo.
+- Comparado ESLint da base e do candidato. Corrigidas as violações não relacionadas a formatação nas linhas novas/alteradas: preservação do tipo de retorno do upsert, tipagem dos planos e metadados e variável de erro não utilizada. Auditoria das linhas alteradas dos seis módulos legados: nenhuma ocorrência além de Prettier. Os módulos novos passam integralmente no lint. O lint geral continua reprovado por dívida de tipagem legada e formatação; não foi feita reformatação ampla.
+- Acrescentada proteção à limpeza: além de conferir histórico/hash/escopo, o vínculo atual da clínica deve estar LINKED e apontar para o profissional remoto selecionado. Dois testes cobrem vínculo removido e vínculo apontando para outro profissional. Metadados de intervalos inválidos são recusados antes da gravação.
+- Validação final: **304 testes de sync aprovados**, 23 suítes; builds API/web aprovados e TypeScript web separado aprovado. A suíte ampliada anterior segue como evidência dos módulos não afetados; não foi declarada uma nova execução completa dela.
+- No PostgreSQL local descartável, a SQL exata da migration foi executada em tabela temporária com registro legado, dentro de transação desfeita. Preservou o hash e criou managedState nulo. A conferência de metadados identificou todas as colunas escalares exigidas pelo candidato nesse banco de teste já alinhado.
+- O Prisma gerado da base conseguiu criar, ler e atualizar um registro fictício no banco com a coluna adicional. A atualização antiga preservou os metadados e mudou o hash; a checagem de hash do candidato distingue esse histórico desatualizado. Isso valida compatibilidade do cliente de banco, não um rollback completo de imagem/serviço.
+- Fluxo web conferido no navegador local: login fictício, seleção de clínica fictícia, dashboard, abertura do histórico, expansão da composição e disparo manual contra servidor HTTP simulado. Confirmados a tabela, as agendas pendentes, o aviso de contagem antiga e o status parcial. Ajustada a apresentação do selo de pendência e a largura da composição. A mensagem sobre planos orienta conferência sem afirmar indisponibilidade universal.
+
+O usuário confirmou que a conta Doctoralia informada acessa o ambiente real da clínica. Não foi disponibilizada homologação com agendas fictícias. Nenhuma chamada de escrita de validação foi feita contra a Doctoralia real.
+
+### Condições que permanecem antes de publicar
+
+1. Infraestrutura conferir schema/migrations do banco real, backup com data/local/escopo e procedimento de restauração. A validação local não prova o estado do banco de produção.
+2. Identificar e preservar a imagem/configuração atualmente executada e revisar retorno somente do vismed, conforme AGENTS.md/PUBLICACAO.md. Não houve ensaio de rollback de imagem em produção.
+3. Obter ambiente/conta de teste Doctoralia para validar envio e remoção reais; na ausência dele, combinar explicitamente escopo e autorização de uma validação controlada, sem tratar o resultado simulado como homologação externa concluída.
+4. Conferir os planos aceitos e os horários antigos pendentes com a clínica antes de qualquer correção manual desses dados. A aprovação do pacote não escolhe planos pela clínica.
+5. Solicitar autorização de envio Git/publicação após apresentar o pacote e a situação dos controles. Nenhum push, migration de produção ou deploy foi executado nesta revisão.
+
+Conclusão: verificações locais encerradas; publicação ainda depende dos controles operacionais e da definição da validação externa.

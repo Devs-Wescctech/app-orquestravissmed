@@ -1,4 +1,4 @@
-import { selectInsurancePlan, PLAN_REMEDIATION } from './insurance-plan-selection';
+import { selectInsurancePlan, PLAN_REMEDIATION, AddressInsuranceProvider } from './insurance-plan-selection';
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { DocplannerClient } from '../integrations/docplanner.service';
@@ -581,10 +581,10 @@ export class PushSyncService {
         try {
             const mutated = result.added > 0 || result.removed > 0 || plansAdded > 0;
             if (mutated) await new Promise(r => setTimeout(r, 500));
-            const verify = mutated ? await client.getAddressInsuranceProviders(facilityId, doctorId, addressId) : { _items: currentProviders };
+            const verify = (mutated ? await client.getAddressInsuranceProviders(facilityId, doctorId, addressId) : { _items: currentProviders }) as { _items?: unknown };
             if (!Array.isArray(verify?._items)) throw new Error('Resposta inválida na verificação de convênios.');
-            const verifyItems = verify._items;
-            const verifiedIds = new Set(verifyItems.map((p: any) => String(p.insurance_provider_id || p.id)));
+            const verifyItems = verify._items as AddressInsuranceProvider[];
+            const verifiedIds = new Set(verifyItems.map(p => String(p.insurance_provider_id || p.id)));
             for (const pid of desiredProviderIds) {
                 if (!verifiedIds.has(pid) && syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'provider_pending',
                     `Endereço ${addressId}: vínculo do convênio ${pid} não confirmado na Doctoralia.`);

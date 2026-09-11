@@ -81,17 +81,19 @@ function comparable(value: unknown): string {
 }
 
 /** Compare business fields; timestamps alone must not cause another write. */
-export async function differentialUpsert(
-  delegate: unknown,
+export async function differentialUpsert<
+  T extends { findUnique: (...args: never[]) => Promise<unknown> },
+>(
+  delegate: T,
   category: string,
   args: {
     where: Record<string, unknown>;
     create: Record<string, unknown>;
     update: Record<string, unknown>;
   },
-): Promise<any> {
+): Promise<Awaited<ReturnType<T['findUnique']>>> {
   // Prisma delegates vary by model; their shared operations are invoked here.
-  const model = delegate as {
+  const model = delegate as unknown as {
     findUnique(input: {
       where: Record<string, unknown>;
     }): Promise<Record<string, unknown> | null>;
@@ -115,7 +117,7 @@ export async function differentialUpsert(
         key,
         !existing ? 'created' : changed ? 'updated' : 'unchanged',
       );
-    return result;
+    return result as Awaited<ReturnType<T['findUnique']>>;
   } catch (error) {
     if (category) recordOutcome(category, key, 'errors');
     throw error;

@@ -362,7 +362,7 @@ export default function SyncDashboardPage() {
                             {status?.insurance.regressionWarnings} endereço(s) apresentaram convênios sem plano na última sincronização
                         </p>
                         <p className="text-xs text-amber-700 mt-1">
-                            Sem plano vinculado, a página pública do médico mostra "Não disponível para agendamentos online".
+                            Convênios sem plano vinculado precisam de conferência da disponibilidade para agendamento online.
                             Confira as pendências: se houver vários planos, selecione os aceitos no endereço da Doctoralia; se não houver plano disponível, revise o cadastro com a Doctoralia.
                         </p>
                         {(status?.insurance.regressionDetails || []).length > 0 && (
@@ -526,7 +526,7 @@ export default function SyncDashboardPage() {
                                 const runState = getRunState(run);
                                 return (
                                 <div key={run.id} className="p-6 px-8 flex flex-col md:flex-row gap-4 items-start md:items-center justify-between hover:bg-slate-50/50 transition-all cursor-default group/item">
-                                    <div className="flex items-center gap-5">
+                                    <div className="flex min-w-0 flex-1 items-start gap-5">
                                         <div className={`h-14 w-14 rounded-2xl flex items-center justify-center shrink-0 border-2 transition-all group-hover/item:scale-105 shadow-lg ${
                                             runState === 'completed' ? 'bg-white border-emerald-100 text-primary shadow-emerald-100/20' :
                                             runState === 'running' ? 'bg-white border-blue-100 text-blue-500 shadow-blue-100/20' :
@@ -538,7 +538,7 @@ export default function SyncDashboardPage() {
                                                 (runState === 'skipped' || runState === 'completed_with_warnings') ? <Clock className="h-6 w-6" /> :
                                                 <AlertTriangle className="h-6 w-6" />}
                                         </div>
-                                        <div>
+                                        <div className="min-w-0 flex-1">
                                             <h4 className="font-black text-base text-slate-900 leading-none group-hover/item:text-primary transition-colors">
                                                 {run.type === 'full' ? 'Doctoralia (Completa)' : run.type === 'vismed-full' ? 'VissMed (Completa)' : 'Parcial'}
                                             </h4>
@@ -556,7 +556,7 @@ export default function SyncDashboardPage() {
                                     </div>
                                     <div className="flex items-center gap-4">
                                         <div className="text-right">
-                                            <span className={`px-3 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest shadow-sm ${
+                                            <span className={`inline-flex text-center px-3 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest shadow-sm ${
                                                 runState === 'completed' ? 'bg-primary text-white' :
                                                 runState === 'running' ? 'bg-blue-500 text-white' :
                                                 (runState === 'skipped' || runState === 'completed_with_warnings') ? 'bg-amber-500 text-white' :

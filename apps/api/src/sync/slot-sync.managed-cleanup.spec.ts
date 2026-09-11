@@ -56,12 +56,20 @@ describe('slot cleanup integration', () => {
         expect(f.client.replaceSlots).not.toHaveBeenCalled();
         expect(f.events.some(e => e.action === 'skipped_incomplete')).toBe(true);
     });
+    it.each([{ status: 'UNLINKED', externalId: 'd' }, { status: 'LINKED', externalId: 'different-doctor' }])(
+        'does not clear when the current clinic mapping no longer authorizes the doctor: %j', async mapping => {
+            const f = fixture(); f.prisma.mapping.findFirst.mockResolvedValue(mapping);
+            await f.service.syncSlotsForDoctor('v', f.client, 'run', 30, 'clinic-a', f.availability);
+            expect(f.client.replaceSlots).not.toHaveBeenCalled();
+            expect(f.prisma.slotPushState.upsert).not.toHaveBeenCalled();
+            expect(f.events.some(e => e.action === 'managed_scope_pending')).toBe(true);
+        });
     it('uses configured address plans when publishing new availability', async () => {
         const f = fixture(); f.setState(null);
         f.prisma.mapping.findMany.mockResolvedValue([{ externalId: '7' }]);
         f.client.getAddressInsuranceProviders.mockResolvedValue({ _items: [{ insurance_provider_id: '7', insurance_plans: { _items: [{ insurance_plan_id: '72' }] } }] });
         f.availability.getRanges.mockReturnValue([{ start: '08:00', end: '12:00' }]);
-        // Real date/range conversion remains exercised by the service.
+        // Isolate the service's choice of address plans from date conversion.
         jest.spyOn(f.service, 'buildDaySlotsFromRanges').mockImplementation((_date, _ranges, _services, _tz, _duration, providers, plans) =>
             [{ ...ranges[0], address_services: [{ address_service_id: 5, duration: 30 }], insurance_providers: providers, insurance_plans: plans }]);
         await f.service.syncSlotsForDoctor('v', f.client, 'run', 30, 'clinic-a', f.availability);

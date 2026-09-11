@@ -1,4 +1,5 @@
 import { managedSlotState, managedClearPayload, ManagedSlotState } from './managed-slot-ranges';
+import { AddressInsuranceProvider } from './insurance-plan-selection';
 import { Injectable, Logger } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
@@ -30,8 +31,8 @@ export class SlotSyncService {
         try {
             await this.prisma.slotPushState.upsert({
                 where: { doctoraliaDoctorId_addressId: { doctoraliaDoctorId, addressId } },
-                create: { doctoraliaDoctorId, addressId, availabilityHash, managedState: managedState as any },
-                update: { availabilityHash, lastSyncedAt: new Date(), managedState: managedState as any },
+                create: { doctoraliaDoctorId, addressId, availabilityHash, managedState },
+                update: { availabilityHash, lastSyncedAt: new Date(), managedState },
             });
         } catch (err: any) {
             this.logger.warn(`Falha ao gravar SlotPushState (${doctoraliaDoctorId}/${addressId}): ${err.message}`);
@@ -206,11 +207,11 @@ export class SlotSyncService {
             return { success: false, message: 'Médico VisMed não encontrado.', slotsCreated: 0 };
         }
 
-        if (clinicId) {
-            const mapping = await this.prisma.mapping.findFirst({
+        const clinicMapping = clinicId ? await this.prisma.mapping.findFirst({
                 where: { vismedId: doctor.id, entityType: 'DOCTOR', clinicId },
-            });
-            if (!mapping) {
+            }) : null;
+        if (clinicId) {
+            if (!clinicMapping) {
                 return { success: false, message: `Médico ${doctor.name} não pertence a esta clínica.`, slotsCreated: 0 };
             }
         }
@@ -413,18 +414,18 @@ export class SlotSyncService {
                 // differ from the clinic's manual selection and is not an authorization.
                 if (insuranceProviderIds.length > 0) {
                     try {
-                        const response = await client.getAddressInsuranceProviders(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId);
+                        const response = await client.getAddressInsuranceProviders(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId) as { _items?: unknown };
                         if (!Array.isArray(response?._items)) throw new Error('Resposta inválida de planos vinculados.');
                         const desired = new Set(insuranceProviderIds.map(String));
                         const seenPlans = new Set<number>();
-                        for (const provider of response._items) {
+                        for (const provider of response._items as AddressInsuranceProvider[]) {
                             if (!desired.has(String(provider.insurance_provider_id ?? provider.id))) continue;
                             for (const plan of provider.insurance_plans?._items || []) {
                                 if (/^[1-9]\d*$/.test(String(plan.insurance_plan_id))) seenPlans.add(Number(plan.insurance_plan_id));
                             }
                         }
                         insurancePlanIds = [...seenPlans];
-                    } catch (error) {
+                    } catch {
                         addressesFailed++;
                         if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'error',
                             `Endereço ${addrId}: não foi possível confirmar planos vinculados; disponibilidade não enviada.`);
@@ -494,7 +495,10 @@ export class SlotSyncService {
                         continue;
                     }
                     const scope = { clinicId: clinicId || '', facilityId: String(dDoc.doctoraliaFacilityId), doctorId: String(dDoc.doctoraliaDoctorId), addressId: addrId };
-                    const clearPayload = managedClearPayload(prevState!.managedState, prevState!.availabilityHash, scope, dates);
+                    const ownsCurrentDoctor = clinicMapping?.status === 'LINKED'
+                        && clinicMapping.externalId === String(dDoc.doctoraliaDoctorId);
+                    const clearPayload = ownsCurrentDoctor
+                        ? managedClearPayload(prevState.managedState, prevState.availabilityHash, scope, dates) : null;
                     if (!clearPayload) {
                         addressesFailed++;
                         if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'managed_scope_pending',

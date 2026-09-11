@@ -1,25 +1,37 @@
-export interface SlotScope {
+export type SlotScope = {
   clinicId: string;
   facilityId: string;
   doctorId: string;
   addressId: string;
-}
-export interface ManagedSlotState extends SlotScope {
+};
+export type ManagedSlotState = SlotScope & {
   version: 1;
   hash: string;
   ranges: Array<{ start: string; end: string }>;
-}
+};
 
 export function managedSlotState(
   scope: SlotScope,
   hash: string,
-  slots: Array<{ start: string; end: string }>,
+  slots: unknown[],
 ): ManagedSlotState {
   return {
     ...scope,
     version: 1,
     hash,
-    ranges: slots.map(({ start, end }) => ({ start, end })),
+    ranges: slots.map((slot) => {
+      if (
+        !slot ||
+        typeof slot !== 'object' ||
+        !('start' in slot) ||
+        !('end' in slot) ||
+        typeof slot.start !== 'string' ||
+        typeof slot.end !== 'string'
+      ) {
+        throw new Error('Invalid managed slot range');
+      }
+      return { start: slot.start, end: slot.end };
+    }),
   };
 }
 

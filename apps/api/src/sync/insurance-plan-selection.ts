@@ -1,3 +1,9 @@
+export type AddressInsuranceProvider = {
+  insurance_provider_id?: string | number;
+  id?: string | number;
+  insurance_plans?: { _items?: Array<{ insurance_plan_id?: string | number }> };
+};
+
 export type PlanSelection = {
   id: string | null;
   reason:
