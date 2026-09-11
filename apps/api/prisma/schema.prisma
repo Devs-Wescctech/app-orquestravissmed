@@ -680,6 +680,8 @@ model SlotPushState {
   doctoraliaDoctorId String
   addressId          String
   availabilityHash   String
+  // Intervals confirmed remotely; hash/scope prevent using stale metadata after rollback.
+  managedState       Json?
   lastSyncedAt       DateTime @default(now())
   updatedAt          DateTime @updatedAt
 

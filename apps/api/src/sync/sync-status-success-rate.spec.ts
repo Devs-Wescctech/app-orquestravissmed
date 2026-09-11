@@ -49,6 +49,13 @@ function makeController(historyRuns: any[]) {
 }
 
 describe('successRate exclui runs skipped do denominador', () => {
+    it('partial completion is visible and is not full success', async () => {
+        const controller = makeController([run('completed_with_warnings'), run('completed')]);
+        const result = await controller.getSyncStatus(CLINIC, SUPER_ADMIN_REQ);
+        expect(result.successRate).toBe(50);
+        expect(result.health).toBe('warning');
+        expect(result.doctoralia.lastSync?.status).toBe('completed_with_warnings');
+    });
     it('skipped intercalados não reduzem o percentual (3 completed + 2 skipped = 100%)', async () => {
         const controller = makeController([
             run('completed'), run('skipped'), run('completed'), run('skipped'), run('completed'),

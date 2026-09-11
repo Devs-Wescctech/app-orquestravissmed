@@ -1,3 +1,4 @@
+import { managedSlotState, managedClearPayload, ManagedSlotState } from './managed-slot-ranges';
 import { Injectable, Logger } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
@@ -25,15 +26,16 @@ export class SlotSyncService {
         private stableCache: StableDataCacheService,
     ) {}
 
-    private async upsertSlotPushState(doctoraliaDoctorId: string, addressId: string, availabilityHash: string): Promise<void> {
+    private async upsertSlotPushState(doctoraliaDoctorId: string, addressId: string, availabilityHash: string, managedState?: ManagedSlotState): Promise<void> {
         try {
             await this.prisma.slotPushState.upsert({
                 where: { doctoraliaDoctorId_addressId: { doctoraliaDoctorId, addressId } },
-                create: { doctoraliaDoctorId, addressId, availabilityHash },
-                update: { availabilityHash, lastSyncedAt: new Date() },
+                create: { doctoraliaDoctorId, addressId, availabilityHash, managedState: managedState as any },
+                update: { availabilityHash, lastSyncedAt: new Date(), managedState: managedState as any },
             });
         } catch (err: any) {
             this.logger.warn(`Falha ao gravar SlotPushState (${doctoraliaDoctorId}/${addressId}): ${err.message}`);
+            throw err;
         }
     }
 
@@ -330,10 +332,6 @@ export class SlotSyncService {
             }
         }
 
-        // Cache de plan_id por provider_id (escopo: este médico). Evita N+1 quando o mesmo provider
-        // aparece em múltiplos endereços. Valor -1 significa "consultado e sem planos disponíveis".
-        const planCache = new Map<number, number>();
-
         for (const addr of doctoraliaAddresses) {
             const addrId = String(addr.id);
             addressesAttempted++;
@@ -356,6 +354,7 @@ export class SlotSyncService {
             } catch (error: any) {
                 this.logger.warn(`Failed to get services for addr ${addrId}: ${error.message}`);
                 addressesFailed++;
+                if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'error', `Endereço ${addrId}: falha ao consultar serviços; disponibilidade não enviada.`);
                 continue;
             }
 
@@ -367,6 +366,7 @@ export class SlotSyncService {
                     this.logger.log(`Doctor ${doctor.name} address ${addrId}: provisioned ${provisioned.length} service(s) from specialty mappings`);
                 } else {
                     this.logger.warn(`Doctor ${doctor.name} address ${addrId}: no specialty→service mappings available, skipping slot sync`);
+                    if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'mapping_pending', `Endereço ${addrId}: falta correspondência aprovada de especialidade e serviço.`);
                     continue;
                 }
             }
@@ -409,47 +409,26 @@ export class SlotSyncService {
                     .map(m => parseInt(m.externalId!, 10))
                     .filter(id => !isNaN(id));
 
-                // CRITICAL: para cada provider, busca o primeiro plano disponível na Doctoralia.
-                // O slot precisa de `insurance_plans` para a página pública marcar o convênio
-                // como "agendável online" (isBookable:true). Sem isso, a UI mostra a tag
-                // "(Não disponível para agendamentos online)" mesmo com providers vinculados.
-                // Cache evita N+1: o mesmo provider é consultado uma vez por sync (independe de quantos endereços/médicos).
-                const seenPlans = new Set<number>();
-                for (const providerId of insuranceProviderIds) {
-                    if (planCache.has(providerId)) {
-                        const cached = planCache.get(providerId)!;
-                        if (cached > 0 && !seenPlans.has(cached)) {
-                            insurancePlanIds.push(cached);
-                            seenPlans.add(cached);
-                        }
-                        continue;
-                    }
+                // Use plans actually linked to this address. A catalog's first plan may
+                // differ from the clinic's manual selection and is not an authorization.
+                if (insuranceProviderIds.length > 0) {
                     try {
-                        // WP-06: planos de convênio são estáveis — cache TTL por provider.
-                        const plansRes = await this.stableCache.getOrFetch(
-                            `${client.getCacheIdentity()}|insurancePlans|${providerId}`,
-                            STABLE_DATA_TTLS.insurancePlans,
-                            () => client.getInsurancePlans(String(providerId)),
-                        );
-                        const firstPlan = plansRes?._items?.[0];
-                        if (firstPlan?.id) {
-                            const planIdNum = parseInt(String(firstPlan.id), 10);
-                            if (!isNaN(planIdNum)) {
-                                planCache.set(providerId, planIdNum);
-                                if (!seenPlans.has(planIdNum)) {
-                                    insurancePlanIds.push(planIdNum);
-                                    seenPlans.add(planIdNum);
-                                }
-                            } else {
-                                planCache.set(providerId, -1);
+                        const response = await client.getAddressInsuranceProviders(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId);
+                        if (!Array.isArray(response?._items)) throw new Error('Resposta inválida de planos vinculados.');
+                        const desired = new Set(insuranceProviderIds.map(String));
+                        const seenPlans = new Set<number>();
+                        for (const provider of response._items) {
+                            if (!desired.has(String(provider.insurance_provider_id ?? provider.id))) continue;
+                            for (const plan of provider.insurance_plans?._items || []) {
+                                if (/^[1-9]\d*$/.test(String(plan.insurance_plan_id))) seenPlans.add(Number(plan.insurance_plan_id));
                             }
-                        } else {
-                            planCache.set(providerId, -1);
-                            this.logger.warn(`Doctor ${doctor.name} address ${addrId}: provider ${providerId} sem planos disponíveis — slot pode aparecer como "não agendável online"`);
                         }
-                    } catch (err: any) {
-                        // não cacheia erro: pode ser transitório, próxima execução tenta de novo
-                        this.logger.warn(`Doctor ${doctor.name} address ${addrId}: falha ao buscar planos do provider ${providerId}: ${err.message}`);
+                        insurancePlanIds = [...seenPlans];
+                    } catch (error) {
+                        addressesFailed++;
+                        if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'error',
+                            `Endereço ${addrId}: não foi possível confirmar planos vinculados; disponibilidade não enviada.`);
+                        continue;
                     }
                 }
 
@@ -504,7 +483,7 @@ export class SlotSyncService {
 
             if (allSlots.length === 0) {
                 // Médico TOTALMENTE bloqueado neste endereço (nenhuma faixa livre na janela).
-                // Só limpamos o calendário (replaceSlots []) se a foto está completa E havia algo
+                // Só limpamos intervalos comprovadamente enviados se a foto está completa E havia algo
                 // empurrado antes (estado prévio não-vazio). Senão, pulamos com aviso — evita
                 // wipe acidental de um calendário que nunca gerenciamos.
                 const prevWasNonEmpty = prevState && prevState.availabilityHash !== this.EMPTY_SLOTS_HASH;
@@ -514,11 +493,20 @@ export class SlotSyncService {
                         this.logger.log(`Doctor ${doctor.name} address ${addrId}: já vazio (hash igual), skip.`);
                         continue;
                     }
+                    const scope = { clinicId: clinicId || '', facilityId: String(dDoc.doctoraliaFacilityId), doctorId: String(dDoc.doctoraliaDoctorId), addressId: addrId };
+                    const clearPayload = managedClearPayload(prevState!.managedState, prevState!.availabilityHash, scope, dates);
+                    if (!clearPayload) {
+                        addressesFailed++;
+                        if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'managed_scope_pending',
+                            `Endereço ${addrId}: limpeza pendente de conferência dos intervalos gerenciados. Estado antigo ou fora da janela; nenhuma remoção enviada.`);
+                        continue;
+                    }
                     try {
-                        await client.replaceSlots(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, { slots: [] });
-                        await this.upsertSlotPushState(String(dDoc.doctoraliaDoctorId), addrId, availabilityHash);
+                        await client.replaceSlots(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, clearPayload);
+                        await this.upsertSlotPushState(String(dDoc.doctoraliaDoctorId), addrId, availabilityHash, managedSlotState(
+                            { clinicId: clinicId || '', facilityId: String(dDoc.doctoraliaFacilityId), doctorId: String(dDoc.doctoraliaDoctorId), addressId: addrId }, availabilityHash, allSlots));
                         addressesCleared++;
-                        const msg = `Doctor ${doctor.name} address ${addrId}: agenda totalmente bloqueada na VisMed — calendário Doctoralia limpo.`;
+                        const msg = `Doctor ${doctor.name} address ${addrId}: agenda bloqueada na VisMed; intervalos gerenciados na janela removidos da Doctoralia.`;
                         this.logger.log(msg);
                         if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'cleared', msg);
                     } catch (error: any) {
@@ -536,6 +524,10 @@ export class SlotSyncService {
             }
 
             if (source === 'availability' && prevState && prevState.availabilityHash === availabilityHash) {
+                if (!prevState.managedState) {
+                    await this.upsertSlotPushState(String(dDoc.doctoraliaDoctorId), addrId, availabilityHash, managedSlotState(
+                        { clinicId: clinicId || '', facilityId: String(dDoc.doctoraliaFacilityId), doctorId: String(dDoc.doctoraliaDoctorId), addressId: addrId }, availabilityHash, allSlots));
+                }
                 addressesUnchanged++;
                 this.logger.log(`Doctor ${doctor.name} address ${addrId}: disponibilidade inalterada (hash igual), skip replaceSlots.`);
                 if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'unchanged', `Doctor ${doctor.name} addr ${addrId}: disponibilidade inalterada, push pulado.`);
@@ -561,6 +553,7 @@ export class SlotSyncService {
                 } else if (status && status >= 400 && status < 500) {
                     this.logger.error(`Doctor ${doctor.name} address ${addrId}: calendar enable rejected (${status}): ${enableErr.message} — skipping slot sync for this address`);
                     addressesFailed++;
+                    if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'error', `Endereço ${addrId}: ativação do calendário recusada (${status}).`);
                     continue;
                 } else {
                     this.logger.warn(`Doctor ${doctor.name} address ${addrId}: transient error enabling calendar: ${enableErr.message} — proceeding with slot sync`);
@@ -578,7 +571,8 @@ export class SlotSyncService {
                 if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'doctoralia_response', `Doctor ${doctor.name} addr ${addrId}: resposta Doctoralia: ${respStr.substring(0, 400)}`);
 
                 totalSlots += allSlots.length;
-                await this.upsertSlotPushState(String(dDoc.doctoraliaDoctorId), addrId, availabilityHash);
+                await this.upsertSlotPushState(String(dDoc.doctoraliaDoctorId), addrId, availabilityHash, managedSlotState(
+                            { clinicId: clinicId || '', facilityId: String(dDoc.doctoraliaFacilityId), doctorId: String(dDoc.doctoraliaDoctorId), addressId: addrId }, availabilityHash, allSlots));
                 // WP-01: emit slot sync pushed event
                 try {
                     getDoctoraliaMetricsService()?.recordSlotSync({

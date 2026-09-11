@@ -1,4 +1,6 @@
 'use client';
+
+import { SyncRunReport, SyncReport } from '@/components/sync/SyncRunReport';
 import { useState, useEffect, useCallback } from 'react';
 import {
     RefreshCw, CheckCircle2, XCircle, Clock, AlertTriangle, Activity, Loader2,
@@ -36,7 +38,7 @@ interface SyncStatus {
     recentRuns: Array<{
         id: string; type: string; status: string;
         startedAt: string; endedAt: string | null; totalRecords: number;
-        metrics?: { skipReason?: string } | null;
+        metrics?: { skipReason?: string; report?: SyncReport } | null;
     }>;
 }
 
@@ -117,8 +119,9 @@ export default function SyncDashboardPage() {
     const formatDate = (dateStr: string) =>
         new Date(dateStr).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' });
 
-    type RunState = 'completed' | 'running' | 'failed' | 'skipped';
+    type RunState = 'completed_with_warnings' | 'completed' | 'running' | 'failed' | 'skipped';
     const getRunState = (run: { status: string; endedAt: string | null }): RunState => {
+        if (run.status === 'completed_with_warnings') return 'completed_with_warnings';
         if (run.status === 'completed') return 'completed';
         if (run.status === 'failed') return 'failed';
         if (run.status === 'skipped') return 'skipped';
@@ -356,11 +359,11 @@ export default function SyncDashboardPage() {
                     </div>
                     <div className="flex-1 min-w-0">
                         <p className="text-sm font-black text-amber-900">
-                            {status?.insurance.regressionWarnings} convênio(s) ficaram sem plano vinculado na última sincronização
+                            {status?.insurance.regressionWarnings} endereço(s) apresentaram convênios sem plano na última sincronização
                         </p>
                         <p className="text-xs text-amber-700 mt-1">
                             Sem plano vinculado, a página pública do médico mostra "Não disponível para agendamentos online".
-                            Rode a sincronização novamente — o sistema tenta vincular o primeiro plano automaticamente.
+                            Confira as pendências: se houver vários planos, selecione os aceitos no endereço da Doctoralia; se não houver plano disponível, revise o cadastro com a Doctoralia.
                         </p>
                         {(status?.insurance.regressionDetails || []).length > 0 && (
                             <details className="mt-3">
@@ -522,17 +525,17 @@ export default function SyncDashboardPage() {
                             status?.recentRuns.map((run) => {
                                 const runState = getRunState(run);
                                 return (
-                                <div key={run.id} className="p-6 px-8 flex items-center justify-between hover:bg-slate-50/50 transition-all cursor-default group/item">
+                                <div key={run.id} className="p-6 px-8 flex flex-col md:flex-row gap-4 items-start md:items-center justify-between hover:bg-slate-50/50 transition-all cursor-default group/item">
                                     <div className="flex items-center gap-5">
                                         <div className={`h-14 w-14 rounded-2xl flex items-center justify-center shrink-0 border-2 transition-all group-hover/item:scale-105 shadow-lg ${
                                             runState === 'completed' ? 'bg-white border-emerald-100 text-primary shadow-emerald-100/20' :
                                             runState === 'running' ? 'bg-white border-blue-100 text-blue-500 shadow-blue-100/20' :
-                                            runState === 'skipped' ? 'bg-white border-amber-100 text-amber-500 shadow-amber-100/20' :
+                                            (runState === 'skipped' || runState === 'completed_with_warnings') ? 'bg-white border-amber-100 text-amber-500 shadow-amber-100/20' :
                                             'bg-white border-rose-100 text-rose-500 shadow-rose-100/20'
                                         }`}>
                                             {runState === 'running' ? <Loader2 className="h-6 w-6 animate-spin" /> :
                                                 runState === 'completed' ? <CheckCircle2 className="h-6 w-6" /> :
-                                                runState === 'skipped' ? <Clock className="h-6 w-6" /> :
+                                                (runState === 'skipped' || runState === 'completed_with_warnings') ? <Clock className="h-6 w-6" /> :
                                                 <AlertTriangle className="h-6 w-6" />}
                                         </div>
                                         <div>
@@ -541,8 +544,9 @@ export default function SyncDashboardPage() {
                                             </h4>
                                             <div className="flex items-center gap-3 mt-2">
                                                 <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest bg-slate-100 px-2 py-0.5 rounded-lg">ID #{run.id.slice(0, 6)}</span>
-                                                <p className="text-[11px] font-bold text-slate-500 uppercase tracking-tight">{run.totalRecords} Registros</p>
+                                                <p className="text-[11px] font-bold text-slate-500 uppercase tracking-tight">{run.totalRecords} {run.metrics?.report?.version === 2 ? 'verificados' : 'registros'}</p>
                                             </div>
+                                            <SyncRunReport report={run.metrics?.report} />
                                             {runState === 'skipped' && (
                                                 <p className="text-[11px] font-semibold text-amber-600 mt-2 max-w-md leading-snug">
                                                     {getSkipMessage(run.metrics)}
@@ -555,10 +559,10 @@ export default function SyncDashboardPage() {
                                             <span className={`px-3 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest shadow-sm ${
                                                 runState === 'completed' ? 'bg-primary text-white' :
                                                 runState === 'running' ? 'bg-blue-500 text-white' :
-                                                runState === 'skipped' ? 'bg-amber-500 text-white' :
+                                                (runState === 'skipped' || runState === 'completed_with_warnings') ? 'bg-amber-500 text-white' :
                                                 'bg-rose-500 text-white'
                                             }`}>
-                                                {runState === 'completed' ? 'Sucesso' : runState === 'running' ? 'Processando' : runState === 'skipped' ? 'Pulado' : 'Falha'}
+                                                {runState === 'completed_with_warnings' ? 'Concluída com pendências' : runState === 'completed' ? 'Sucesso' : runState === 'running' ? 'Processando' : runState === 'skipped' ? 'Pulado' : 'Falha'}
                                             </span>
                                             <p className="text-[10px] font-black text-slate-400 mt-2 flex items-center justify-end gap-1.5 uppercase tracking-widest">
                                                 <Clock className="h-3.5 w-3.5 opacity-50" />

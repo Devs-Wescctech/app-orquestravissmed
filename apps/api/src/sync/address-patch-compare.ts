@@ -24,19 +24,10 @@ export function normalizeAddressField(field: string, value: string | null | unde
     return s;
 }
 
-/**
- * Campos cujo formato de resposta do GET /addresses foi confirmado como
- * equivalente ao payload local, habilitando comparação condicional.
- *
- * EXCLUÍDOS da comparação (comportamento conservador — sempre enviados no PATCH):
- *   - 'street': o payload local é uma string concatenada
- *     (addressStreet + ", " + addressNumber + " - " + complement + " (" + neighborhood + ")")
- *     com separadores aplicados localmente. O GET /addresses devolve um campo único
- *     cujo formato pode diferir (separadores, capitalização, espaços extras, ordenação).
- *     Sem garantia de equivalência → excluído da comparação para evitar PATCH permanente
- *     por diferença meramente cosmética.
- */
+/** Compare only the returned field itself. Street uses exact text after trim;
+ * cosmetic differences are not treated as equal. Missing remote values cause a PATCH. */
 export const COMPARABLE_ADDRESS_FIELDS: ReadonlyArray<string> = [
+    'street',            // igualdade literal após trim; formatos diferentes continuam enviados
     'insurance_support', // enum; normalizado para lowercase
     'city_name',         // string simples; trim suficiente
     'post_code',         // CEP; remove não-numéricos antes de comparar
@@ -50,7 +41,7 @@ export const COMPARABLE_ADDRESS_FIELDS: ReadonlyArray<string> = [
  *   2. Para cada campo comparável presente no payload, o valor normalizado é
  *      igual ao valor remoto normalizado.
  *
- * Se o payload contiver qualquer campo não-comparável (ex.: 'street'), retorna
+ * Se o payload contiver qualquer campo não-comparável, retorna
  * `false` imediatamente (comportamento conservador).
  *
  * Campos ausentes do payload (enviados como undefined / não incluídos) são

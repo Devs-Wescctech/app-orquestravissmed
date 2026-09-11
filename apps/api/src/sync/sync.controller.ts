@@ -11,6 +11,7 @@ import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 import { randomUUID } from 'crypto';
 import { ClinicConcurrencyGuard } from '../bookings/clinic-concurrency-guard';
 import { getDoctoraliaMetricsService, concurrencyActorOf } from '../metrics/doctoralia-metrics.service';
+import { classifySyncEvents } from './sync-observation';
 
 @ApiTags('sync')
 @ApiBearerAuth()
@@ -109,7 +110,7 @@ export class SyncController {
     @Post(':clinicId/run')
     async runSync(@Param('clinicId') clinicId: string, @Request() req: any) {
         this.validateUserClinicAccess(req.user, clinicId);
-        return this.syncService.triggerManualSync(clinicId, 'full');
+        return this.syncService.triggerManualSync(clinicId, 'full', undefined, true);
     }
 
     @ApiOperation({ summary: 'Dispara a rotina de sincronismo global (Doctoralia + VisMed)' })
@@ -120,7 +121,7 @@ export class SyncController {
         @Request() req?: any,
     ) {
         this.validateUserClinicAccess(req?.user, clinicId);
-        return this.syncService.triggerGlobalSync(clinicId, idEmpresa);
+        return this.syncService.triggerGlobalSync(clinicId, idEmpresa, true);
     }
 
     @Get('vismed/stats')
@@ -161,7 +162,7 @@ export class SyncController {
             include: { events: true },
         });
 
-        const lastCompleted = lastRuns.find(r => r.status === 'completed');
+        const lastCompleted = lastRuns.find(r => ['completed', 'completed_with_warnings'].includes(r.status));
         const isRunning = lastRuns.some(r => r.status === 'running');
         const lastFailed = lastRuns.find(r => r.status === 'failed');
 
@@ -184,7 +185,7 @@ export class SyncController {
         let overallHealth: 'healthy' | 'warning' | 'error' | 'never_synced' = 'healthy';
         if (!lastCompleted) overallHealth = 'never_synced';
         else if (lastFailed && lastCompleted && new Date(lastFailed.startedAt) > new Date(lastCompleted.startedAt)) overallHealth = 'error';
-        else if (pendingInsurance > 0 || unlinkedInsurance > 0) overallHealth = 'warning';
+        else if (lastCompleted.status === 'completed_with_warnings' || pendingInsurance > 0 || unlinkedInsurance > 0) overallHealth = 'warning';
 
         const [vismedStats, doctoraliaConn, vismedConn] = await Promise.all([
             Promise.all([
@@ -209,7 +210,8 @@ export class SyncController {
         });
 
         const lastVismedRun = allHistoryRuns.find(r => r.type === 'vismed-full');
-        const lastDoctoraliaRun = allHistoryRuns.find(r => r.type === 'full' && r.status === 'completed');
+        const lastDoctoraliaRun = allHistoryRuns.find(r => r.type === 'full' && ['completed', 'completed_with_warnings'].includes(r.status));
+        if (lastDoctoraliaRun?.status === 'completed_with_warnings' && overallHealth !== 'error') overallHealth = 'warning';
 
         // Runs 'skipped' (ex.: concurrency guard) não são execuções efetivas — ficam fora do denominador
         const executedRuns = allHistoryRuns.filter(r => r.status !== 'skipped');
@@ -223,7 +225,7 @@ export class SyncController {
         const lastInsRun = await this.prisma.syncRun.findFirst({
             where: {
                 clinicId,
-                status: 'completed',
+                status: { in: ['completed', 'completed_with_warnings'] },
                 type: { in: ['full', 'insurance'] },
                 events: { some: { entityType: 'INSURANCE_PUSH' } },
             },
@@ -235,12 +237,12 @@ export class SyncController {
                 where: {
                     syncRunId: lastInsRun.id,
                     entityType: 'INSURANCE_PUSH',
-                    action: 'regression_warning',
+                    action: { in: ['regression_warning', 'plan_pending', 'provider_pending'] },
                 },
                 orderBy: { timestamp: 'desc' },
-                select: { message: true, timestamp: true },
+                select: { message: true, timestamp: true, action: true },
             });
-            insuranceRegressionWarnings = regressionEvents.length;
+            insuranceRegressionWarnings = regressionEvents.filter(e => e.action === 'regression_warning').length;
             insuranceRegressionDetails.push(...regressionEvents.slice(0, 10));
         }
         if (insuranceRegressionWarnings > 0 && overallHealth === 'healthy') overallHealth = 'warning';
@@ -583,9 +585,12 @@ export class SyncController {
                 }
             }
 
+            const issues = classifySyncEvents(await this.prisma.syncEvent.findMany({
+                where: { syncRunId: syncRun.id }, select: { entityType: true, action: true },
+            }));
             await this.prisma.syncRun.update({
                 where: { id: syncRun.id },
-                data: { status: 'completed', endedAt: new Date(), totalRecords: results.length },
+                data: { status: issues.errors + issues.warnings > 0 ? 'completed_with_warnings' : 'completed', endedAt: new Date(), totalRecords: results.length },
             });
         } catch (err: any) {
             await this.prisma.syncRun.update({

@@ -1,3 +1,5 @@
+import { observeSync, beginSyncStage, differentialUpsert, recordOutcome, currentRecordTotal } from './sync-observation';
+import { refreshCatalogs } from './catalog-refresh';
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
@@ -38,7 +40,7 @@ export class SyncService {
         return connections.some(c => c.status === 'paused');
     }
 
-    async triggerManualSync(clinicId: string, type: 'full' | 'doctors' | 'services' | 'vismed-full' = 'full', idEmpresaGestora?: number) {
+    async triggerManualSync(clinicId: string, type: 'full' | 'doctors' | 'services' | 'vismed-full' = 'full', idEmpresaGestora?: number, refreshCatalog = false) {
         const paused = await this.isQueuePaused(clinicId);
         if (paused) {
             this.logger.warn(`Sync queue is paused for clinic ${clinicId}, rejecting ${type} sync`);
@@ -61,6 +63,10 @@ export class SyncService {
                 status: 'running',
             }
         });
+
+        if (refreshCatalog && type === 'full') {
+            await this.logEvent(syncRun.id, 'CATALOG', 'catalog_refresh_requested', 'Atualização manual dos catálogos solicitada.');
+        }
 
         if (type === 'vismed-full') {
             // RESOLUÇÃO FAIL-CLOSED: nunca cair no default global nem na empresa 286.
@@ -228,9 +234,9 @@ export class SyncService {
         }
     }
 
-    async triggerGlobalSync(clinicId: string, idEmpresaGestora?: number) {
+    async triggerGlobalSync(clinicId: string, idEmpresaGestora?: number, refreshCatalog = false) {
         const vismedRun = await this.triggerManualSync(clinicId, 'vismed-full', idEmpresaGestora);
-        const doctoraliaRun = await this.triggerManualSync(clinicId, 'full');
+        const doctoraliaRun = await this.triggerManualSync(clinicId, 'full', undefined, refreshCatalog);
         return { vismedRunId: vismedRun.id, doctoraliaRunId: doctoraliaRun.id };
     }
 
@@ -574,6 +580,10 @@ export class SyncService {
     }
 
     private async _runDoctoraliaSyncDirectBody(syncRunId: string, clinicId: string) {
+        return observeSync(this.prisma, syncRunId, () => this._doctoraliaBody(syncRunId, clinicId));
+    }
+
+    private async _doctoraliaBody(syncRunId: string, clinicId: string) {
         try {
             const conn = await this.prisma.integrationConnection.findFirst({
                 where: { clinicId, provider: 'doctoralia' }
@@ -593,7 +603,6 @@ export class SyncService {
             );
             const facilitiesList = facilitiesInfo._items || [];
             await this.logEvent(syncRunId, 'FACILITY', 'fetch_success', `Found ${facilitiesList.length} facilities`);
-            let totalProcessed = facilitiesList.length;
 
             if (facilitiesList.length === 0) {
                 await this.completeSyncRun(syncRunId);
@@ -622,10 +631,9 @@ export class SyncService {
                 const docId = String(doc.id);
                 activeDoctorIds.push(docId);
                 await this.saveGenericMapping(clinicId, 'DOCTOR', docId, doc, syncRunId);
-                totalProcessed++;
 
                 const doctorUpsert = buildDoctoraliaDoctorUpsertData(doc, facilityId);
-                const doctoraliaDoctor = await this.prisma.doctoraliaDoctor.upsert({
+                const doctoraliaDoctor = await differentialUpsert(this.prisma.doctoraliaDoctor, 'doctors', {
                     where: { doctoraliaDoctorId: docId },
                     create: doctorUpsert.create,
                     update: doctorUpsert.update,
@@ -659,13 +667,13 @@ export class SyncService {
                                 activeServiceIds.push(srvId);
                                 allServicesMap.set(srvId, srv);
                                 const normName = (srv.name || `Service #${srvId}`).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
-                                const doctoraliaService = await this.prisma.doctoraliaService.upsert({
+                                const doctoraliaService = await differentialUpsert(this.prisma.doctoraliaService, 'services', {
                                     where: { doctoraliaServiceId: srvId },
                                     create: { doctoraliaServiceId: srvId, name: srv.name || `Service #${srvId}`, normalizedName: normName },
                                     update: { name: srv.name || `Service #${srvId}`, normalizedName: normName }
                                 });
                                 const addrServiceId = linkId;
-                                await this.prisma.doctoraliaAddressService.upsert({
+                                await differentialUpsert(this.prisma.doctoraliaAddressService, 'address_services', {
                                     where: { doctoraliaAddressServiceId: addrServiceId },
                                     update: {
                                         price: srv.price, isPriceFrom: srv.is_price_from || false,
@@ -682,7 +690,7 @@ export class SyncService {
                                     }
                                 });
                             }
-                        } catch (e) { }
+                        } catch (e) { await this.logEvent(syncRunId, 'SERVICE', 'fetch_error', 'Falha ao atualizar serviços de um endereço.'); }
 
                         try {
                             const insRes = await client.getAddressInsuranceProviders(facilityId, docId, addrId);
@@ -694,7 +702,7 @@ export class SyncService {
                                     const aipName = aip.name || aip.insurance_provider_name;
                                     if (!aipId || !aipName) continue;
                                     const normName = (aipName || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
-                                    await this.prisma.doctoraliaInsuranceProvider.upsert({
+                                    await differentialUpsert(this.prisma.doctoraliaInsuranceProvider, 'insurances', {
                                         where: { doctoraliaId: Number(aipId) },
                                         create: { doctoraliaId: Number(aipId), name: aipName, normalizedName: normName },
                                         update: { name: aipName, normalizedName: normName }
@@ -712,110 +720,7 @@ export class SyncService {
                 await this.saveGenericMapping(clinicId, 'SERVICE', srvId, srv, syncRunId);
             }
 
-            this.logger.log('Importando dicionário global de Serviços da Doctoralia...');
-            await this.updateSyncStatus(syncRunId, 'importing_services_dictionary');
-            try {
-                const dictRes = await this.stableCache.getOrFetch(
-                    `${client.getCacheIdentity()}|servicesDictionary`,
-                    STABLE_DATA_TTLS.servicesDictionary,
-                    () => client.getServicesDictionary(),
-                );
-                const dictItems = dictRes._items || [];
-                this.logger.log(`Dicionário de Serviços: ${dictItems.length} encontrados.`);
-                await this.logEvent(syncRunId, 'SERVICE_CATALOG', 'fetch_success', `Dicionário global: ${dictItems.length} serviços encontrados.`);
-
-                let savedSvcCount = 0;
-                const BATCH = 500;
-                for (let i = 0; i < dictItems.length; i += BATCH) {
-                    const slice = dictItems.slice(i, i + BATCH);
-                    const values: string[] = [];
-                    const params: any[] = [];
-                    let p = 1;
-                    for (const item of slice) {
-                        const svcId = String(item.id);
-                        const svcName = item.name || `Service #${svcId}`;
-                        const normName = svcName.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
-                        values.push(`($${p++}, $${p++}, $${p++}, NOW(), NOW())`);
-                        params.push(svcId, svcName, normName);
-                    }
-                    const sql = `
-                        INSERT INTO "DoctoraliaService" ("id", "doctoraliaServiceId", "name", "normalizedName", "createdAt", "updatedAt")
-                        SELECT gen_random_uuid(), v.sid, v.nm, v.norm, NOW(), NOW()
-                        FROM (VALUES ${values.join(',')}) AS v(sid, nm, norm, c, u)
-                        ON CONFLICT ("doctoraliaServiceId")
-                        DO UPDATE SET "name" = EXCLUDED."name", "normalizedName" = EXCLUDED."normalizedName", "updatedAt" = NOW()
-                    `;
-                    try {
-                        await this.prisma.$executeRawUnsafe(sql, ...params);
-                        savedSvcCount += slice.length;
-                    } catch (batchErr: any) {
-                        this.logger.warn(`Falha em batch de ${slice.length} serviços (offset ${i}): ${batchErr?.message}`);
-                    }
-                    if (savedSvcCount > 0 && (savedSvcCount % 2000 === 0 || (i + BATCH) >= dictItems.length)) {
-                        this.logger.log(`Dicionário de Serviços: ${savedSvcCount}/${dictItems.length} salvos...`);
-                    }
-                }
-                totalProcessed += savedSvcCount;
-                this.logger.log(`Dicionário de Serviços: ${savedSvcCount} salvos no dicionário local.`);
-            } catch (catalogError: any) {
-                this.logger.warn(`Falha ao importar dicionário de serviços: ${catalogError.message}`);
-                await this.logEvent(syncRunId, 'SERVICE_CATALOG', 'fetch_error', `Erro: ${catalogError.message}`);
-            }
-
-            this.logger.log('Importando dicionário global de Insurance Providers da Doctoralia...');
-            await this.updateSyncStatus(syncRunId, 'syncing_insurance_providers');
-            try {
-                const insProvidersRes = await this.stableCache.getOrFetch(
-                    `${client.getCacheIdentity()}|insuranceProviders`,
-                    STABLE_DATA_TTLS.insuranceProviders,
-                    () => client.getInsuranceProviders(),
-                );
-                const insProviders = insProvidersRes._items || [];
-                this.logger.log(`Insurance Providers: ${insProviders.length} encontrados no dicionário global.`);
-                await this.logEvent(syncRunId, 'INSURANCE', 'fetch_success', `Dicionário global: ${insProviders.length} insurance providers encontrados.`);
-
-                let savedCount = 0;
-                const IP_BATCH = 500;
-                const validItems = insProviders.filter((ip: any) => {
-                    const ipId = ip.insurance_provider_id || ip.id;
-                    const ipName = ip.name || ip.insurance_provider_name;
-                    return ipId && ipName;
-                });
-                for (let i = 0; i < validItems.length; i += IP_BATCH) {
-                    const slice = validItems.slice(i, i + IP_BATCH);
-                    const values: string[] = [];
-                    const params: any[] = [];
-                    let p = 1;
-                    for (const ip of slice) {
-                        const ipId = Number(ip.insurance_provider_id || ip.id);
-                        const ipName = ip.name || ip.insurance_provider_name;
-                        const normName = (ipName || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
-                        values.push(`($${p++}::int, $${p++}, $${p++})`);
-                        params.push(ipId, ipName, normName);
-                    }
-                    const sql = `
-                        INSERT INTO "DoctoraliaInsuranceProvider" ("id", "doctoraliaId", "name", "normalizedName", "createdAt", "updatedAt")
-                        SELECT gen_random_uuid(), v.did, v.nm, v.norm, NOW(), NOW()
-                        FROM (VALUES ${values.join(',')}) AS v(did, nm, norm)
-                        ON CONFLICT ("doctoraliaId")
-                        DO UPDATE SET "name" = EXCLUDED."name", "normalizedName" = EXCLUDED."normalizedName", "updatedAt" = NOW()
-                    `;
-                    try {
-                        await this.prisma.$executeRawUnsafe(sql, ...params);
-                        savedCount += slice.length;
-                    } catch (batchErr: any) {
-                        this.logger.warn(`Falha em batch de ${slice.length} insurance providers (offset ${i}): ${batchErr?.message}`);
-                    }
-                    if (savedCount > 0 && (savedCount % 1000 === 0 || (i + IP_BATCH) >= validItems.length)) {
-                        this.logger.log(`Insurance Providers: ${savedCount}/${validItems.length} salvos...`);
-                    }
-                }
-                totalProcessed += savedCount;
-                this.logger.log(`Insurance Providers: ${savedCount} salvos no dicionário local.`);
-            } catch (insErr: any) {
-                this.logger.warn(`Falha ao importar insurance providers: ${insErr.message}`);
-                await this.logEvent(syncRunId, 'INSURANCE', 'fetch_error', `Erro: ${insErr.message}`);
-            }
+            await refreshCatalogs(this.prisma, client, conn, syncRunId);
 
             await this.updateSyncStatus(syncRunId, 'running_matching_engine');
             await this.matchingEngine.runMatchingForUnmatched(clinicId);
@@ -825,8 +730,8 @@ export class SyncService {
             await this.pushSync.pushToDoctoralia(clinicId, syncRunId, client);
 
             await this.cleanupOrphans(clinicId, syncRunId, activeDoctorIds, activeServiceIds);
-            await this.completeSyncRun(syncRunId, totalProcessed);
-            this.logger.log(`[DIRECT] Doctoralia sync completed: ${totalProcessed} records.`);
+            await this.completeSyncRun(syncRunId, currentRecordTotal());
+            this.logger.log(`[DIRECT] Doctoralia sync completed: ${currentRecordTotal()} records verified.`);
         } catch (e) {
             // WP-08A: circuito Doctoralia aberto → finaliza o run como SKIPPED explícito
             // (não é falha da clínica; a próxima janela do scheduler cobre). Nunca
@@ -849,7 +754,9 @@ export class SyncService {
 
     private async saveGenericMapping(clinicId: string, type: any, externalId: string, item: any, syncRunId: string) {
         const name = item.name || item.title || (item.surname ? `${item.name} ${item.surname}` : `Item #${externalId}`);
-        await this.prisma.mapping.upsert({
+        const existing = await this.prisma.mapping.findUnique({ where: { clinicId_entityType_externalId: { clinicId, entityType: type, externalId } } });
+        if (type === 'LOCATION') recordOutcome('facilities', externalId, !existing ? 'created' : existing.status === 'ORPHAN' ? 'updated' : 'unchanged');
+        await differentialUpsert(this.prisma.mapping, '', {
             where: { clinicId_entityType_externalId: { clinicId, entityType: type, externalId } },
             create: { clinicId, entityType: type, externalId, status: 'UNLINKED', conflictData: { ...item, name, externalId } },
             update: {
@@ -889,7 +796,8 @@ export class SyncService {
     }
 
     private async updateSyncStatus(id: string, status: string) {
-        await this.prisma.syncRun.update({ where: { id }, data: { status } });
+        beginSyncStage(status);
+        await this.prisma.syncRun.update({ where: { id }, data: { status: 'running' } });
     }
 
     private async completeSyncRun(id: string, totalRecords = 0) {

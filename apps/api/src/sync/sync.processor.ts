@@ -1,3 +1,5 @@
+import { observeSync, beginSyncStage, differentialUpsert, recordOutcome, currentRecordTotal } from './sync-observation';
+import { refreshCatalogs } from './catalog-refresh';
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Job } from 'bullmq';
 import { Logger } from '@nestjs/common';
@@ -86,6 +88,10 @@ export class SyncProcessor extends WorkerHost {
     }
 
     private async _processInner(job: Job<any, any, string>, syncRunId: string, clinicId: string): Promise<any> {
+        return observeSync(this.prisma, syncRunId, () => this._processBody(job, syncRunId, clinicId));
+    }
+
+    private async _processBody(job: Job<any, any, string>, syncRunId: string, clinicId: string) {
         try {
             const conn = await this.prisma.integrationConnection.findFirst({
                 where: { clinicId, provider: 'doctoralia' }
@@ -107,8 +113,6 @@ export class SyncProcessor extends WorkerHost {
             );
             const facilitiesList = facilitiesInfo._items || [];
             await this.logEvent(syncRunId, 'FACILITY', 'fetch_success', `Found ${facilitiesList.length} facilities`);
-            let totalProcessed = 0;
-            totalProcessed += facilitiesList.length;
 
             if (facilitiesList.length === 0) {
                 await this.completeSync(syncRunId);
@@ -134,9 +138,9 @@ export class SyncProcessor extends WorkerHost {
             );
             const doctorsList = docsRes._items || [];
             await this.logEvent(syncRunId, 'DOCTOR', 'fetch_success', `Found ${doctorsList.length} doctors`);
-            totalProcessed += doctorsList.length;
-            // totalProcessed += doctorsList.length; // This will be updated incrementally inside the loop
-            await this.prisma.syncRun.update({ where: { id: syncRunId }, data: { totalRecords: totalProcessed } });
+
+
+            await this.prisma.syncRun.update({ where: { id: syncRunId }, data: { totalRecords: currentRecordTotal() } });
 
             const activeDoctorIds: string[] = [];
             const activeServiceIds: string[] = [];
@@ -148,11 +152,10 @@ export class SyncProcessor extends WorkerHost {
 
                 // Save generic mapping
                 await this.saveGenericMapping(clinicId, 'DOCTOR', docId, doc, syncRunId);
-                totalProcessed++; // Increment totalProcessed for each doctor
 
                 // Save typed table
                 const doctorUpsert = buildDoctoraliaDoctorUpsertData(doc, facilityId);
-                const doctoraliaDoctor = await this.prisma.doctoraliaDoctor.upsert({
+                const doctoraliaDoctor = await differentialUpsert(this.prisma.doctoraliaDoctor, 'doctors', {
                     where: { doctoraliaDoctorId: docId },
                     create: doctorUpsert.create,
                     update: doctorUpsert.update,
@@ -190,7 +193,7 @@ export class SyncProcessor extends WorkerHost {
                                 const normName = (srv.name || `Service #${srvId}`).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
 
                                 // Save Global Service Dictionary Item
-                                const doctoraliaService = await this.prisma.doctoraliaService.upsert({
+                                const doctoraliaService = await differentialUpsert(this.prisma.doctoraliaService, 'services', {
                                     where: { doctoraliaServiceId: srvId },
                                     create: {
                                         doctoraliaServiceId: srvId,
@@ -205,7 +208,7 @@ export class SyncProcessor extends WorkerHost {
 
                                 // Save Address Service Association (Pivot) — chave = id real do vínculo
                                 const addrServiceId = linkId;
-                                await this.prisma.doctoraliaAddressService.upsert({
+                                await differentialUpsert(this.prisma.doctoraliaAddressService, 'address_services', {
                                     where: { doctoraliaAddressServiceId: addrServiceId },
                                     update: {
                                         price: srv.price,
@@ -230,7 +233,7 @@ export class SyncProcessor extends WorkerHost {
                                 });
                             }
                         } catch (e) {
-                            // Ignore address without services
+                            await this.logEvent(syncRunId, 'SERVICE', 'fetch_error', 'Falha ao atualizar serviços de um endereço.');
                         }
 
                         try {
@@ -243,7 +246,7 @@ export class SyncProcessor extends WorkerHost {
                                     const aipName = aip.name || aip.insurance_provider_name;
                                     if (!aipId || !aipName) continue;
                                     const normName = (aipName || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
-                                    await this.prisma.doctoraliaInsuranceProvider.upsert({
+                                    await differentialUpsert(this.prisma.doctoraliaInsuranceProvider, 'insurances', {
                                         where: { doctoraliaId: Number(aipId) },
                                         create: { doctoraliaId: Number(aipId), name: aipName, normalizedName: normName },
                                         update: { name: aipName, normalizedName: normName }
@@ -255,14 +258,14 @@ export class SyncProcessor extends WorkerHost {
                         }
                     }
                 } catch (e) {
-                    // Ignore doc without addresses
+                    await this.logEvent(syncRunId, 'DOCTOR', 'fetch_error', 'Falha ao atualizar endereços de um profissional.');
                 }
 
                 // Real-time progress update for doctors loop
                 if (activeDoctorIds.length % 5 === 0) {
                     await this.prisma.syncRun.update({
                         where: { id: syncRunId },
-                        data: { totalRecords: totalProcessed }
+                        data: { totalRecords: currentRecordTotal() }
                     });
                 }
             }
@@ -273,96 +276,20 @@ export class SyncProcessor extends WorkerHost {
             }
 
             // Update Run metrics for Orphans cleanup
+            const priorRun = await this.prisma.syncRun.findUnique({ where: { id: syncRunId }, select: { metrics: true } });
             await this.prisma.syncRun.update({
                 where: { id: syncRunId },
                 data: {
                     metrics: {
+                        ...(priorRun?.metrics as any || {}),
                         last_active_doctors: activeDoctorIds,
                         last_active_services: activeServiceIds
                     }
                 }
             });
 
-            this.logger.log('Importando dicionário global de Serviços da Doctoralia...');
-            await this.updateSyncStatus(syncRunId, 'importing_services_dictionary');
-            try {
-                const dictRes = await this.stableCache.getOrFetch(
-                    `${client.getCacheIdentity()}|servicesDictionary`,
-                    STABLE_DATA_TTLS.servicesDictionary,
-                    () => client.getServicesDictionary(),
-                );
-                const dictItems = dictRes._items || [];
-                this.logger.log(`Dicionário de Serviços: ${dictItems.length} encontrados.`);
-                await this.logEvent(syncRunId, 'SERVICE_CATALOG', 'fetch_success', `Dicionário global: ${dictItems.length} serviços encontrados.`);
+            await refreshCatalogs(this.prisma, client, conn, syncRunId);
 
-                let savedSvcCount = 0;
-                for (const item of dictItems) {
-                    const svcId = String(item.id);
-                    const svcName = item.name || `Service #${svcId}`;
-                    try {
-                        const normName = svcName.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
-                        await this.prisma.doctoraliaService.upsert({
-                            where: { doctoraliaServiceId: svcId },
-                            update: { name: svcName, normalizedName: normName },
-                            create: { doctoraliaServiceId: svcId, name: svcName, normalizedName: normName }
-                        });
-                        savedSvcCount++;
-                    } catch (itemErr: any) {
-                        this.logger.debug(`Falha ao salvar serviço ${svcId}: ${itemErr?.message}`);
-                    }
-                    if (savedSvcCount % 500 === 0) {
-                        this.logger.log(`Dicionário de Serviços: ${savedSvcCount}/${dictItems.length} salvos...`);
-                    }
-                }
-                totalProcessed += savedSvcCount;
-                this.logger.log(`Dicionário de Serviços: ${savedSvcCount} salvos no dicionário local.`);
-                await this.prisma.syncRun.update({ where: { id: syncRunId }, data: { totalRecords: totalProcessed } });
-            } catch (catalogError: any) {
-                this.logger.warn(`Falha ao importar dicionário de serviços: ${catalogError.message}`);
-                await this.logEvent(syncRunId, 'SERVICE_CATALOG', 'fetch_error', `Erro: ${catalogError.message}`);
-            }
-
-            // 4. Insurance Providers (Global Dictionary) — before matching so convênios can match
-            this.logger.log('Importando dicionário global de Insurance Providers da Doctoralia...');
-            await this.updateSyncStatus(syncRunId, 'syncing_insurance_providers');
-            try {
-                const insProvidersRes = await this.stableCache.getOrFetch(
-                    `${client.getCacheIdentity()}|insuranceProviders`,
-                    STABLE_DATA_TTLS.insuranceProviders,
-                    () => client.getInsuranceProviders(),
-                );
-                const insProviders = insProvidersRes._items || [];
-                this.logger.log(`Insurance Providers: ${insProviders.length} encontrados no dicionário global.`);
-                await this.logEvent(syncRunId, 'INSURANCE', 'fetch_success', `Dicionário global: ${insProviders.length} insurance providers encontrados.`);
-
-                let savedCount = 0;
-                for (const ip of insProviders) {
-                    const ipId = ip.insurance_provider_id || ip.id;
-                    const ipName = ip.name || ip.insurance_provider_name;
-                    if (!ipId || !ipName) continue;
-                    try {
-                        const normName = (ipName || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
-                        await this.prisma.doctoraliaInsuranceProvider.upsert({
-                            where: { doctoraliaId: Number(ipId) },
-                            create: { doctoraliaId: Number(ipId), name: ipName, normalizedName: normName },
-                            update: { name: ipName, normalizedName: normName }
-                        });
-                        savedCount++;
-                    } catch (itemErr: any) {
-                        this.logger.debug(`Falha ao salvar insurance provider ${ipId}: ${itemErr?.message}`);
-                    }
-                    if (savedCount % 100 === 0) {
-                        this.logger.log(`Insurance Providers: ${savedCount}/${insProviders.length} salvos...`);
-                    }
-                }
-                totalProcessed += savedCount;
-                this.logger.log(`Insurance Providers: ${savedCount} salvos no dicionário local.`);
-            } catch (insErr: any) {
-                this.logger.warn(`Falha ao importar insurance providers: ${insErr?.message}`);
-                await this.logEvent(syncRunId, 'INSURANCE', 'fetch_error', `Erro: ${insErr?.message}`);
-            }
-
-            this.logger.log('Sincronização de Entidades Padrão concluídas. Acionando Rescan de Matching...');
             await this.updateSyncStatus(syncRunId, 'running_matching_engine');
             await this.matchingEngine.runMatchingForUnmatched(clinicId);
 
@@ -374,7 +301,7 @@ export class SyncProcessor extends WorkerHost {
             // 6. Cleanup Orphans
             await this.cleanupOrphans(clinicId, syncRunId);
 
-            await this.completeSync(syncRunId, totalProcessed);
+            await this.completeSync(syncRunId, currentRecordTotal());
             return { status: 'success' };
         } catch (error: any) {
             this.logger.error(`Failed sync job ${job.id}: ${error.message}`);
@@ -427,6 +354,7 @@ export class SyncProcessor extends WorkerHost {
             }
         });
 
+        if (type === 'LOCATION') recordOutcome('facilities', externalId, !existingMapping ? 'created' : existingMapping.status === 'ORPHAN' ? 'updated' : 'unchanged');
         if (!existingMapping) {
             await this.prisma.mapping.create({
                 data: {
@@ -479,7 +407,8 @@ export class SyncProcessor extends WorkerHost {
     }
 
     private async updateSyncStatus(id: string, status: string) {
-        await this.prisma.syncRun.update({ where: { id }, data: { status } });
+        beginSyncStage(status);
+        await this.prisma.syncRun.update({ where: { id }, data: { status: 'running' } });
     }
 
     private async logEvent(syncRunId: string, entityType: string, action: string, message: string) {

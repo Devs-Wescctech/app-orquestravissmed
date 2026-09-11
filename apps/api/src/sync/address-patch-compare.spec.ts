@@ -105,7 +105,7 @@ describe('canSkipAddressPatch', () => {
     });
 
     // (e) campo não-comparável (street) sempre força PATCH
-    it('sends PATCH when payload contains non-comparable field (street)', () => {
+    it('skips PATCH when street is exactly equal', () => {
         const payload = {
             insurance_support: 'private_and_insurance',
             city_name: 'São Paulo',
@@ -117,8 +117,8 @@ describe('canSkipAddressPatch', () => {
             street: 'Rua A, 123',   // mesmo valor, mas campo excluído da comparação
         };
         const { skip, reason } = canSkipAddressPatch(payload, remote);
-        expect(skip).toBe(false);
-        expect(reason).toMatch(/street/);
+        expect(skip).toBe(true);
+        expect(reason).toBeTruthy();
     });
 
     // (f) null vs "" tratados como iguais após normalização
@@ -197,7 +197,7 @@ describe('COMPARABLE_ADDRESS_FIELDS', () => {
         expect(COMPARABLE_ADDRESS_FIELDS).toContain('post_code');
     });
 
-    it('does NOT include street (excluded because format is not provably equivalent)', () => {
-        expect(COMPARABLE_ADDRESS_FIELDS).not.toContain('street');
+    it('includes street for exact comparison', () => {
+        expect(COMPARABLE_ADDRESS_FIELDS).toContain('street');
     });
 });

@@ -1,3 +1,4 @@
+import { selectInsurancePlan, PLAN_REMEDIATION } from './insurance-plan-selection';
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { DocplannerClient } from '../integrations/docplanner.service';
@@ -24,6 +25,7 @@ export class PushSyncService {
         const clinic = await this.prisma.clinic.findUnique({ where: { id: clinicId } });
         if (!clinic) {
             this.logger.error(`Clinic ${clinicId} not found, aborting REVERSE SYNC.`);
+            await this.logEvent(syncRunId, 'SYSTEM', 'configuration_pending', 'Clínica não encontrada; atualização remota não executada.');
             return;
         }
 
@@ -129,6 +131,7 @@ export class PushSyncService {
                 cycleCtx.setAddresses(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, doctoraliaAddresses);
             } catch (error: any) {
                 this.logger.error(`Error fetching addresses for doctor ${dDoc.name}: ${error.message}`);
+                await this.logEvent(syncRunId, 'ADDRESS_PUSH', 'fetch_error', 'Falha ao consultar endereços de um profissional.');
                 continue;
             }
 
@@ -495,12 +498,15 @@ export class PushSyncService {
                     STABLE_DATA_TTLS.insurancePlans,
                     () => client.getInsurancePlans(providerId),
                 );
-                const items = plansRes?._items || [];
-                const firstId = items.length > 0 ? String(items[0].insurance_plan_id) : null;
+                const selection = selectInsurancePlan(plansRes);
+                const firstId = selection.id;
+                if (!firstId && syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'plan_pending',
+                    `Endereço ${addressId}, convênio ${providerId}: ${PLAN_REMEDIATION[selection.reason]}`);
                 defaultPlanCache.set(providerId, firstId);
                 return firstId;
             } catch (error: any) {
                 this.logger.warn(`Doctor ${doctorName}: [INS] Falha ao listar planos do provider ${providerId}: ${error.message}`);
+                if (syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'error', `Endereço ${addressId}, convênio ${providerId}: falha ao consultar planos; tentar novamente após recuperar a integração.`);
                 defaultPlanCache.set(providerId, null);
                 return null;
             }
@@ -510,7 +516,8 @@ export class PushSyncService {
             try {
                 const planId = await resolveDefaultPlanId(providerId);
                 const plansArg = planId ? [{ insurance_plan_id: planId }] : undefined;
-                await client.addAddressInsuranceProvider(facilityId, doctorId, addressId, providerId, plansArg);
+                if (planId) await client.putAddressInsuranceProvider(facilityId, doctorId, addressId, providerId, plansArg);
+                else await client.addAddressInsuranceProvider(facilityId, doctorId, addressId, providerId);
                 result.added++;
                 const planTxt = planId ? ` (plano ${planId})` : ' (sem plano disponível)';
                 this.logger.log(`Doctor ${doctorName}: [INS] Added insurance provider ${providerId} to address ${addressId}${planTxt}`);
@@ -534,6 +541,7 @@ export class PushSyncService {
                 this.logger.log(`Doctor ${doctorName}: [INS] Removed insurance provider ${providerId} from address ${addressId}`);
             } catch (error: any) {
                 this.logger.warn(`Doctor ${doctorName}: [INS FAILED] Failed to remove insurance provider ${providerId}: ${error.message}`);
+                if (syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'error', `Endereço ${addressId}: falha ao remover convênio ${providerId}.`);
             }
         }
 
@@ -559,6 +567,7 @@ export class PushSyncService {
                 this.logger.log(`Doctor ${doctorName}: [INS] Plano ${planId} atribuído ao provider ${providerId} (estava sem plano)`);
             } catch (error: any) {
                 this.logger.warn(`Doctor ${doctorName}: [INS] Falha ao definir plano padrão para provider ${providerId}: ${error.message}`);
+                if (syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'error', `Endereço ${addressId}: falha ao definir plano do convênio ${providerId}.`);
             }
         }
 
@@ -570,9 +579,16 @@ export class PushSyncService {
         let providersWithoutPlans = 0;
         const providersMissingPlanIds: string[] = [];
         try {
-            await new Promise(r => setTimeout(r, 500));
-            const verify = await client.getAddressInsuranceProviders(facilityId, doctorId, addressId);
-            const verifyItems = verify._items || [];
+            const mutated = result.added > 0 || result.removed > 0 || plansAdded > 0;
+            if (mutated) await new Promise(r => setTimeout(r, 500));
+            const verify = mutated ? await client.getAddressInsuranceProviders(facilityId, doctorId, addressId) : { _items: currentProviders };
+            if (!Array.isArray(verify?._items)) throw new Error('Resposta inválida na verificação de convênios.');
+            const verifyItems = verify._items;
+            const verifiedIds = new Set(verifyItems.map((p: any) => String(p.insurance_provider_id || p.id)));
+            for (const pid of desiredProviderIds) {
+                if (!verifiedIds.has(pid) && syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'provider_pending',
+                    `Endereço ${addressId}: vínculo do convênio ${pid} não confirmado na Doctoralia.`);
+            }
             for (const p of verifyItems) {
                 const pid = String(p.insurance_provider_id || p.id);
                 if (!desiredProviderIds.has(pid)) continue;
@@ -584,6 +600,7 @@ export class PushSyncService {
             }
         } catch (error: any) {
             this.logger.warn(`Doctor ${doctorName}: [INS] Pós-push: falha ao re-verificar providers - ${error.message}`);
+            if (syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'error', `Endereço ${addressId}: não foi possível confirmar os vínculos de convênios após envio.`);
         }
 
         if (providersWithoutPlans > 0 && syncRunId) {
@@ -591,7 +608,7 @@ export class PushSyncService {
                 syncRunId,
                 'INSURANCE_PUSH',
                 'regression_warning',
-                `Doctor ${doctorName} addr ${addressId}: ${providersWithoutPlans} convênio(s) sem plano após push (IDs: ${providersMissingPlanIds.join(',')}). UI pública mostrará "Não disponível para agendamentos online".`
+                `Doctor ${doctorName} addr ${addressId}: ${providersWithoutPlans} convênio(s) sem plano após push (IDs: ${providersMissingPlanIds.join(',')}). Conferir disponibilidade e seleção de planos no endereço da Doctoralia; consulte as pendências específicas desta execução.`
             );
             this.logger.warn(`Doctor ${doctorName} addr ${addressId}: REGRESSION WARNING - ${providersWithoutPlans} provider(s) sem plano: ${providersMissingPlanIds.join(',')}`);
         }

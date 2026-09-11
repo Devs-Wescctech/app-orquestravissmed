@@ -87,7 +87,7 @@ export default function DashboardOverview() {
                     let logStatus: 'success' | 'warning' | 'failed' | 'pending' | 'skipped' = 'pending';
                     if (log.status === 'completed' || log.status === 'success') logStatus = 'success';
                     else if (log.status === 'skipped') logStatus = 'skipped';
-                    else if (log.status === 'partially' || log.status === 'warning') logStatus = 'warning';
+                    else if (log.status === 'completed_with_warnings' || log.status === 'partially' || log.status === 'warning') logStatus = 'warning';
                     else if (log.status === 'failed' || log.status === 'error') logStatus = 'failed';
                     return {
                         id: log.id,
@@ -427,10 +427,10 @@ export default function DashboardOverview() {
                                     <div className="text-right">
                                         <span className={`px-3 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest shadow-sm ${log.status === 'success' ? 'bg-primary text-white' :
                                             log.status === 'pending' ? 'bg-blue-500 text-white' :
-                                                log.status === 'skipped' ? 'bg-amber-500 text-white' :
+                                                (log.status === 'skipped' || log.status === 'warning') ? 'bg-amber-500 text-white' :
                                                 'bg-rose-500 text-white'
                                             }`}>
-                                            {log.status === 'success' ? 'Sucesso' : log.status === 'pending' ? 'Processando' : log.status === 'skipped' ? 'Pulado' : 'Falha'}
+                                            {log.status === 'warning' ? 'Com pendências' : log.status === 'success' ? 'Sucesso' : log.status === 'pending' ? 'Processando' : log.status === 'skipped' ? 'Pulado' : 'Falha'}
                                         </span>
                                         <p className="text-[10px] font-black text-slate-400 mt-2.5 flex items-center justify-end gap-1.5 uppercase tracking-widest">
                                             <CalendarDays className="h-3.5 w-3.5 opacity-50" />
