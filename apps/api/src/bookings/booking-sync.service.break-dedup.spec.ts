@@ -1,20 +1,3 @@
-/**
- * Unit tests for syncDoctoraliaBreak — break deduplication after timeout / 409
- *
- * Task WP-02 P0a: when addCalendarBreak fails with a network/timeout error the
- * break may already have been created on Doctoralia's side.  Before rethrowing,
- * the system must look for the remote break and adopt it if found unambiguously.
- *
- * Covered scenarios:
- *   (a) POST succeeds           → normal persist, no findRemoteBreakId call
- *   (b) timeout, 0 candidates   → rethrow; no persist
- *   (c) timeout, 1 candidate (since + till correct) → adopt; no rethrow
- *   (d) timeout, 1 candidate (since correct, till wrong) → rethrow; no persist
- *   (e) timeout, 2 candidates   → rethrow; no persist (ambiguous)
- *   (f) 409, 1 candidate        → adopt; existing 409 behaviour preserved
- *   (g) 409, 0 candidates       → warn only; no rethrow (existing 409 behaviour)
- */
-
 import { BookingSyncService } from './booking-sync.service';
 
 // ---------------------------------------------------------------------------
@@ -54,6 +37,7 @@ function buildService(overrides: {
     getCalendarBreak?: jest.Mock;
     moveCalendarBreak?: jest.Mock;
     updateResult?: any;
+    legacy?: boolean;
 }) {
     const rec = {
         id: 'bs-1',
@@ -98,8 +82,20 @@ function buildService(overrides: {
         deleteCalendarBreak: jest.fn(),
     };
 
+    let receipt: any = rec.doctoraliaBreakId && !overrides.legacy ? {
+        id: `calendar-break:${rec.id}`, action: 'CALENDAR_BREAK_CREATION', entityId: rec.id,
+        details: { state: 'OWNED', breakId: rec.doctoraliaBreakId, clinicId: rec.clinicId,
+            facilityId: 'fac-1', doctorId: 'doc-ext-1', addressId: 'addr-1' },
+    } : null;
     const prisma = {
+        auditLog: {
+            findUnique: jest.fn(async () => receipt),
+            create: jest.fn(async ({data}) => { if (receipt) throw Object.assign(new Error('duplicate'), {code:'P2002'}); receipt = data; return receipt; }),
+            update: jest.fn(async ({data}) => { receipt = { ...receipt, ...data }; return receipt; }),
+            deleteMany: jest.fn(async () => { receipt = null; return {count:1}; }),
+        },
         bookingSync: {
+            findFirst: jest.fn().mockResolvedValue(null),
             findUnique: jest.fn().mockResolvedValue(rec),
             update:     jest.fn().mockResolvedValue(rec),
             updateMany: jest.fn().mockResolvedValue({ count: 1 }),
@@ -132,140 +128,120 @@ function buildService(overrides: {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('syncDoctoraliaBreak — break deduplication', () => {
-    // Helper to call the private method
-    const callSync = (service: BookingSyncService, id = 'bs-1') =>
-        (service as any).syncDoctoraliaBreak(id);
-
-    // (a) -----------------------------------------------------------------------
-    it('(a) POST succeeds — persists breakId, does NOT call getCalendarBreaks', async () => {
-        const { service, client, prisma } = buildService({
-            addCalendarBreak: jest.fn().mockResolvedValue({ id: 'created-id' }),
-        });
-
+describe('syncDoctoraliaBreak — ownership', () => {
+    const callSync = (service: BookingSyncService) => (service as any).syncDoctoraliaBreak('bs-1');
+    it('persists a direct creation receipt and booking ID', async () => {
+        const {service, prisma, client} = buildService({});
         await callSync(service);
-
+        expect(prisma.auditLog.update).toHaveBeenCalledWith(expect.objectContaining({data: {
+            details: expect.objectContaining({state:'OWNED',breakId:'new-break-id'}),
+        }}));
+        expect(prisma.bookingSync.update).toHaveBeenCalledWith(expect.objectContaining({data: expect.objectContaining({
+            doctoraliaBreakId:'new-break-id', syncedToDoctoralia:true,
+        })}));
+        expect(client.getCalendarBreaks).not.toHaveBeenCalled();
+    });
+    it.each([
+        ['manual break', [remoteBreak('manual')]],
+        ['another patient', [remoteBreak('patient-A')]],
+        ['multiple breaks', [remoteBreak('A'), remoteBreak('B')]],
+        ['no break', []],
+    ])('409 with %s never adopts or reports success', async (_label, items) => {
+        const {service, prisma, client} = buildService({addCalendarBreak:jest.fn().mockRejectedValue(conflictError()), getCalendarBreaks:jest.fn().mockResolvedValue(items)});
+        await expect(callSync(service)).rejects.toThrow('BREAK_CONFLICT');
+        expect(client.getCalendarBreaks).not.toHaveBeenCalled();
+        expect(client.deleteCalendarBreak).not.toHaveBeenCalled();
+        expect(prisma.bookingSync.update).toHaveBeenCalledWith(expect.objectContaining({data:expect.objectContaining({syncedToDoctoralia:false})}));
+        expect(prisma.bookingSync.update.mock.calls.some(([a]:any[]) => a.data.doctoraliaBreakId)).toBe(false);
+    });
+    it.each([abortError(), new Error('fetch failed'), serverError()])('uncertain failure persists a hold across retries: %s', async error => {
+        const {service, prisma, client} = buildService({addCalendarBreak:jest.fn().mockRejectedValue(error),getCalendarBreaks:jest.fn().mockResolvedValue([remoteBreak('manual')])});
+        await expect(callSync(service)).rejects.toThrow('BREAK_CREATION_UNCONFIRMED');
+        await expect(callSync(service)).rejects.toThrow('BREAK_CREATION_UNCONFIRMED');
         expect(client.addCalendarBreak).toHaveBeenCalledTimes(1);
         expect(client.getCalendarBreaks).not.toHaveBeenCalled();
-        expect(prisma.bookingSync.update).toHaveBeenCalledWith(
-            expect.objectContaining({
-                data: expect.objectContaining({ doctoraliaBreakId: 'created-id', syncedToDoctoralia: true }),
-            }),
-        );
+        expect(prisma.auditLog.deleteMany).not.toHaveBeenCalled();
     });
-
-    // (b) -----------------------------------------------------------------------
-    it('(b) timeout, 0 candidates — rethrows, no persist', async () => {
-        const { service, client, prisma } = buildService({
-            addCalendarBreak:  jest.fn().mockRejectedValue(abortError()),
-            getCalendarBreaks: jest.fn().mockResolvedValue([]), // empty list
-        });
-
-        await expect(callSync(service)).rejects.toMatchObject({ name: 'AbortError' });
-
-        expect(client.getCalendarBreaks).toHaveBeenCalledTimes(1);
-        // update should NOT have been called with breakId (only the rateLimiter was acquired)
-        const updateCalls: any[] = prisma.bookingSync.update.mock.calls;
-        const adoptCall = updateCalls.find(([arg]: any[]) => arg?.data?.doctoraliaBreakId);
-        expect(adoptCall).toBeUndefined();
+    it.each([{}, {id:null}, {id:{wrong:true}}])('missing/invalid returned ID remains pending: %j', async response => {
+        const {service,client} = buildService({addCalendarBreak:jest.fn().mockResolvedValue(response)});
+        await expect(callSync(service)).rejects.toThrow('BREAK_CREATION_UNCONFIRMED');
+        await expect(callSync(service)).rejects.toThrow('BREAK_CREATION_UNCONFIRMED');
+        expect(client.addCalendarBreak).toHaveBeenCalledTimes(1);
     });
-
-    // (c) -----------------------------------------------------------------------
-    it('(c) timeout, 1 candidate (since + till correct) — adopts; does NOT rethrow', async () => {
-        const { service, client, prisma } = buildService({
-            addCalendarBreak:  jest.fn().mockRejectedValue(abortError()),
-            // since within 10s, till within 10s → both within ±60s tolerance
-            getCalendarBreaks: jest.fn().mockResolvedValue([remoteBreak('remote-1', 10_000, 5_000)]),
-        });
-
+    it('pre-send rejection permits a later safe retry', async () => {
+        const error = Object.assign(new Error('queue full'), {name:'DoctoraliaQueueFullError',code:'DOCTORALIA_QUEUE_FULL'});
+        const {service,client} = buildService({addCalendarBreak:jest.fn().mockRejectedValueOnce(error).mockResolvedValue({id:'created'})});
+        await expect(callSync(service)).rejects.toThrow('BREAK_RETRY_PENDING');
         await expect(callSync(service)).resolves.toBeUndefined();
-
-        expect(client.getCalendarBreaks).toHaveBeenCalledTimes(1);
-        const updateCalls: any[] = prisma.bookingSync.update.mock.calls;
-        const adoptCall = updateCalls.find(([arg]: any[]) => arg?.data?.doctoraliaBreakId === 'remote-1');
-        expect(adoptCall).toBeDefined();
-        expect(adoptCall[0].data.syncedToDoctoralia).toBe(true);
+        expect(client.addCalendarBreak).toHaveBeenCalledTimes(2);
     });
-
-    // (d) -----------------------------------------------------------------------
-    it('(d) timeout, 1 candidate (since correct, till outside tolerance) — rethrows; no persist', async () => {
-        const { service, client, prisma } = buildService({
-            addCalendarBreak:  jest.fn().mockRejectedValue(abortError()),
-            // since within 10s (ok), till 90s off → outside ±60s tolerance
-            getCalendarBreaks: jest.fn().mockResolvedValue([remoteBreak('remote-bad-till', 10_000, 90_000)]),
-        });
-
-        await expect(callSync(service)).rejects.toMatchObject({ name: 'AbortError' });
-
-        const updateCalls: any[] = prisma.bookingSync.update.mock.calls;
-        const adoptCall = updateCalls.find(([arg]: any[]) => arg?.data?.doctoraliaBreakId);
-        expect(adoptCall).toBeUndefined();
+    it('recovers a confirmed creation after local update fails, without another POST', async () => {
+        const update = jest.fn().mockRejectedValueOnce(new Error('database unavailable')).mockResolvedValue({});
+        const {service,client} = buildService({bookingSync:{update}});
+        await expect(callSync(service)).rejects.toThrow('database unavailable');
+        await callSync(service);
+        expect(client.addCalendarBreak).toHaveBeenCalledTimes(1);
+        expect(update).toHaveBeenLastCalledWith(expect.objectContaining({data:expect.objectContaining({doctoraliaBreakId:'new-break-id',syncedToDoctoralia:false})}));
     });
-
-    // (e) -----------------------------------------------------------------------
-    it('(e) timeout, 2 candidates — rethrows (ambiguous); no persist', async () => {
-        const { service, client, prisma } = buildService({
-            addCalendarBreak: jest.fn().mockRejectedValue(abortError()),
-            getCalendarBreaks: jest.fn().mockResolvedValue([
-                remoteBreak('remote-A', 5_000, 5_000),
-                remoteBreak('remote-B', 2_000, 2_000),
-            ]),
-        });
-
-        await expect(callSync(service)).rejects.toMatchObject({ name: 'AbortError' });
-
-        const updateCalls: any[] = prisma.bookingSync.update.mock.calls;
-        const adoptCall = updateCalls.find(([arg]: any[]) => arg?.data?.doctoraliaBreakId);
-        expect(adoptCall).toBeUndefined();
+    it.each(['CANCELLED','BOOKED'])('legacy association without proof is preserved on %s', async status => {
+        const {service,client,prisma} = buildService({legacy:true,rec:{status,doctoraliaBreakId:'legacy'}});
+        await expect(callSync(service)).rejects.toThrow('BREAK_OWNERSHIP_PENDING');
+        expect(client.moveCalendarBreak).not.toHaveBeenCalled();
+        expect(client.deleteCalendarBreak).not.toHaveBeenCalled();
+        expect(prisma.bookingSync.update).toHaveBeenCalledWith(expect.objectContaining({data:expect.objectContaining({syncedToDoctoralia:false})}));
     });
-
-    // (f) -----------------------------------------------------------------------
-    it('(f) 409, 1 candidate — adopts (existing 409 behaviour preserved)', async () => {
-        const { service, client, prisma } = buildService({
-            addCalendarBreak:  jest.fn().mockRejectedValue(conflictError()),
-            getCalendarBreaks: jest.fn().mockResolvedValue([remoteBreak('existing-1', 0, 0)]),
-        });
-
-        await expect(callSync(service)).resolves.toBeUndefined();
-
-        const updateCalls: any[] = prisma.bookingSync.update.mock.calls;
-        const adoptCall = updateCalls.find(([arg]: any[]) => arg?.data?.doctoraliaBreakId === 'existing-1');
-        expect(adoptCall).toBeDefined();
-        expect(adoptCall[0].data.syncedToDoctoralia).toBe(true);
+    it('changed doctor/address mapping cannot move a confirmed break', async () => {
+        const {service,client} = buildService({rec:{doctoraliaBreakId:'owned'}, mapping:{externalId:'different-doctor',conflictData:{facilityId:'fac-1',address:{id:'different-address'}}}});
+        await expect(callSync(service)).rejects.toThrow('BREAK_OWNERSHIP_PENDING');
+        expect(client.moveCalendarBreak).not.toHaveBeenCalled();
     });
-
-    // (g) -----------------------------------------------------------------------
-    it('(g) 409, 0 candidates — warns only; does NOT rethrow (existing 409 behaviour)', async () => {
-        const { service, client } = buildService({
-            addCalendarBreak:  jest.fn().mockRejectedValue(conflictError()),
-            getCalendarBreaks: jest.fn().mockResolvedValue([]),
-        });
-
-        // must NOT throw
-        await expect(callSync(service)).resolves.toBeUndefined();
-        expect(client.getCalendarBreaks).toHaveBeenCalledTimes(1);
+    it('concurrent attempts send only one POST', async () => {
+        const {service,client} = buildService({});
+        await Promise.allSettled([callSync(service), callSync(service)]);
+        expect(client.addCalendarBreak).toHaveBeenCalledTimes(1);
     });
-
-    // (h) -----------------------------------------------------------------------
-    it('(h) non-timeout HTTP error (500) — rethrows without calling getCalendarBreaks', async () => {
-        const { service, client } = buildService({
-            addCalendarBreak: jest.fn().mockRejectedValue(serverError()),
-        });
-
-        await expect(callSync(service)).rejects.toMatchObject({ status: 500 });
-        expect(client.getCalendarBreaks).not.toHaveBeenCalled();
+    it('journal unavailable prevents sending', async () => {
+        const {service,client,prisma} = buildService({});
+        prisma.auditLog.create.mockRejectedValueOnce(new Error('database unavailable'));
+        await expect(callSync(service)).rejects.toThrow('database unavailable');
+        expect(client.addCalendarBreak).not.toHaveBeenCalled();
     });
-
-    // (i) -----------------------------------------------------------------------
-    it('(i) network error (no status) — treated as timeout; rethrows when 0 candidates', async () => {
-        const networkErr = new Error('fetch failed');
-        const { service, client } = buildService({
-            addCalendarBreak:  jest.fn().mockRejectedValue(networkErr),
-            getCalendarBreaks: jest.fn().mockResolvedValue([]),
-        });
-
-        await expect(callSync(service)).rejects.toBe(networkErr);
-        expect(client.getCalendarBreaks).toHaveBeenCalledTimes(1);
+    it('failed receipt persistence leaves a durable hold instead of repeating POST', async () => {
+        const {service,client,prisma} = buildService({});
+        prisma.auditLog.update.mockRejectedValueOnce(new Error('database unavailable'));
+        await expect(callSync(service)).rejects.toThrow('database unavailable');
+        await expect(callSync(service)).rejects.toThrow('BREAK_CREATION_UNCONFIRMED');
+        expect(client.addCalendarBreak).toHaveBeenCalledTimes(1);
+    });
+    it('dashboard cancellation preserves an unproven legacy break and records the reason', async () => {
+        const {service,client,prisma} = buildService({legacy:true});
+        await (service as any).cancelSyncRecord('clinic-1', {id:'bs-1',doctoraliaBreakId:'legacy',doctoraliaFacilityId:'fac-1',doctoraliaDoctorId:'doc-ext-1',doctoraliaAddressId:'addr-1'});
+        expect(client.deleteCalendarBreak).not.toHaveBeenCalled();
+        expect(prisma.bookingSync.update).toHaveBeenCalledWith(expect.objectContaining({data:expect.objectContaining({syncError:expect.stringContaining('BREAK_OWNERSHIP_PENDING')})}));
+    });
+    it('404 on cancellation clears the confirmed association safely', async () => {
+        const {service,client,prisma} = buildService({rec:{status:'CANCELLED',doctoraliaBreakId:'owned'}});
+        client.deleteCalendarBreak.mockRejectedValue(Object.assign(new Error('404'),{status:404}));
+        await callSync(service);
+        expect(prisma.bookingSync.update).toHaveBeenCalledWith(expect.objectContaining({data:expect.objectContaining({doctoraliaBreakId:null})}));
+    });
+    it('cancels only a break with creation evidence', async () => {
+        const {service,client,prisma} = buildService({rec:{status:'CANCELLED',doctoraliaBreakId:'owned'}});
+        await callSync(service);
+        expect(client.deleteCalendarBreak).toHaveBeenCalledWith('fac-1','doc-ext-1','addr-1','owned');
+        expect(prisma.bookingSync.update).toHaveBeenCalledWith(expect.objectContaining({data:expect.objectContaining({doctoraliaBreakId:null})}));
+    });
+    it('duplicate association prevents cancellation even with a receipt', async () => {
+        const {service,client} = buildService({rec:{status:'CANCELLED',doctoraliaBreakId:'owned'},bookingSync:{findFirst:jest.fn().mockResolvedValue({id:'patient-A'})}});
+        await expect(callSync(service)).rejects.toThrow('outro agendamento');
+        expect(client.deleteCalendarBreak).not.toHaveBeenCalled();
+    });
+    it('does not clear the link when remote cancellation fails', async () => {
+        const {service,client,prisma} = buildService({rec:{status:'CANCELLED',doctoraliaBreakId:'owned'}});
+        client.deleteCalendarBreak.mockRejectedValue(abortError());
+        await expect(callSync(service)).rejects.toMatchObject({name:'AbortError'});
+        expect(prisma.bookingSync.update).not.toHaveBeenCalled();
+        expect(prisma.auditLog.deleteMany).not.toHaveBeenCalled();
     });
 });
 
