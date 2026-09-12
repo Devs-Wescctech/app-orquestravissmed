@@ -489,6 +489,8 @@ export class PushSyncService {
         const toRemove = [...currentProviderIds].filter(id => !desiredProviderIds.has(id));
 
         const defaultPlanCache = new Map<string, string | null>();
+        // Only a complete, successful empty catalog exempts a provider from plan warnings.
+        const providersWithEmptyCatalog = new Set<string>();
         const resolveDefaultPlanId = async (providerId: string): Promise<string | null> => {
             if (defaultPlanCache.has(providerId)) return defaultPlanCache.get(providerId)!;
             try {
@@ -500,7 +502,11 @@ export class PushSyncService {
                 );
                 const selection = selectInsurancePlan(plansRes);
                 const firstId = selection.id;
-                if (!firstId && syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'plan_pending',
+                if (selection.reason === 'no_available_plan') {
+                    providersWithEmptyCatalog.add(providerId);
+                    if (syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'catalog_without_plans',
+                        `Endereço ${addressId}, convênio ${providerId}: catálogo consultado com sucesso, sem planos publicados. A ausência de planos, por si só, não indica pendência.`);
+                } else if (!firstId && syncRunId) await this.logEvent(syncRunId, 'INSURANCE_PUSH', 'plan_pending',
                     `Endereço ${addressId}, convênio ${providerId}: ${PLAN_REMEDIATION[selection.reason]}`);
                 defaultPlanCache.set(providerId, firstId);
                 return firstId;
@@ -545,7 +551,7 @@ export class PushSyncService {
             }
         }
 
-        // Garante pelo menos 1 plano para cada provider LINKED já existente (sem planos).
+        // Resolve uma seleção inequívoca quando há planos no catálogo.
         // Não sobrescreve seleções manuais já configuradas no Doctoralia.
         let plansAdded = 0;
         for (const provider of currentProviders) {
@@ -573,8 +579,8 @@ export class PushSyncService {
 
         result.unchanged += [...desiredProviderIds].filter(id => currentProviderIds.has(id)).length;
 
-        // Verificação pós-push (anti-regressão): re-busca providers e conta os LINKED sem plano.
-        // Convênios sem plano fazem a UI mostrar "Não disponível para agendamentos online".
+        // Verificação pós-push: ausência de plano só é pendência quando o catálogo
+        // não foi confirmado como vazio. Vínculos ausentes continuam sendo avisados.
         // Pequeno delay evita falso-positivo por propagação interna do Doctoralia logo após PUT.
         let providersWithoutPlans = 0;
         const providersMissingPlanIds: string[] = [];
@@ -593,7 +599,7 @@ export class PushSyncService {
                 const pid = String(p.insurance_provider_id || p.id);
                 if (!desiredProviderIds.has(pid)) continue;
                 const plans = p.insurance_plans?._items || [];
-                if (plans.length === 0) {
+                if (plans.length === 0 && !providersWithEmptyCatalog.has(pid)) {
                     providersWithoutPlans++;
                     providersMissingPlanIds.push(pid);
                 }

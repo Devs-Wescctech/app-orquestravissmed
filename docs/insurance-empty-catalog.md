@@ -1,0 +1,13 @@
+# Classificação de convênios sem planos
+
+Quando a Doctoralia retorna um catálogo completo e válido com `_items: []`, a ausência de planos não é, isoladamente, uma pendência. A documentação da API admite vínculo de convênio sem `insurance_plans` e respostas de endereço com planos vazios: https://integrations.docplanner.com/docs/.
+
+A reconciliação agora registra `INSURANCE_PUSH/catalog_without_plans` como informação e exclui exclusivamente esse caso de `plan_pending` e do resumo `regression_warning`. Erros HTTP, catálogo inválido/incompleto, múltiplos planos sem seleção e vínculo não confirmado continuam gerando avisos/erros pelos caminhos existentes. Seleções já presentes são preservadas. A classificação é por convênio e por chamada, e segue a revalidação pelo cache existente: não bloqueia o convênio permanentemente.
+
+Não muda endpoints, payloads, autenticação, permissões, vínculo automático, consultas ao catálogo, envio de agendas ou critérios de remoção. Nenhuma mudança de schema, migration, dependências ou inicialização. O relatório de execução usa a classificação existente: o novo evento informativo não conta como warning. Se as únicas ocorrências forem catálogos vazios válidos, a nova execução pode concluir sem pendências; outros avisos permanecem. O campo auxiliar providersWithoutPlans passa a contar ausência de seleção que não foi explicada por catálogo vazio válido.
+
+O histórico permanece intacto. Execuções antigas continuam mostrando a classificação vigente quando rodaram; após publicação, é preciso aguardar uma nova execução para observar o novo resultado. Na amostra auditada de Petrópolis havia 168 avisos específicos e 42 resumos desse caso; a redução esperada é de 210 ocorrências se o estado permanecer igual, sem prometer remoção das sete outras pendências.
+
+Revisão de vínculos comerciais pendente de confirmação da clínica: UNIMED PETROPOLIS → Petro, CAROL → Santa Casa Dona Carolina Malheiros, REGENTE → Saúde da Gente. Nomes divergentes não autorizam substituições automáticas. Nenhum desses vínculos foi editado por este pacote.
+
+Validação executada em 12/09/2026: npm ci do lockfile em checkout isolado, geração do cliente Prisma sem acesso ao banco, 26 testes de seleção/reconciliação/observação passaram e compilação TypeScript da API passou. Casos cobertos: vazio válido sem escrita, múltiplos planos, catálogo inválido/incompleto, falha de consulta, vínculo não confirmado, preservação de seleção existente e mudança do catálogo em ciclo posterior. Testes usam clientes simulados sem escrever na Doctoralia. Frontend e endpoints não foram alterados; não houve novo teste de escrita externa. Publicação é uma etapa separada; este pacote é local.

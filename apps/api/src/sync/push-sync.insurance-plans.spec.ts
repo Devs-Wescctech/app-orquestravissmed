@@ -1,5 +1,6 @@
 import { PushSyncService } from './push-sync.service';
 import { Logger } from '@nestjs/common';
+import { classifySyncEvents } from './sync-observation';
 
 function fixture(planItems: any[], existingPlans: any[] = []) {
     const events: any[] = [];
@@ -29,7 +30,18 @@ describe('insurance reconciliation', () => {
         expect(f.client.putAddressInsuranceProvider).toHaveBeenCalledWith('f', 'd', 'a', '7', [{ insurance_plan_id: '1' }]);
         expect(f.events.some(e => e.action === 'regression_warning')).toBe(false);
     });
-    it.each([{ plans: [] }, { plans: [{ insurance_plan_id: '1' }, { insurance_plan_id: '2' }] }])('makes unresolved configuration actionable without choosing arbitrarily', async ({ plans }) => {
+    it('records a valid empty catalog as information without writes or warnings', async () => {
+        const f = fixture([]);
+        const result = await f.run();
+        expect(result.providersWithoutPlans).toBe(0);
+        expect(result.providersMissingPlanIds).toEqual([]);
+        expect(f.client.putAddressInsuranceProvider).not.toHaveBeenCalled();
+        expect(f.client.addAddressInsuranceProvider).not.toHaveBeenCalled();
+        expect(f.client.deleteAddressInsuranceProvider).not.toHaveBeenCalled();
+        expect(f.events.some(e => e.action === 'catalog_without_plans')).toBe(true);
+        expect(classifySyncEvents(f.events)).toMatchObject({ warnings: 0, errors: 0 });
+    });
+    it.each([{ plans: [{ insurance_plan_id: '1' }, { insurance_plan_id: '2' }] }, { plans: [{ id: 'invalid' }] }])('makes unresolved configuration actionable without choosing arbitrarily', async ({ plans }) => {
         const f = fixture(plans);
         await f.run();
         expect(f.client.putAddressInsuranceProvider).not.toHaveBeenCalled();
@@ -40,5 +52,30 @@ describe('insurance reconciliation', () => {
         const f = fixture([]); f.client.getInsurancePlans.mockRejectedValue(new Error('offline'));
         await f.run();
         expect(f.events.some(e => e.action === 'error')).toBe(true);
+        expect(f.events.some(e => e.action === 'catalog_without_plans')).toBe(false);
+        expect(f.events.some(e => e.action === 'regression_warning')).toBe(true);
+    });
+    it('does not exempt incomplete catalogs even when their first page is empty', async () => {
+        const f = fixture([]);
+        f.client.getInsurancePlans.mockResolvedValue({ _items: [], _links: { next: { href: '/next' } } });
+        await f.run();
+        expect(f.events.some(e => e.action === 'plan_pending')).toBe(true);
+        expect(f.events.some(e => e.action === 'catalog_without_plans')).toBe(false);
+    });
+    it('reclassifies a provider when plans become available in a later cycle', async () => {
+        const f = fixture([]);
+        await f.run();
+        f.events.length = 0;
+        f.client.getInsurancePlans.mockResolvedValue({ _items: [{ insurance_plan_id: '1' }, { insurance_plan_id: '2' }] });
+        await f.run();
+        expect(f.events.some(e => e.action === 'plan_pending')).toBe(true);
+        expect(f.events.some(e => e.action === 'regression_warning')).toBe(true);
+    });
+    it('still warns if a provider with an empty catalog is not confirmed after adding', async () => {
+        const f = fixture([]);
+        f.client.getAddressInsuranceProviders.mockResolvedValue({ _items: [] });
+        await f.run();
+        expect(f.events.some(e => e.action === 'provider_pending')).toBe(true);
+        expect(classifySyncEvents(f.events).warnings).toBeGreaterThan(0);
     });
 });

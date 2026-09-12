@@ -49,7 +49,7 @@ export function selectInsurancePlan(input: unknown): PlanSelection {
 
 export const PLAN_REMEDIATION = {
   no_available_plan:
-    'Não há plano disponível no catálogo da Doctoralia; conferir o cadastro do convênio com a Doctoralia.',
+    'O catálogo da Doctoralia foi consultado com sucesso e não possui planos publicados para este convênio.',
   selection_required:
     'Há vários planos disponíveis; selecionar os planos aceitos no endereço da Doctoralia.',
   invalid_catalog:
