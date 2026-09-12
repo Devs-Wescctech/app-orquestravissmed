@@ -64,6 +64,13 @@ test('help buttons have accessible names for all four concepts', () => {
  for(const label of ['Sem pendências','Com pendências','Falhas','Em andamento']) assert.ok(html.includes('Entenda: '+label));
  assert.ok(html.includes('aria-expanded="false"'));
 });
+test('compact card keeps the sample total visible and results in a closed disclosure', () => {
+ const html=render(runs(['completed','completed_with_warnings','failed']));
+ assert.match(html,/3<span class="sr-only"> execuções na amostra/);
+ assert.match(html,/<summary[^>]*>Ver resultados/);
+ assert.doesNotMatch(html,/<details[^>]*\sopen/);
+ assert.match(html,/Entender pendências/);
+});
 test('known pending causes are explained without declaring all appointments failed', () => {
  const result=explainPendingReasons([{action:'plan_pending',message:'catálogo vazio'},{action:'regression_warning'},{action:'managed_scope_pending'},{action:'skipped_no_approved_mapping'},{action:'created'}]);
  assert.equal(result.length,3);assert.equal(result[0].events.length,2);
