@@ -330,7 +330,7 @@ export class VismedService {
     async getScheduleDay(idEmpresaGestora: number, idCategoriaServico: number, dataAgendamento: string, baseUrl?: string): Promise<any> {
         try {
             this.logger.log(`Buscando horários disponíveis para especialidade ${idCategoriaServico} em ${dataAgendamento}`);
-            return await this.requestData(
+            return await this.requestDataStrict(
                 `schedule/online/scheduleDay?idempresagestora=${idEmpresaGestora}&idcategoriaservico=${idCategoriaServico}&dataagendamento=${dataAgendamento}`,
                 baseUrl
             );

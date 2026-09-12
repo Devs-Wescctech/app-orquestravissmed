@@ -541,7 +541,13 @@ export default function SyncDashboardPage() {
                                                 <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest bg-slate-100 px-2 py-0.5 rounded-lg">ID #{run.id.slice(0, 6)}</span>
                                                 <p className="text-[11px] font-bold text-slate-500 uppercase tracking-tight">{run.totalRecords} {run.metrics?.report?.version === 2 ? 'verificados' : 'registros'}</p>
                                             </div>
-                                            <SyncRunReport report={run.metrics?.report} />
+                                            <SyncRunReport key={activeClinic?.id + run.id} report={run.metrics?.report} loadEvents={async () => {
+                                                if (!activeClinic) throw new Error('Clínica indisponível');
+                                                const response = await api.get('/sync/' + activeClinic.id + '/history');
+                                                const detail = response.data.find((item: { id: string }) => item.id === run.id);
+                                                if (!detail || !Array.isArray(detail.events)) throw new Error('Eventos indisponíveis');
+                                                return detail.events;
+                                            }} />
                                             {runState === 'skipped' && (
                                                 <p className="text-[11px] font-semibold text-amber-600 mt-2 max-w-md leading-snug">
                                                     {getSkipMessage(run.metrics)}

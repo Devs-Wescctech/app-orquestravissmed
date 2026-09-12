@@ -15,7 +15,7 @@ const component = new Module(filename, module);
 component.filename = filename;
 component.paths = Module._nodeModulePaths(path.dirname(filename));
 component._compile(compiled, filename);
-const render = report => renderToStaticMarkup(React.createElement(component.exports.SyncRunReport, { report }));
+const render = (report, events) => renderToStaticMarkup(React.createElement(component.exports.SyncRunReport, { report, events }));
 
 test('historical totals are identified as not measuring actual changes', () => {
   assert.match(render(), /Contagem anterior: não distingue alterações reais/);
@@ -30,4 +30,21 @@ test('new report distinguishes unchanged records, stages and pending calendars',
   assert.match(html, /Agendas pendentes: 3/);
   assert.match(html, /Atualização de agendas e vínculos: 1.2 s/);
   assert.match(html, /overflow-x-auto/);
+});
+
+const emptyReport = { version: 2, categories: {}, stages: [], agendas: { skipped_empty: 2 }, errors: 0, warnings: 0 };
+test('empty agendas show evidence without claiming the internal calendar is blocked', () => {
+  const html = render(emptyReport, [{ entityType: 'SLOT_SYNC', action: 'skipped_empty', message: 'Profissional Teste, endereço 1, período 2026-09-13 a 2026-10-12: sem intervalos livres.' }]);
+  assert.match(html, /sem disponibilidade identificada/);
+  assert.match(html, /2026-09-13 a 2026-10-12/);
+  assert.match(html, /não comprova/);
+  assert.match(html, /não cobrem todas/);
+});
+test('legacy events are explained without inventing a detailed cause', () => {
+  const html = render(emptyReport, [{ entityType: 'SLOT_SYNC', action: 'skipped_empty', message: 'Doctor Teste address 12: nenhuma faixa livre e sem estado prévio gerenciado — skip (evita wipe acidental).' }, { entityType: 'OTHER', action: 'skipped_empty', message: 'não relacionado' }]);
+  assert.match(html, /execução antiga não registrou o motivo detalhado/);
+  assert.doesNotMatch(html, /wipe|não relacionado/);
+});
+test('no empty count does not show empty-agenda details', () => {
+  assert.doesNotMatch(render({ ...emptyReport, agendas: {} }), /Ver agendas sem disponibilidade/);
 });

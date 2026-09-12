@@ -520,7 +520,10 @@ export class SlotSyncService {
                         if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'error', msg);
                     }
                 } else {
-                    const msg = `Doctor ${doctor.name} address ${addrId}: nenhuma faixa livre e sem estado prévio gerenciado — skip (evita wipe acidental).`;
+                    const reason = source === 'availability' && avail
+                        ? avail.describeEmpty(Number(doctor.vismedId), dates)
+                        : 'Os turnos cadastrados não geraram faixas para envio.';
+                    const msg = `Profissional ${doctor.name}, endereço ${addrId}, período ${dates[0]} a ${dates[dates.length - 1]}: ${reason} Nenhum horário enviado ou removido da Doctoralia.`;
                     this.logger.warn(msg);
                     if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'skipped_empty', msg);
                 }

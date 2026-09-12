@@ -84,6 +84,15 @@ describe('VismedService', () => {
     expect(service).toBeDefined();
   });
 
+  it.each(['null', 'false', '0', '""'])('preserves invalid schedule JSON %s for completeness validation', async body => {
+    getSpy.mockImplementation((_url: any, cb: any) => {
+      const req = new FakeReq();
+      setImmediate(() => respond(req, cb, 200, body));
+      return req as any;
+    });
+    expect(await service.getScheduleDay(52, 10, '2026-09-15', 'https://vismed.test')).toEqual(JSON.parse(body));
+  });
+
   describe('getAgendamentos', () => {
     it('consome somente no modo explícito e omite sincronizar em readonly e por default', async () => {
       const requestedUrls: string[] = [];

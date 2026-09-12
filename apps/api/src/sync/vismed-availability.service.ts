@@ -41,6 +41,13 @@ export class ClinicAvailability {
         return this.ranges.get(this.rangeKey(prof, date)) || [];
     }
 
+    describeEmpty(prof: number, dates: string[]): string {
+        const present = dates.filter(date => this.ranges.has(this.rangeKey(prof, date)));
+        if (present.length === 0) return 'O profissional não apareceu nas respostas de disponibilidade da VISSMED para o período consultado; conferir cadastro e habilitação on-line.';
+        if (present.some(date => this.getRanges(prof, date).length > 0)) return 'A VISSMED retornou faixas, mas nenhuma gerou horário válido para envio; conferir duração e limites dos intervalos.';
+        return 'A VISSMED retornou o profissional sem intervalos livres no período consultado. Isso não confirma bloqueio ou ausência de horários na agenda interna.';
+    }
+
     setInferredStep(prof: number, minutes: number) {
         this.inferredStep.set(prof, minutes);
     }
@@ -201,17 +208,22 @@ export class VismedAvailabilityService {
                 const { categoryId, date } = tasks[myIdx];
                 try {
                     const res: any = await this.vismed.getScheduleDay(conn.idEmpresaGestora, categoryId, date, conn.baseUrl);
-                    const schedule: any[] = Array.isArray(res) ? res : (res?.schedule || res?.data || []);
+                    const schedule: any[] = Array.isArray(res) ? res : (res?.schedule ?? res?.data);
+                    if (!Array.isArray(schedule)) throw new Error('Resposta de disponibilidade sem lista válida.');
                     for (const entry of schedule) {
                         const prof = Number(entry?.idprofissional ?? entry?.idProfissional ?? entry?.profissional);
-                        if (!Number.isInteger(prof)) continue;
+                        if (!Number.isInteger(prof) || prof <= 0) throw new Error('Profissional inválido na resposta de disponibilidade.');
                         const key = `${prof}|${date}`;
                         const arr = rawByProfDate.get(key) || [];
-                        const horarios = entry?.horarios ?? entry?.horários ?? entry?.slots ?? [];
+                        const horarios = entry?.horarios ?? entry?.horários ?? entry?.slots;
+                        if (!Array.isArray(horarios)) throw new Error('Resposta do profissional sem lista válida de horários.');
                         for (const h of horarios) {
                             const inicio = h?.inicio ?? h?.início ?? h?.start;
                             const fim = h?.fim ?? h?.end;
-                            if (inicio && fim) arr.push({ inicio: String(inicio), fim: String(fim) });
+                            const start = this.toMinutes(String(inicio ?? ''));
+                            const end = this.toMinutes(String(fim ?? ''));
+                            if (start == null || end == null || end <= start) throw new Error('Intervalo de disponibilidade inválido; conferência necessária.');
+                            arr.push({ inicio: String(inicio), fim: String(fim) });
                         }
                         rawByProfDate.set(key, arr);
                     }

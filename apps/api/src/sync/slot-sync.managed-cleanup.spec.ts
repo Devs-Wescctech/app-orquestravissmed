@@ -1,6 +1,7 @@
 import { SlotSyncService } from './slot-sync.service';
 import { managedSlotState } from './managed-slot-ranges';
 import { Logger } from '@nestjs/common';
+import { ClinicAvailability } from './vismed-availability.service';
 
 const scope = { clinicId: 'clinic-a', facilityId: 'f', doctorId: 'd', addressId: 'a' };
 const date = '2026-09-12';
@@ -29,6 +30,17 @@ function fixture() {
 }
 describe('slot cleanup integration', () => {
     beforeAll(() => Logger.overrideLogger(false));
+    it('reports the empty source and period without writing or deleting an unmanaged calendar', async () => {
+        const f = fixture(); f.setState(null);
+        const availability = new ClinicAvailability();
+        await f.service.syncSlotsForDoctor('v', f.client, 'run', 30, 'clinic-a', availability);
+        expect(f.client.replaceSlots).not.toHaveBeenCalled();
+        expect(f.prisma.slotPushState.upsert).not.toHaveBeenCalled();
+        const event = f.events.find(e => e.action === 'skipped_empty');
+        expect(event.message).toContain(date);
+        expect(event.message).toContain('não apareceu');
+        expect(event.message).toContain('Nenhum horário enviado ou removido');
+    });
     it('clears exact managed periods only after a complete source snapshot and persists after success', async () => {
         const f = fixture();
         const result = await f.service.syncSlotsForDoctor('v', f.client, 'run', 30, 'clinic-a', f.availability);
