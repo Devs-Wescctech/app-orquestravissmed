@@ -1,4 +1,5 @@
 import { ExecutionRun, summarizeExecutions } from './execution-summary';
+import { SyncStatusHelp } from './SyncStatusHelp';
 
 export function SyncExecutionSummary({ runs }: { runs: readonly ExecutionRun[] | null }) {
     const summary = runs === null ? null : summarizeExecutions(runs);
@@ -10,7 +11,7 @@ export function SyncExecutionSummary({ runs }: { runs: readonly ExecutionRun[] |
     ] as const : [];
 
     return (
-        <section aria-label="Resultados da sincronização" className="bg-white/70 backdrop-blur-xl rounded-[32px] p-4 shadow-sm border border-slate-100/60 min-h-40">
+        <section aria-label="Resultados da sincronização" className="relative hover:z-30 focus-within:z-30 bg-white/70 backdrop-blur-xl rounded-[32px] p-4 shadow-sm border border-slate-100/60 min-h-40">
             <h3 className="text-xs font-bold text-slate-900">Execuções recentes</h3>
             {summary === null ? (
                 <p className="mt-4 text-xs text-slate-500">Resumo indisponível</p>
@@ -22,13 +23,14 @@ export function SyncExecutionSummary({ runs }: { runs: readonly ExecutionRun[] |
                     <dl className="mt-3 space-y-1 text-[11px]">
                         {rows.map(([label, count, color]) => (
                             <div key={label} className="flex items-center justify-between gap-2">
-                                <dt className="text-slate-600">{label}</dt>
+                                <dt className="flex items-center gap-1 text-slate-600"><span>{label}</span><SyncStatusHelp label={label} /></dt>
                                 <dd className={`font-bold tabular-nums ${color}`}>{count}</dd>
                             </div>
                         ))}
                     </dl>
                     {summary.skipped > 0 && <p className="mt-2 text-[10px] text-slate-500">{summary.skipped} pulada(s), sem execução</p>}
                     {summary.other > 0 && <p className="mt-2 text-[10px] text-slate-500">{summary.other} com outro status</p>}
+                    {summary.warnings > 0 && <a href="/sync#motivos-pendencias" className="mt-3 inline-block text-[11px] font-semibold text-amber-800 underline">Entender pendências</a>}
                 </>
             )}
         </section>

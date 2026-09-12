@@ -1,5 +1,6 @@
 'use client';
 
+import { SyncPendingDetails } from '@/components/sync/SyncPendingDetails';
 import { SyncExecutionSummary } from '@/components/sync/SyncExecutionSummary';
 
 import { SyncRunReport, SyncReport } from '@/components/sync/SyncRunReport';
@@ -174,6 +175,7 @@ export default function SyncDashboardPage() {
         never_synced: { bg: 'bg-slate-400', text: 'text-slate-400', light: 'bg-slate-50' },
     };
     const hc = status ? healthColors[status.health] : healthColors.never_synced;
+    const pendingRun = !fetchError ? status?.recentRuns.slice(0, 10).find(run => ['completed_with_warnings', 'partially', 'warning'].includes(run.status)) : undefined;
 
     return (
         <div className="max-w-7xl mx-auto space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
@@ -335,6 +337,15 @@ export default function SyncDashboardPage() {
                     </div>
                 </div>
             )}
+
+            {pendingRun && activeClinic && <SyncPendingDetails key={activeClinic.id + pendingRun.id}
+                startedAt={pendingRun.startedAt} source={pendingRun.type === 'vismed-full' ? 'VISSMED' : ['full', 'insurance'].includes(pendingRun.type) ? 'Doctoralia' : 'Integração'}
+                loadEvents={async () => {
+                    const response = await api.get('/sync/' + activeClinic.id + '/history');
+                    const run = response.data.find((item: { id: string }) => item.id === pendingRun.id);
+                    if (!run || !Array.isArray(run.events)) throw new Error('Eventos indisponíveis');
+                    return run.events;
+                }} />}
 
             {(status?.insurance.regressionWarnings || 0) > 0 && (
                 <div className="bg-amber-50 border-2 border-amber-300 rounded-[24px] p-6 flex items-start gap-4 shadow-sm">

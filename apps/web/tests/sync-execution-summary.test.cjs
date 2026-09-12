@@ -21,7 +21,7 @@ function load(name, dependencies = {}) {
     return mod.exports;
 }
 const helper = load('execution-summary.ts');
-const { SyncExecutionSummary } = load('SyncExecutionSummary.tsx', { './execution-summary': helper });
+const { SyncExecutionSummary } = load('SyncExecutionSummary.tsx', { './execution-summary': helper, './SyncStatusHelp': load('SyncStatusHelp.tsx') });
 const runs = statuses => statuses.map(status => ({ status }));
 const render = value => renderToStaticMarkup(React.createElement(SyncExecutionSummary, { runs: value }));
 
@@ -56,4 +56,26 @@ test('a small sample shows its actual size and preserves totals', () => {
     const s = helper.summarizeExecutions(sample);
     assert.equal(s.sampled, s.completed + s.warnings + s.failed + s.running + s.skipped + s.other);
     assert.match(render(sample), /Últimas 3/);
+});
+
+const { explainPendingReasons } = load('pending-reasons.ts');
+test('help buttons have accessible names for all four concepts', () => {
+ const html=render(runs(['completed']));
+ for(const label of ['Sem pendências','Com pendências','Falhas','Em andamento']) assert.ok(html.includes('Entenda: '+label));
+ assert.ok(html.includes('aria-expanded="false"'));
+});
+test('known pending causes are explained without declaring all appointments failed', () => {
+ const result=explainPendingReasons([{action:'plan_pending',message:'catálogo vazio'},{action:'regression_warning'},{action:'managed_scope_pending'},{action:'skipped_no_approved_mapping'},{action:'created'}]);
+ assert.equal(result.length,3);assert.equal(result[0].events.length,2);
+ assert.ok(result.some(r=>r.title==='Remoção de horários aguardando conferência'));
+ assert.ok(result.every(r=>r.meaning&&r.next));
+});
+test('unknown events do not invent a cause',()=>{
+ assert.deepEqual(explainPendingReasons([{action:'new_unknown_warning'}]),[]);
+});
+const { SyncPendingDetails }=load('SyncPendingDetails.tsx',{'./pending-reasons':load('pending-reasons.ts')});
+test('pending details identify the execution and do not fetch until requested',()=>{
+ let calls=0;
+ const html=renderToStaticMarkup(React.createElement(SyncPendingDetails,{startedAt:'2026-09-12T10:00:00Z',source:'Doctoralia',loadEvents:async()=>{calls++;return [];}}));
+ assert.equal(calls,0);assert.match(html,/12\/09\/2026/);assert.match(html,/07:00:00/);assert.match(html,/Ver motivos e próximos passos/);
 });
