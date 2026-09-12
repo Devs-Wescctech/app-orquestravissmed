@@ -11,7 +11,7 @@ export function SyncExecutionSummary({ runs }: { runs: readonly ExecutionRun[] |
     ] as const : [];
 
     return (
-        <section aria-label="Resultados da sincronização" className="relative z-10 hover:z-30 focus-within:z-30 bg-white/70 backdrop-blur-xl rounded-[32px] p-6 shadow-sm border border-slate-100/60 h-40 flex flex-col justify-between">
+        <section aria-label="Resultados da sincronização" className="relative z-10 hover:z-30 focus-within:z-30 bg-white/70 backdrop-blur-xl rounded-[32px] p-6 shadow-sm border border-slate-100/60 h-40 flex flex-col justify-between transition-all duration-300 hover:shadow-xl hover:-translate-y-1">
             <h3 className="text-[10px] font-black uppercase leading-tight tracking-widest text-slate-400">Execuções recentes</h3>
             {summary === null ? (
                 <p className="mt-4 text-xs text-slate-500">Resumo indisponível</p>
