@@ -1,6 +1,8 @@
 'use client';
+
+import { SyncExecutionSummary } from '@/components/sync/SyncExecutionSummary';
 import { useState, useEffect } from 'react';
-import { CheckCircle2, Hourglass, AlertTriangle, Settings2, Users, Loader2, UserSquare2, CalendarDays, ExternalLink, Activity, ShieldCheck, ArrowUpRight, Link2Off, X, Clock } from 'lucide-react';
+import { CheckCircle2, Hourglass, AlertTriangle, Settings2, Users, Loader2, UserSquare2, CalendarDays, ExternalLink, Activity, ArrowUpRight, Link2Off, X, Clock } from 'lucide-react';
 import Link from 'next/link';
 import { api } from '@/lib/api';
 import { useClinic } from '@/lib/clinic-store';
@@ -43,7 +45,7 @@ export default function DashboardOverview() {
         linkedDoctors: 0,
         unlinkedDoctors: 0,
         calendarEnabled: false,
-        syncHealth: 100,
+        executionRuns: null as Array<{ status: string }> | null,
         recentLogs: [] as any[],
         doctorsList: [] as any[],
         vismedStats: { units: 0, doctors: 0, specialties: 0 },
@@ -58,7 +60,7 @@ export default function DashboardOverview() {
                 const [usersRes, clinicsRes, syncRes, doctorsCountRes, calendarRes, doctorsRes, vismedRes, skippedRes] = await Promise.all([
                     api.get('/users').catch(() => ({ data: [] })),
                     api.get('/clinics').catch(() => ({ data: [] })),
-                    api.get(`/sync/${clinicId}/history`).catch(() => ({ data: [] })),
+                    api.get(`/sync/${clinicId}/history`).catch(() => ({ data: null })),
                     api.get('/doctors/count', { params: { clinicId } }).catch(() => ({ data: { total: 0, linked: 0, unlinked: 0 } })),
                     api.get('/appointments/calendar-status', { params: { clinicId } }).catch(() => ({ data: { calendarEnabled: false } })),
                     api.get('/doctors', { params: { clinicId } }).catch(() => ({ data: [] })),
@@ -75,14 +77,6 @@ export default function DashboardOverview() {
                 const activeC = allClinics.filter((c: any) => c.active).length;
 
                 const allLogs = syncRes.data || [];
-                let health = 100;
-                // Runs 'skipped' não são execuções efetivas — ficam fora do denominador
-                const executedLogs = allLogs.filter((l: any) => l.status !== 'skipped');
-                if (executedLogs.length > 0) {
-                    const successLogs = executedLogs.filter((l: any) => l.status === 'completed' || l.status === 'success').length;
-                    health = Math.round((successLogs / executedLogs.length) * 100);
-                }
-
                 const topLogs = allLogs.slice(0, 3).map((log: any) => {
                     let logStatus: 'success' | 'warning' | 'failed' | 'pending' | 'skipped' = 'pending';
                     if (log.status === 'completed' || log.status === 'success') logStatus = 'success';
@@ -107,7 +101,7 @@ export default function DashboardOverview() {
                     linkedDoctors: doctorsCountRes.data?.linked || 0,
                     unlinkedDoctors: doctorsCountRes.data?.unlinked || 0,
                     calendarEnabled: calendarRes.data?.calendarEnabled || false,
-                    syncHealth: health,
+                    executionRuns: Array.isArray(syncRes.data) ? syncRes.data : null,
                     recentLogs: topLogs,
                     doctorsList: (doctorsRes.data || []).slice(0, 5),
                     vismedStats: vismedRes.data || { units: 0, doctors: 0, specialties: 0 },
@@ -284,24 +278,7 @@ export default function DashboardOverview() {
             {/* KPI Grid - Glassmorphism Green Theme */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6 gap-6">
 
-                {/* Sync Health (Destacado) */}
-                <div className="bg-white/70 backdrop-blur-xl rounded-[32px] p-6 shadow-sm border border-slate-100/60 flex flex-col justify-between h-40 transition-all duration-300 hover:shadow-xl hover:-translate-y-1 group border-r-4 border-r-primary">
-                    <div className="flex justify-between items-start">
-                        <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest leading-tight">Saúde de<br />Sincronismo</h3>
-                        <div className={`h-10 w-10 rounded-2xl flex items-center justify-center shadow-lg transition-transform group-hover:scale-110 ${metrics.syncHealth >= 90 ? 'bg-primary text-white' : 'bg-rose-500 text-white'}`}>
-                            <ShieldCheck className="h-5 w-5" />
-                        </div>
-                    </div>
-                    <div>
-                        <div className="flex items-center gap-2">
-                            <div className="text-4xl font-black text-slate-900 tracking-tighter">{metrics.syncHealth}%</div>
-                            <div className={`h-2.5 w-2.5 rounded-full animate-ping ${metrics.syncHealth >= 90 ? 'bg-primary' : 'bg-rose-500'}`}></div>
-                        </div>
-                        <div className="h-1.5 w-full bg-slate-100 rounded-full mt-3 overflow-hidden">
-                            <div className={`h-full rounded-full transition-all duration-1000 ${metrics.syncHealth >= 90 ? 'bg-primary' : 'bg-rose-500'}`} style={{ width: `${metrics.syncHealth}%` }}></div>
-                        </div>
-                    </div>
-                </div>
+                <SyncExecutionSummary runs={metrics.executionRuns} />
 
                 {/* VISMED Base */}
                 <div className="bg-slate-900 rounded-[32px] p-6 shadow-2xl flex flex-col justify-between h-40 transition-all duration-300 hover:scale-[1.02] hover:shadow-primary/20 group relative overflow-hidden">

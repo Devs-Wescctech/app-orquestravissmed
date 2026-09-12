@@ -1,0 +1,13 @@
+# Execuções recentes substitui Saúde de Sincronismo
+
+O percentual anterior misturava falhas, pendências e trabalhos em andamento. Uma amostra de quatro completed, cinco completed_with_warnings e um failed aparecia como 40%, sem explicar a distribuição. O painel inicial ainda usava 20 registros, enquanto a Central usava 10.
+
+Ambas as telas agora exibem o mesmo componente com as últimas dez execuções retornadas em ordem decrescente pela API, somando VISSMED e Doctoralia. As categorias são mutuamente exclusivas: sem pendências, com pendências, falhas, em andamento, puladas e outros status. As quatro primeiras aparecem mesmo com zero; puladas/outros aparecem quando presentes. Histórico menor mostra o tamanho real. Sem dados e erro de consulta possuem mensagens distintas. Nenhum percentual de saúde ou sucesso é inferido.
+
+Aliases históricos success, warning, partially e error conservam a classificação já usada no painel inicial. Status desconhecido fica em Outros e não é tratado como sucesso nem falha.
+
+Não muda execução de jobs, agendamentos, vínculos, banco ou contratos HTTP. O successRate legado continua no endpoint para compatibilidade, mas essas duas telas não o consomem. Os alertas de pendências e detalhes das execuções permanecem acessíveis nos fluxos existentes.
+
+Teste: `node --test apps/web/tests/sync-execution-summary.test.cjs apps/web/tests/sync-run-report.test.cjs`. Build: `npm run build:web`, usando npm ci do lockfile deste candidato. Sem necessidade de migration. Publicação requer revisão/autorização específica; atualização de produção não faz parte desta edição local.
+
+Validação em 12/09/2026: npm ci em checkout isolado; 8/8 testes passaram; build web concluído com código 0; `npx tsc --noEmit --incremental false --project apps/web/tsconfig.json` passou separadamente (o Next deste projeto desabilita typecheck/lint no build). Prévia local do componente real, com CSS do build e dados fictícios, conferida no navegador em largura de cartão de 160px. Não foi executado fluxo autenticado completo nem teste em produção. O Next emitiu aviso de tentativa malsucedida de completar dependências SWC do lockfile e aviso de Browserslist antigo; o build concluiu e o lockfile permaneceu intacto. Nenhuma atualização de dependência incorporada.

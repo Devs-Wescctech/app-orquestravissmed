@@ -1,11 +1,13 @@
 'use client';
 
+import { SyncExecutionSummary } from '@/components/sync/SyncExecutionSummary';
+
 import { SyncRunReport, SyncReport } from '@/components/sync/SyncRunReport';
 import { useState, useEffect, useCallback } from 'react';
 import {
     RefreshCw, CheckCircle2, XCircle, Clock, AlertTriangle, Activity, Loader2,
     Shield, Link2, Unlink, Eye, ChevronDown, ChevronUp, FileJson, X,
-    ShieldCheck, UserSquare2, Stethoscope, Building2, CalendarDays,
+    UserSquare2, Stethoscope, Building2, CalendarDays,
     ToggleLeft, ToggleRight, ArrowUpRight, Database, Wifi, WifiOff, Zap
 } from 'lucide-react';
 import { api } from '@/lib/api';
@@ -17,7 +19,6 @@ interface SyncStatus {
     health: 'healthy' | 'warning' | 'error' | 'never_synced';
     isRunning: boolean;
     queueEnabled: boolean;
-    successRate: number;
     lastSync: { id: string; startedAt: string; endedAt: string | null; totalRecords: number } | null;
     lastError: { id: string; startedAt: string; message: string } | null;
     doctors: { mapped: number };
@@ -225,24 +226,7 @@ export default function SyncDashboardPage() {
             {/* KPI Grid */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6 gap-6">
 
-                {/* Sync Health */}
-                <div className="bg-white/70 backdrop-blur-xl rounded-[32px] p-6 shadow-sm border border-slate-100/60 flex flex-col justify-between h-40 transition-all duration-300 hover:shadow-xl hover:-translate-y-1 group border-r-4 border-r-primary">
-                    <div className="flex justify-between items-start">
-                        <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest leading-tight">Saúde de<br />Sincronismo</h3>
-                        <div className={`h-10 w-10 rounded-2xl flex items-center justify-center shadow-lg transition-transform group-hover:scale-110 ${(status?.successRate || 0) >= 90 ? 'bg-primary text-white' : 'bg-rose-500 text-white'}`}>
-                            <ShieldCheck className="h-5 w-5" />
-                        </div>
-                    </div>
-                    <div>
-                        <div className="flex items-center gap-2">
-                            <div className="text-4xl font-black text-slate-900 tracking-tighter">{status?.successRate || 0}%</div>
-                            <div className={`h-2.5 w-2.5 rounded-full animate-ping ${(status?.successRate || 0) >= 90 ? 'bg-primary' : 'bg-rose-500'}`}></div>
-                        </div>
-                        <div className="h-1.5 w-full bg-slate-100 rounded-full mt-3 overflow-hidden">
-                            <div className={`h-full rounded-full transition-all duration-1000 ${(status?.successRate || 0) >= 90 ? 'bg-primary' : 'bg-rose-500'}`} style={{ width: `${status?.successRate || 0}%` }}></div>
-                        </div>
-                    </div>
-                </div>
+                <SyncExecutionSummary runs={fetchError ? null : status?.recentRuns ?? null} />
 
                 {/* VissMed Base */}
                 <div className="bg-slate-900 rounded-[32px] p-6 shadow-2xl flex flex-col justify-between h-40 transition-all duration-300 hover:scale-[1.02] hover:shadow-primary/20 group relative overflow-hidden">
