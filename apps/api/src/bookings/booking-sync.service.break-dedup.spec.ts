@@ -1,3 +1,4 @@
+import { CalendarBreakOwnership } from './calendar-break-ownership';
 import { BookingSyncService } from './booking-sync.service';
 
 // ---------------------------------------------------------------------------
@@ -183,12 +184,40 @@ describe('syncDoctoraliaBreak — ownership', () => {
         expect(client.addCalendarBreak).toHaveBeenCalledTimes(1);
         expect(update).toHaveBeenLastCalledWith(expect.objectContaining({data:expect.objectContaining({doctoraliaBreakId:'new-break-id',syncedToDoctoralia:false})}));
     });
-    it.each(['CANCELLED','BOOKED'])('legacy association without proof is preserved on %s', async status => {
+    it.each(['CANCELLED','BOOKED'])('existing legacy link continues its lifecycle on %s', async status => {
         const {service,client,prisma} = buildService({legacy:true,rec:{status,doctoraliaBreakId:'legacy'}});
+        await expect(callSync(service)).resolves.toBeUndefined();
+        if (status === 'CANCELLED') {
+            expect(client.deleteCalendarBreak).toHaveBeenCalledWith('fac-1','doc-ext-1','addr-1','legacy');
+        } else {
+            expect(client.moveCalendarBreak).toHaveBeenCalledWith('fac-1','doc-ext-1','addr-1','legacy',expect.any(Object));
+        }
+        expect(client.addCalendarBreak).not.toHaveBeenCalled();
+        expect(client.getCalendarBreaks).not.toHaveBeenCalled();
+        expect(prisma.auditLog.create).not.toHaveBeenCalled();
+    });
+    it('legacy exception cannot be used by the new association path', async () => {
+        const {prisma} = buildService({legacy:true});
+        await expect(new CalendarBreakOwnership(prisma).requireOwned('bs-1', {
+            clinicId:'clinic-1',facilityId:'fac-1',doctorId:'doc-ext-1',addressId:'addr-1',
+        }, 'remote')).rejects.toThrow('BREAK_OWNERSHIP_PENDING');
+    });
+    it('a PENDING receipt is never treated as legacy even with an existing ID', async () => {
+        const {service,prisma,client} = buildService({rec:{doctoraliaBreakId:'unconfirmed'}});
+        prisma.auditLog.findUnique.mockResolvedValue({action:'CALENDAR_BREAK_CREATION',entityId:'bs-1',details:{state:'PENDING'}});
         await expect(callSync(service)).rejects.toThrow('BREAK_OWNERSHIP_PENDING');
         expect(client.moveCalendarBreak).not.toHaveBeenCalled();
+    });
+    it('an inconsistent journal entry is never treated as a missing legacy receipt', async () => {
+        const {service,prisma,client} = buildService({rec:{doctoraliaBreakId:'unconfirmed'}});
+        prisma.auditLog.findUnique.mockResolvedValue({action:'OTHER',entityId:'bs-1',details:null});
+        await expect(callSync(service)).rejects.toThrow('BREAK_OWNERSHIP_PENDING');
+        expect(client.moveCalendarBreak).not.toHaveBeenCalled();
+    });
+    it('legacy duplicate association remains suspicious and cannot be cancelled automatically', async () => {
+        const {service,client} = buildService({legacy:true,rec:{status:'CANCELLED',doctoraliaBreakId:'duplicate'},bookingSync:{findFirst:jest.fn().mockResolvedValue({id:'another-booking'})}});
+        await expect(callSync(service)).rejects.toThrow('outro agendamento');
         expect(client.deleteCalendarBreak).not.toHaveBeenCalled();
-        expect(prisma.bookingSync.update).toHaveBeenCalledWith(expect.objectContaining({data:expect.objectContaining({syncedToDoctoralia:false})}));
     });
     it('changed doctor/address mapping cannot move a confirmed break', async () => {
         const {service,client} = buildService({rec:{doctoraliaBreakId:'owned'}, mapping:{externalId:'different-doctor',conflictData:{facilityId:'fac-1',address:{id:'different-address'}}}});
@@ -213,11 +242,10 @@ describe('syncDoctoraliaBreak — ownership', () => {
         await expect(callSync(service)).rejects.toThrow('BREAK_CREATION_UNCONFIRMED');
         expect(client.addCalendarBreak).toHaveBeenCalledTimes(1);
     });
-    it('dashboard cancellation preserves an unproven legacy break and records the reason', async () => {
-        const {service,client,prisma} = buildService({legacy:true});
+    it('dashboard cancellation keeps the existing legacy lifecycle', async () => {
+        const {service,client} = buildService({legacy:true});
         await (service as any).cancelSyncRecord('clinic-1', {id:'bs-1',doctoraliaBreakId:'legacy',doctoraliaFacilityId:'fac-1',doctoraliaDoctorId:'doc-ext-1',doctoraliaAddressId:'addr-1'});
-        expect(client.deleteCalendarBreak).not.toHaveBeenCalled();
-        expect(prisma.bookingSync.update).toHaveBeenCalledWith(expect.objectContaining({data:expect.objectContaining({syncError:expect.stringContaining('BREAK_OWNERSHIP_PENDING')})}));
+        expect(client.deleteCalendarBreak).toHaveBeenCalledWith('fac-1','doc-ext-1','addr-1','legacy');
     });
     it('404 on cancellation clears the confirmed association safely', async () => {
         const {service,client,prisma} = buildService({rec:{status:'CANCELLED',doctoraliaBreakId:'owned'}});

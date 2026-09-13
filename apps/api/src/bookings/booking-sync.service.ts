@@ -3243,7 +3243,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             throw error;
         };
         if (rec.doctoraliaBreakId) {
-            try { await ownership.requireOwned(rec.id, scope, rec.doctoraliaBreakId); }
+            try { await ownership.requireOwned(rec.id, scope, rec.doctoraliaBreakId, true); }
             catch (error) { return pending(error as Error); }
         }
 
@@ -4960,7 +4960,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                     await new CalendarBreakOwnership(this.prisma).requireOwned(syncRecord.id, {
                         clinicId, facilityId: syncRecord.doctoraliaFacilityId || '',
                         doctorId: syncRecord.doctoraliaDoctorId || '', addressId: syncRecord.doctoraliaAddressId || '',
-                    }, syncRecord.doctoraliaBreakId);
+                    }, syncRecord.doctoraliaBreakId, true);
                     await this.rateLimiter.acquire('doctoralia');
                     await client.deleteCalendarBreak(
                         syncRecord.doctoraliaFacilityId || '',

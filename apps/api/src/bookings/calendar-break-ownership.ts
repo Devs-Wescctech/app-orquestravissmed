@@ -9,7 +9,11 @@ export class CalendarBreakOwnership {
 
     async read(bookingId: string): Promise<any> {
         const entry = await this.prisma.auditLog.findUnique({ where: { id: journalId(bookingId) } });
-        return entry?.action === 'CALENDAR_BREAK_CREATION' && entry.entityId === bookingId ? entry.details : null;
+        if (!entry) return null;
+        if (entry.action !== 'CALENDAR_BREAK_CREATION' || entry.entityId !== bookingId || !entry.details) {
+            throw new Error('BREAK_OWNERSHIP_PENDING: comprovante inconsistente; conferir a associação.');
+        }
+        return entry.details;
     }
 
     matches(receipt: any, scope: BreakScope, breakId?: string): boolean {
@@ -18,8 +22,12 @@ export class CalendarBreakOwnership {
             && Object.entries(scope).every(([key, value]) => receipt[key] === String(value));
     }
 
-    async requireOwned(bookingId: string, scope: BreakScope, breakId: string): Promise<void> {
-        if (!this.matches(await this.read(bookingId), scope, breakId)) {
+    async requireOwned(bookingId: string, scope: BreakScope, breakId: string, allowExistingAssociation = false): Promise<void> {
+        const receipt = await this.read(bookingId);
+        // Transition only for IDs already persisted on BookingSync. Never use this
+        // exception to adopt a newly discovered remote ID or bypass a PENDING receipt.
+        const legacyAssociation = receipt === null && allowExistingAssociation;
+        if (!legacyAssociation && !this.matches(receipt, scope, breakId)) {
             throw new Error('BREAK_OWNERSHIP_PENDING: não há comprovante de criação deste bloqueio para este agendamento. Bloqueio preservado; conferir a associação.');
         }
         const other = await this.prisma.bookingSync.findFirst({ where: {
