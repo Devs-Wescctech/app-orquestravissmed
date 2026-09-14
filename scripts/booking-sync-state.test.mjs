@@ -1,6 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { getBookingSyncState } from '../apps/web/src/lib/booking-sync-state.ts';
+import fs from 'node:fs';
+import { createRequire, Module } from 'node:module';
+import { fileURLToPath } from 'node:url';
+const require = createRequire(import.meta.url);
+const ts = require('typescript');
+const filename = fileURLToPath(new URL('../apps/web/src/lib/booking-sync-state.ts', import.meta.url));
+const compiled = new Module(filename);
+compiled.paths = require.resolve.paths('typescript');
+compiled._compile(ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS },
+}).outputText, filename);
+const { getBookingSyncState } = compiled.exports;
 
 const blocked = {
     origin: 'VISMED', status: 'BOOKED', vismedAppointmentId: 'local-1',
@@ -43,6 +54,17 @@ test('Doctoralia booking awaiting VissMed remains pending', () => {
 
 test('booking ID does not turn an unconfirmed block into a confirmed one', () => {
     const state = getBookingSyncState({ ...blocked, doctoraliaBookingId: 'remote-1', syncedToDoctoralia: false });
-    assert.equal(state.syncedToDoctoralia, true);
+    assert.equal(state.syncedToDoctoralia, false);
     assert.equal(state.doctoraliaBreakConfirmed, false);
+});
+
+test('confirmed blocks and pending refusals or ownership remain distinct in the same list', () => {
+    const records = [
+        ...Array.from({ length: 16 }, () => blocked),
+        { ...blocked, syncError: 'BREAK_OWNERSHIP_PENDING' },
+        { origin: 'DOCTORALIA', doctoraliaBookingId: 'refused', syncedToDoctoralia: true, syncError: 'VISMED_REFUSAL_CANCEL_PENDING' },
+        { ...blocked, doctoraliaBookingId: 'moving', syncedToDoctoralia: false },
+    ].map(getBookingSyncState);
+    assert.equal(records.filter(r => r.syncedToVismed && r.syncedToDoctoralia).length, 16);
+    assert.equal(records.filter(r => !r.syncedToVismed || !r.syncedToDoctoralia).length, 3);
 });

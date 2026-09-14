@@ -11,8 +11,9 @@ const {bookingSyncState,bookingPendingNotice}=m.exports;
 test('existing IDs do not overwrite pending flags',()=>{
  assert.equal(bookingSyncState({doctoraliaBookingId:'123',syncedToDoctoralia:false}).syncedToDoctoralia,false);
 });
-test('a persisted break can represent a legacy VISSMED association',()=>{
- assert.equal(bookingSyncState({doctoraliaBreakId:'123'}).syncedToDoctoralia,true);
+test('a persisted break requires confirmation before claiming synchronization',()=>{
+ assert.equal(bookingSyncState({doctoraliaBreakId:'123'}).syncedToDoctoralia,false);
+ assert.equal(bookingSyncState({origin:'VISMED',status:'BOOKED',doctoraliaBreakId:'123',syncedToDoctoralia:true}).syncedToDoctoralia,true);
 });
 test('ownership and refusal pending remain visibly pending',()=>{
  for(const syncError of ['BREAK_OWNERSHIP_PENDING','VISMED_REFUSAL_CANCEL_PENDING','BREAK_CONFLICT']) {

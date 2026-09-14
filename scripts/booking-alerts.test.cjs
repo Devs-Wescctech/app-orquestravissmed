@@ -18,6 +18,13 @@ function loadSource(relativePath, imports = {}) {
     return module.exports;
 }
 const presentation = loadSource('apps/web/src/lib/booking-alert-presentation.ts');
+test('pending refusal cancellation takes precedence over unavailable time advice', () => {
+    const result = presentation.getAlertPresentation('VISMED_CREATE_FAILED', 'Horário indisponível VISMED_REFUSAL_CANCEL_PENDING');
+    assert.equal(result.title, 'Cancelamento na Doctoralia pendente');
+    assert.match(result.description, /Aguarde a confirmação/);
+    assert.doesNotMatch(result.description, /tentar novamente|escolher outro horário/);
+    assert.equal(result.needsMapping, false);
+});
 const { BookingAlerts } = loadSource('apps/web/src/components/bookings/BookingAlerts.tsx', {
     '@/lib/booking-alert-presentation': presentation,
 });

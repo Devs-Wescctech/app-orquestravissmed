@@ -234,7 +234,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         });
 
         // Dead-letter: esgotadas as tentativas de criar o agendamento na VisMed,
-        // alertar o operador no dashboard (precisa agendar manualmente na VisMed).
+        // alertar o operador no dashboard para conferir a causa e o estado nas duas agendas.
         this.queueService.registerDeadLetterHandler('slot-booked', async (payload, clinicId, error) => {
             const bookingId = payload?.data?.visit_booking?.id;
             if (!bookingId) return;
@@ -4163,6 +4163,9 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                     return this.docplannerService.createClient(conn.domain || 'doctoralia.com.br', conn.clientId, conn.clientSecret || '');
                 },
             });
+            // A confirmed cancellation closes this booking's earlier creation warning.
+            // Pending or uncertain cancellations must keep their warning visible.
+            await this.resolveSkippedAlertForBooking(record.id);
         } catch (error: any) {
             if (String(error?.message).startsWith(REFUSAL_PENDING)) throw error;
             throw new Error(`${REFUSAL_PENDING}: cancelamento não concluído; conferir a integração.`);

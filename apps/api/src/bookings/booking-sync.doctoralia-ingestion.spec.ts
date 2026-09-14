@@ -108,6 +108,7 @@ describe('BookingSyncService — definitive refusal through the booking handler'
         prisma.auditLog = { findUnique: jest.fn(async () => receipt), create: jest.fn(async ({ data }) => receipt = data),
             update: jest.fn(async ({ data }) => receipt = { ...receipt, ...data }) };
         prisma.$transaction = jest.fn(async fn => fn(prisma));
+        prisma.skippedBookingAlert = { updateMany: jest.fn().mockResolvedValue({ count: 1 }) };
         const remote = Object.assign(client, {
             getBooking: jest.fn().mockResolvedValue({ ...booking, status: 'booked' }),
             cancelBooking: jest.fn().mockResolvedValue(null),
@@ -123,6 +124,10 @@ describe('BookingSyncService — definitive refusal through the booking handler'
         expect(s.preflight).toHaveBeenCalledTimes(2);
         expect(s.remote.cancelBooking).toHaveBeenCalledTimes(1);
         expect(s.record).toMatchObject({ status: 'CANCELLED', syncedToVismed: false, syncedToDoctoralia: true });
+        expect(s.prisma.skippedBookingAlert.updateMany).toHaveBeenCalledWith({
+            where: { bookingSyncId: s.record.id, resolved: false },
+            data: { resolved: true, resolvedAt: expect.any(Date) },
+        });
         await s.run();
         expect(s.create).toHaveBeenCalledTimes(1);
         expect(s.remote.cancelBooking).toHaveBeenCalledTimes(1);
@@ -147,6 +152,7 @@ describe('BookingSyncService — definitive refusal through the booking handler'
         expect(s.create).toHaveBeenCalledTimes(1);
         expect(s.remote.cancelBooking).toHaveBeenCalledTimes(1);
         expect(s.record).toMatchObject({ status: 'FAILED', syncedToDoctoralia: false });
+        expect(s.prisma.skippedBookingAlert.updateMany).not.toHaveBeenCalled();
     });
     it('does not cancel or recreate after a pending marker without proof', async () => {
         const s = setup(); Object.assign(s.record, { status: 'FAILED', syncError: REFUSAL_PENDING });

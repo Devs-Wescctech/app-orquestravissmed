@@ -11,6 +11,13 @@ export function getAlertHeading(total: number, groups: Array<{ reason?: string }
 }
 
 export function getAlertPresentation(reason?: string, error?: string | null) {
+    if (error?.includes('VISMED_REFUSAL_CANCEL_PENDING')) {
+        return {
+            title: 'Cancelamento na Doctoralia pendente',
+            description: 'A VISSMED recusou o horário. Aguarde a confirmação do cancelamento na Doctoralia antes de informar ao paciente que a consulta foi cancelada.',
+            needsMapping: false,
+        };
+    }
     if (reason === 'DOCTOR_NOT_LINKED') {
         return {
             title: 'Médico sem vínculo com a Doctoralia',

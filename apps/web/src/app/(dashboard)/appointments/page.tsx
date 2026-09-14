@@ -10,7 +10,6 @@ import { bookingPendingNotice, bookingSyncState } from '@/lib/booking-sync-state
 import { useClinic } from '@/lib/clinic-store';
 import { useAuthStore } from '@/lib/store';
 import { toast } from 'sonner';
-import { getBookingSyncState } from '@/lib/booking-sync-state';
 
 interface Doctor {
     externalId: string;
@@ -46,8 +45,6 @@ interface BookingRecord {
     booked_by?: string;
     syncedToVismed?: boolean;
     syncedToDoctoralia?: boolean;
-    doctoraliaBreakId?: string;
-    syncError?: string;
 }
 
 type ViewMode = 'day' | 'week' | 'month';
