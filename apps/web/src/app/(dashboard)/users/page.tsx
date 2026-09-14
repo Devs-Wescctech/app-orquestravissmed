@@ -2,6 +2,9 @@
 import { useState, useEffect } from 'react';
 import { Search, Plus, MoreHorizontal, ShieldCheck, Mail, Loader2 } from 'lucide-react';
 import { api } from '@/lib/api';
+import { useAuthStore } from '@/lib/store';
+import { canManageAccounts } from '@/lib/admin-access';
+import { AdminAccessNotice } from '@/components/layout/AdminAccessNotice';
 
 interface User {
     id: string;
@@ -14,12 +17,18 @@ interface User {
 }
 
 export default function UsersManagement() {
+    const currentUser = useAuthStore(state => state.user);
+    const canManage = canManageAccounts(currentUser);
+    const [loadError, setLoadError] = useState(false);
     const [users, setUsers] = useState<User[]>([]);
     const [searchTerm, setSearchTerm] = useState('');
     const [isLoading, setIsLoading] = useState(true);
 
     useEffect(() => {
+        if (!canManage) { setUsers([]); setIsLoading(false); return; }
         const fetchUsers = async () => {
+            setIsLoading(true);
+            setLoadError(false);
             try {
                 const response = await api.get('/users');
                 const data = response.data;
@@ -34,19 +43,23 @@ export default function UsersManagement() {
                 }));
                 setUsers(formattedUsers);
             } catch (error) {
-                console.error('Error fetching users:', error);
+                setUsers([]);
+                setLoadError(true);
             } finally {
                 setIsLoading(false);
             }
         };
 
         fetchUsers();
-    }, []);
+    }, [canManage]);
 
     const filteredUsers = users.filter((u) => u.name.toLowerCase().includes(searchTerm.toLowerCase()));
 
+    if (!canManage) return <AdminAccessNotice />;
+
     return (
         <div className="max-w-6xl mx-auto space-y-6">
+            {loadError && <p role="alert" className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">Não foi possível consultar os usuários. Confira sua permissão e atualize a página para tentar novamente.</p>}
             <div className="flex justify-between items-start mb-8">
                 <div>
                     <h1 className="text-3xl font-bold tracking-tight text-slate-900">Usuários</h1>

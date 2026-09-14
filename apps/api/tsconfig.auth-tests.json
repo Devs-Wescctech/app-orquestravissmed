@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["src/auth/*.spec.ts", "src/users/*.spec.ts", "test/helpers/auth-test-app.ts"],
+  "exclude": [],
+  "compilerOptions": { "noEmit": true, "incremental": false }
+}

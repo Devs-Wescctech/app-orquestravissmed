@@ -2,9 +2,12 @@ import { Controller, Get, Post, Body, Param, Put, Delete, UseGuards, Request, Ba
 import { UsersService } from './users.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
+import { Roles } from '../auth/roles.decorator';
+import { Role } from '@prisma/client';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import * as bcrypt from 'bcryptjs';
 import { PrismaService } from '../prisma/prisma.service';
+import { userWriteInput } from './user-write-input';
 
 @ApiTags('users')
 @ApiBearerAuth()
@@ -18,6 +21,7 @@ export class UsersController {
 
     @ApiOperation({ summary: 'Get all users' })
     @Get()
+    @Roles(Role.SUPER_ADMIN)
     async findAll() {
         return this.usersService.findAll();
     }
@@ -71,14 +75,16 @@ export class UsersController {
 
     @ApiOperation({ summary: 'Get a single user by ID' })
     @Get(':id')
+    @Roles(Role.SUPER_ADMIN)
     async findOne(@Param('id') id: string) {
         return this.usersService.findById(id);
     }
 
     @ApiOperation({ summary: 'Create a new user' })
     @Post()
-    async create(@Body() data: any) {
-        // Basic implementation for MVP matching the specific frontend
+    @Roles(Role.SUPER_ADMIN)
+    async create(@Body() body: any) {
+        const data = userWriteInput(body, true);
         const hashedPassword = await bcrypt.hash(data.password, 10);
         const user = await this.prisma.user.create({
             data: {
@@ -100,8 +106,11 @@ export class UsersController {
 
     @ApiOperation({ summary: 'Update an existing user' })
     @Put(':id')
-    async update(@Param('id') id: string, @Body() data: any) {
-        let updateData: any = { ...data };
+    @Roles(Role.SUPER_ADMIN)
+    async update(@Param('id') id: string, @Body() body: any, @Request() req: any) {
+        const data = userWriteInput(body);
+        if (id === req.user.id && data.active === false) throw new BadRequestException('Você não pode desativar a própria conta');
+        const updateData: any = { ...data };
         if (data.password) {
             updateData.password = await bcrypt.hash(data.password, 10);
         }
@@ -115,7 +124,10 @@ export class UsersController {
 
     @ApiOperation({ summary: 'Delete a user' })
     @Delete(':id')
-    async remove(@Param('id') id: string) {
-        return this.prisma.user.delete({ where: { id } });
+    @Roles(Role.SUPER_ADMIN)
+    async remove(@Param('id') id: string, @Request() req: any) {
+        if (id === req.user.id) throw new BadRequestException('Você não pode excluir a própria conta');
+        const { password, ...user } = await this.prisma.user.delete({ where: { id } });
+        return user;
     }
 }

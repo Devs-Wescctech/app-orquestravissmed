@@ -7,6 +7,7 @@ import Link from 'next/link';
 import { api } from '@/lib/api';
 import { useClinic } from '@/lib/clinic-store';
 import { useAuthStore } from '@/lib/store';
+import { canManageAccounts } from '@/lib/admin-access';
 
 interface SkippedAlertDoctor {
     vismedDoctorId: string;
@@ -31,6 +32,7 @@ interface SkippedAlertDoctor {
 
 export default function DashboardOverview() {
     const { user } = useAuthStore();
+    const canManage = canManageAccounts(user);
     const { activeClinic } = useClinic();
     const [isLoading, setIsLoading] = useState(true);
     const [skippedAlerts, setSkippedAlerts] = useState<{ total: number; doctors: SkippedAlertDoctor[] }>({ total: 0, doctors: [] });
@@ -58,8 +60,8 @@ export default function DashboardOverview() {
                 const clinicId = activeClinic.id;
 
                 const [usersRes, clinicsRes, syncRes, doctorsCountRes, calendarRes, doctorsRes, vismedRes, skippedRes] = await Promise.all([
-                    api.get('/users').catch(() => ({ data: [] })),
-                    api.get('/clinics').catch(() => ({ data: [] })),
+                    canManage ? api.get('/users').catch(() => ({ data: [] })) : Promise.resolve({ data: [] }),
+                    api.get('/clinics/my').catch(() => ({ data: [] })),
                     api.get(`/sync/${clinicId}/history`).catch(() => ({ data: null })),
                     api.get('/doctors/count', { params: { clinicId } }).catch(() => ({ data: { total: 0, linked: 0, unlinked: 0 } })),
                     api.get('/appointments/calendar-status', { params: { clinicId } }).catch(() => ({ data: { calendarEnabled: false } })),
@@ -321,8 +323,8 @@ export default function DashboardOverview() {
                         </div>
                     </div>
                     <div>
-                        <div className="text-4xl font-black text-slate-900 tracking-tighter">{metrics.activeUsers}</div>
-                        <p className="text-[10px] font-black text-slate-500 mt-1 uppercase tracking-widest">Membros Integrados</p>
+                        <div className="text-4xl font-black text-slate-900 tracking-tighter">{canManage ? metrics.activeUsers : '—'}</div>
+                        <p className="text-[10px] font-black text-slate-500 mt-1 uppercase tracking-widest">{canManage ? 'Membros Integrados' : 'Restrito ao Super Admin'}</p>
                     </div>
                 </div>
 
@@ -336,7 +338,7 @@ export default function DashboardOverview() {
                     </div>
                     <div>
                         <div className="text-4xl font-black text-slate-900 tracking-tighter">{metrics.activeClinics}</div>
-                        <p className="text-[10px] font-black text-slate-500 mt-1 uppercase tracking-widest">Rede VissMed</p>
+                        <p className="text-[10px] font-black text-slate-500 mt-1 uppercase tracking-widest">{canManage ? 'Rede VissMed' : 'Clínicas com acesso'}</p>
                     </div>
                 </div>
 
