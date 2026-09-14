@@ -7,6 +7,7 @@ import { DoctoraliaMetricsService } from '../metrics/doctoralia-metrics.service'
 import { DoctoraliaCircuitOpenError } from '../integrations/doctoralia-circuit-breaker';
 import { DoctoraliaQueueFullError } from '../integrations/doctoralia-queue.errors';
 import { ClaimDeferError } from './booking-claim.service';
+import { REFUSAL_PENDING } from './vismed-refusal-cancellation';
 
 const conn = {
     clinicId: 'clinic-ingestion',
@@ -88,6 +89,77 @@ function buildService() {
     );
     return { service, prisma, queue, rateLimiter, guard, client, metrics, claim };
 }
+
+describe('BookingSyncService — definitive refusal through the booking handler', () => {
+    function setup() {
+        const built = buildService();
+        const { service, prisma, client } = built;
+        const body = notification();
+        const booking = body.data.visit_booking;
+        const record: any = { id: 'refused-record', clinicId: conn.clinicId, origin: 'DOCTORALIA', status: 'PROCESSING',
+            doctoraliaBookingId: booking.id, doctoraliaDoctorId: body.data.doctor.id,
+            doctoraliaFacilityId: body.data.facility.id, doctoraliaAddressId: body.data.address.id,
+            startAt: new Date(booking.start_at), endAt: new Date(booking.end_at) };
+        let receipt: any = null;
+        prisma.bookingSync.upsert.mockResolvedValue(record);
+        prisma.bookingSync.findUnique.mockImplementation(async () => ({ ...record }));
+        prisma.bookingSync.update.mockImplementation(async ({ data }: any) => Object.assign(record, data));
+        prisma.mapping.findFirst.mockResolvedValue({ vismedId: 'vm-doctor', externalId: body.data.doctor.id });
+        prisma.auditLog = { findUnique: jest.fn(async () => receipt), create: jest.fn(async ({ data }) => receipt = data),
+            update: jest.fn(async ({ data }) => receipt = { ...receipt, ...data }) };
+        prisma.$transaction = jest.fn(async fn => fn(prisma));
+        const remote = Object.assign(client, {
+            getBooking: jest.fn().mockResolvedValue({ ...booking, status: 'booked' }),
+            cancelBooking: jest.fn().mockResolvedValue(null),
+        });
+        const create = jest.spyOn(service as any, 'createVismedAppointment').mockResolvedValue({ status: 402, msg: 'Horário indisponível, tente outro horários' });
+        const preflight = jest.spyOn(service as any, 'preflightVismedAppointment').mockResolvedValue({ state: 'confirmed_absent' });
+        return { ...built, body, record, remote, create, preflight,
+            run: () => (service as any).handleSlotBooked(conn.clinicId, body.data, body) };
+    }
+    it('cancels only after the definitive create response and a second absence check', async () => {
+        const s = setup();
+        await expect(s.run()).resolves.toMatchObject({ action: 'cancelled_after_vismed_refusal' });
+        expect(s.preflight).toHaveBeenCalledTimes(2);
+        expect(s.remote.cancelBooking).toHaveBeenCalledTimes(1);
+        expect(s.record).toMatchObject({ status: 'CANCELLED', syncedToVismed: false, syncedToDoctoralia: true });
+        await s.run();
+        expect(s.create).toHaveBeenCalledTimes(1);
+        expect(s.remote.cancelBooking).toHaveBeenCalledTimes(1);
+    });
+    it('does not turn a transport failure into a cancellation', async () => {
+        const s = setup(); s.create.mockRejectedValue(new Error('timeout'));
+        await expect(s.run()).rejects.toThrow('timeout');
+        expect(s.remote.cancelBooking).not.toHaveBeenCalled();
+        expect(s.prisma.auditLog.create).not.toHaveBeenCalled();
+    });
+    it('treats refusal plus a creation ID as contradictory, without cancelling or confirming', async () => {
+        const s = setup();
+        s.create.mockResolvedValue({ status: 402, msg: 'Horário indisponível, tente outro horários', idPacienteAgendamento: 'unexpected' });
+        await expect(s.run()).rejects.toThrow('falha na criação');
+        expect(s.remote.cancelBooking).not.toHaveBeenCalled();
+        expect(s.record).toMatchObject({ status: 'FAILED', syncedToVismed: false });
+    });
+    it('holds an uncertain cancellation and retries neither the create nor the delete', async () => {
+        const s = setup(); s.remote.cancelBooking.mockRejectedValue(new Error('timeout'));
+        await expect(s.run()).rejects.toThrow(REFUSAL_PENDING);
+        await expect(s.run()).rejects.toThrow(REFUSAL_PENDING);
+        expect(s.create).toHaveBeenCalledTimes(1);
+        expect(s.remote.cancelBooking).toHaveBeenCalledTimes(1);
+        expect(s.record).toMatchObject({ status: 'FAILED', syncedToDoctoralia: false });
+    });
+    it('does not cancel or recreate after a pending marker without proof', async () => {
+        const s = setup(); Object.assign(s.record, { status: 'FAILED', syncError: REFUSAL_PENDING });
+        await expect(s.run()).rejects.toThrow('comprovante da recusa');
+        expect(s.create).not.toHaveBeenCalled();
+        expect(s.remote.cancelBooking).not.toHaveBeenCalled();
+    });
+    it('does not cancel when the second VISSMED read finds a consultation', async () => {
+        const s = setup(); s.preflight.mockResolvedValueOnce({ state: 'confirmed_absent' }).mockResolvedValueOnce({ state: 'found', vismedAppointmentId: 'existing' });
+        await expect(s.run()).rejects.toThrow('confirmar ausência');
+        expect(s.remote.cancelBooking).not.toHaveBeenCalled();
+    });
+});
 
 describe('BookingSyncService — reconciliação Doctoralia com vínculos atuais', () => {
     const clinicId = conn.clinicId;
@@ -1409,6 +1481,18 @@ describe('BookingSyncService — autoridade clínica na reconciliação de cance
         expect(built.client.getBookings).toHaveBeenCalledTimes(1);
         expect(built.prisma.bookingSync.updateMany).toHaveBeenCalledTimes(1);
         expect(built.propagate).toHaveBeenCalledWith(linkedRecord.id);
+    });
+
+    it('não consulta endereços de bloqueios históricos fora dos agendamentos elegíveis', async () => {
+        const built = setupCancelledReconciliation(validMapping);
+        built.prisma.bookingSync.findMany.mockReset().mockImplementation(async (args: any) => {
+            if (args.where.doctoraliaBookingId?.not === null) return [linkedRecord];
+            return [{ doctoraliaFacilityId: 'facility-1', doctoraliaAddressId: 'unrelated-history' }];
+        });
+        await (built.service as any).reconcileCancelledOnDoctoralia(clinicId);
+        expect(built.prisma.bookingSync.findMany).toHaveBeenCalledTimes(1);
+        expect(built.client.getBookings).toHaveBeenCalledWith('facility-1', 'doctor-1', 'address-1', expect.any(String), expect.any(String));
+        expect(built.client.getBookings).toHaveBeenCalledTimes(1);
     });
 });
 
