@@ -7,6 +7,9 @@ import {
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { bookingPendingNotice, bookingSyncState } from '@/lib/booking-sync-state';
+import { useBookingConflicts } from '@/hooks/use-booking-conflicts';
+import { conflictExplanation } from '@/lib/booking-conflict-details';
+import { BookingConflictDetails } from '@/components/bookings/BookingConflictDetails';
 import { useClinic } from '@/lib/clinic-store';
 import { useAuthStore } from '@/lib/store';
 import { toast } from 'sonner';
@@ -130,6 +133,7 @@ export default function AppointmentsPage() {
 
     const [doctoraliaBookings, setDoctoraliaBookings] = useState<any[]>([]);
     const [syncRecords, setSyncRecords] = useState<BookingRecord[]>([]);
+    const conflictDetails = useBookingConflicts(clinicId, syncRecords);
     const [selectedBooking, setSelectedBooking] = useState<any>(null);
     const [syncStats, setSyncStats] = useState<any>(null);
 
@@ -479,6 +483,10 @@ export default function AppointmentsPage() {
                                 className="w-full rounded-2xl border border-slate-100 p-3 text-left transition-colors hover:bg-amber-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-amber-500">
                                 <span className="block text-xs font-bold text-slate-700">{booking.patientName} · {new Date(booking.startAt).toLocaleDateString('pt-BR')} {formatTime(booking.startAt)}</span>
                                 <span className="mt-1 block text-xs text-amber-800">{bookingPendingNotice(booking)!.title}</span>
+                                {/BREAK_CONFLICT|BREAK_OWNERSHIP_PENDING/.test(booking.syncError || '') && conflictExplanation(conflictDetails[booking.id!]).map(line => (
+                                    <span key={line} className="mt-1 block text-xs text-amber-800">{line}</span>
+                                ))}
+                                {conflictDetails[booking.id!] && <span className="mt-1 block text-[10px] text-slate-500">Consulta em {new Date(conflictDetails[booking.id!].checkedAt).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })} (Brasília).</span>}
                             </button>
                         ))}
                     </div>
@@ -862,7 +870,9 @@ export default function AppointmentsPage() {
                         {bookingPendingNotice(selectedBooking) && (
                             <div role="status" className="mb-5 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-900">
                                 <p className="text-sm font-bold">{bookingPendingNotice(selectedBooking)!.title}</p>
-                                <p className="mt-1 text-xs leading-relaxed">{bookingPendingNotice(selectedBooking)!.detail}</p>
+                                {/BREAK_CONFLICT|BREAK_OWNERSHIP_PENDING/.test(selectedBooking.syncError || '')
+                                    ? <BookingConflictDetails data={conflictDetails[selectedBooking.id]} />
+                                    : <p className="mt-1 text-xs leading-relaxed">{bookingPendingNotice(selectedBooking)!.detail}</p>}
                             </div>
                         )}
                         <div className="space-y-4 bg-slate-50 rounded-2xl p-5">

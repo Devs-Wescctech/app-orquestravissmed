@@ -32,7 +32,11 @@ export function bookingPendingNotice(record: BookingSyncStateInput): { title: st
         title: 'Cancelamento na Doctoralia pendente',
         detail: 'A VISSMED recusou o horário. O cancelamento ainda precisa ser confirmado na Doctoralia; não informe ao paciente que a consulta está cancelada antes dessa conferência.',
     };
-    if (/BREAK_OWNERSHIP_PENDING|BREAK_CONFLICT/.test(error)) return {
+    if (error.includes('BREAK_CONFLICT')) return {
+        title: 'Conflito com bloqueio existente na Doctoralia',
+        detail: 'A criação do bloqueio foi recusada por conflito. Confira os intervalos e agendamentos relacionados.',
+    };
+    if (error.includes('BREAK_OWNERSHIP_PENDING')) return {
         title: 'Bloqueio preservado para conferência',
         detail: 'Não foi possível confirmar que o bloqueio pertence somente a este agendamento. A equipe deve conferir a associação antes de liberar ou movimentar o horário.',
     };
