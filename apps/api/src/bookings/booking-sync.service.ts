@@ -1,4 +1,6 @@
 import { CalendarBreakOwnership } from './calendar-break-ownership';
+import { reconciliationAddresses } from './reconciliation-addresses';
+import { isDefinitiveSlotRefusal, REFUSAL_PENDING, VismedRefusalCancellation } from './vismed-refusal-cancellation';
 import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { DocplannerService } from '../integrations/docplanner.service';
@@ -1836,11 +1838,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 return local.toISOString().replace(/\.\d{3}Z$/, '-03:00');
             };
 
-            const addresses = await this.prisma.bookingSync.findMany({
-                where: { clinicId, doctoraliaDoctorId: doctorId, doctoraliaAddressId: { not: null } },
-                select: { doctoraliaAddressId: true, doctoraliaFacilityId: true },
-                distinct: ['doctoraliaAddressId'],
-            });
+            const addresses = reconciliationAddresses(doctorLinked);
 
             for (const addr of addresses) {
                 if (!addr.doctoraliaAddressId || !addr.doctoraliaFacilityId) continue;
@@ -1869,6 +1867,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                     for (const rec of doctorLinked) {
                         if (!rec.doctoraliaBookingId) continue;
                         if (rec.doctoraliaAddressId !== addr.doctoraliaAddressId) continue;
+                        if (rec.doctoraliaFacilityId !== addr.doctoraliaFacilityId) continue;
                         if (liveIds.has(rec.doctoraliaBookingId)) continue;
 
                         // Anti-race: depois de um moveBooking nosso (VisMed→Doctoralia), a Doctoralia
@@ -3709,6 +3708,10 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         if (mapping) {
             vismedDoctorId = mapping.vismedId;
             try {
+                if (String(reserved.syncError || '').startsWith(REFUSAL_PENDING)) {
+                    await this.cancelDefinitivelyRefusedBooking(reserved, mapping, booking, claimSignal);
+                    return { processed: true, action: 'cancelled_after_vismed_refusal' };
+                }
                 // PROCESSING herdado ou qualquer tentativa anterior é incerta.
                 // Só uma ausência conclusiva em todas as unidades autoriza POST.
                 if (needsFailClosedPreflight) {
@@ -3766,7 +3769,12 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                     claimSignal,
                 );
 
-                if (this.isVismedLogicalFailure(vismedCreateResult)) {
+                if (isDefinitiveSlotRefusal(vismedCreateResult)) {
+                    await this.cancelDefinitivelyRefusedBooking(reserved, mapping, booking, claimSignal, true);
+                    return { processed: true, action: 'cancelled_after_vismed_refusal' };
+                }
+
+                if (vismedCreateResult?.status === 402 || this.isVismedLogicalFailure(vismedCreateResult)) {
                     // 200 com indicador de erro no corpo = agendamento NÃO criado na VisMed,
                     // mesmo que algum campo de ID esteja presente.
                     throw new Error(`VisMed retornou falha na criação do agendamento. ${this.extractVismedBodyError(vismedCreateResult)}`.trim());
@@ -3816,7 +3824,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                         vismedDoctorId: vismedDoctorId || undefined,
                         status: 'FAILED',
                         syncError: String(err.message || 'Failed to create in VisMed').slice(0, 500),
-                        syncedToDoctoralia: true,
+                        syncedToDoctoralia: !String(err.message || '').startsWith(REFUSAL_PENDING),
                         syncedToVismed: false,
                     },
                 }).catch(() => {});
@@ -4134,6 +4142,31 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         const rawId = result.idpacienteagendamento || result.id || result.idPacienteAgendamento;
         if (rawId === undefined || rawId === null || rawId === '' || rawId === 0 || rawId === '0') return null;
         return String(rawId);
+    }
+
+    private async cancelDefinitivelyRefusedBooking(record: any, mapping: any, booking: any, signal: AbortSignal, observedRefusal = false): Promise<void> {
+        try {
+            if (String(booking.id) !== record.doctoraliaBookingId || String(mapping.externalId) !== record.doctoraliaDoctorId
+                || Date.parse(booking.start_at) !== new Date(record.startAt).getTime()
+                || Date.parse(booking.end_at) !== new Date(record.endAt).getTime()) {
+                throw new Error('notificação ou vínculo mudou; conferir a consulta.');
+            }
+            await new VismedRefusalCancellation(this.prisma).run({ ...record, vismedDoctorId: mapping.vismedId }, {
+                observedRefusal,
+                signal,
+                confirmAbsent: async () => (await this.preflightVismedAppointment(record.clinicId, mapping.vismedId, booking, record.id, signal)).state === 'confirmed_absent',
+                getClient: async () => {
+                    const conn = await this.prisma.integrationConnection.findFirst({ where: {
+                        clinicId: record.clinicId, provider: 'doctoralia', status: { not: 'disconnected' },
+                    } });
+                    if (!conn?.clientId) throw new Error('conexão Doctoralia indisponível');
+                    return this.docplannerService.createClient(conn.domain || 'doctoralia.com.br', conn.clientId, conn.clientSecret || '');
+                },
+            });
+        } catch (error: any) {
+            if (String(error?.message).startsWith(REFUSAL_PENDING)) throw error;
+            throw new Error(`${REFUSAL_PENDING}: cancelamento não concluído; conferir a integração.`);
+        }
     }
 
     /** Detecta falha lógica no corpo de uma resposta 200 da VisMed (mesmo que haja algum ID presente). */

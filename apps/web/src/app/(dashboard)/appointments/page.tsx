@@ -6,6 +6,7 @@ import {
     Plus, ChevronDown, ShieldCheck,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import { bookingPendingNotice, bookingSyncState } from '@/lib/booking-sync-state';
 import { useClinic } from '@/lib/clinic-store';
 import { useAuthStore } from '@/lib/store';
 import { toast } from 'sonner';
@@ -41,6 +42,8 @@ interface BookingRecord {
     booked_by?: string;
     syncedToVismed?: boolean;
     syncedToDoctoralia?: boolean;
+    doctoraliaBreakId?: string;
+    syncError?: string;
 }
 
 type ViewMode = 'day' | 'week' | 'month';
@@ -164,9 +167,11 @@ export default function AppointmentsPage() {
 
     useEffect(() => { fetchDoctors(); }, [fetchDoctors]);
 
+    const [syncReadError, setSyncReadError] = useState(false);
     const fetchBookings = useCallback(async () => {
         if (!clinicId || !selectedDoctorId) return;
         setIsFetching(true);
+        setSyncReadError(false);
         try {
             const [bookingsRes, syncRes, statsRes] = await Promise.all([
                 api.get('/appointments/bookings', {
@@ -174,7 +179,7 @@ export default function AppointmentsPage() {
                 }),
                 api.get('/booking-sync/records', {
                     params: { clinicId, doctoraliaDoctorId: selectedDoctorId, start: rangeStart, end: rangeEnd }
-                }).catch(() => ({ data: [] })),
+                }).catch(() => { setSyncReadError(true); return { data: [] }; }),
                 api.get('/booking-sync/stats', { params: { clinicId } }).catch(() => ({ data: null })),
             ]);
             setDoctoraliaBookings(bookingsRes.data?.bookings || []);
@@ -195,13 +200,10 @@ export default function AppointmentsPage() {
 
         for (const rec of syncRecords) {
             if (rec.doctoraliaBookingId) seenDoctoraliaIds.add(rec.doctoraliaBookingId);
-            // Deriva sync status pela PRESENÇA dos IDs reais (mais confiável que
-            // os flags persistidos, que podem ficar dessincronizados após
-            // adopt/reschedule/race conditions).
+            // Existing identifiers do not override a recorded pending operation.
             merged.push({
                 ...rec,
-                syncedToVismed: !!rec.vismedAppointmentId,
-                syncedToDoctoralia: !!rec.doctoraliaBookingId,
+                ...bookingSyncState(rec),
             });
         }
 
@@ -391,6 +393,7 @@ export default function AppointmentsPage() {
     const totalBookings = activeBookings.length;
     const fullySynced = activeBookings.filter(b => b.syncedToVismed && b.syncedToDoctoralia).length;
     const pendingSync = activeBookings.filter(b => !b.syncedToVismed || !b.syncedToDoctoralia).length;
+    const reviewBookings = syncRecords.filter(b => bookingPendingNotice(b)).map(b => ({ ...b, ...bookingSyncState(b) }));
 
     if (isLoading) {
         return (
@@ -456,6 +459,30 @@ export default function AppointmentsPage() {
                     </div>
                 ))}
             </div>
+
+            {syncReadError && (
+                <div role="alert" className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
+                    Não foi possível consultar as pendências da integração. Os indicadores podem estar incompletos.
+                    <button onClick={fetchBookings} className="ml-2 font-bold underline" disabled={isFetching}>Tentar novamente</button>
+                </div>
+            )}
+            {reviewBookings.length > 0 && (
+                <details className="bg-white/70 rounded-[32px] p-5 border border-amber-200 shadow-sm transition-all duration-300 hover:shadow-lg">
+                    <summary className="cursor-pointer text-sm font-bold text-amber-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-amber-500">
+                        Conferências nos registros carregados ({reviewBookings.length})
+                    </summary>
+                    <p className="mt-2 text-xs text-slate-500">Inclui cancelamentos com etapas pendentes. Abra um registro para entender o motivo.</p>
+                    <div className="mt-3 max-h-64 overflow-y-auto space-y-2">
+                        {reviewBookings.map((booking, index) => (
+                            <button key={booking.id || index} onClick={() => setSelectedBooking(booking)}
+                                className="w-full rounded-2xl border border-slate-100 p-3 text-left transition-colors hover:bg-amber-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-amber-500">
+                                <span className="block text-xs font-bold text-slate-700">{booking.patientName} · {new Date(booking.startAt).toLocaleDateString('pt-BR')} {formatTime(booking.startAt)}</span>
+                                <span className="mt-1 block text-xs text-amber-800">{bookingPendingNotice(booking)!.title}</span>
+                            </button>
+                        ))}
+                    </div>
+                </details>
+            )}
 
             {/* ─── TOOLBAR: View mode + Doctor selector + Navigation ─── */}
             <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-3">
@@ -824,13 +851,19 @@ export default function AppointmentsPage() {
                                 <Globe className="h-3.5 w-3.5" />
                                 Doctoralia {selectedBooking.syncedToDoctoralia ? '✓' : '✗'}
                             </div>
-                            {selectedBooking.origin === 'VISMED' && (
+                            {selectedBooking.origin === 'VISMED' && selectedBooking.syncedToDoctoralia && selectedBooking.status !== 'CANCELLED' && (
                                 <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-wider border bg-violet-50 border-violet-200 text-violet-600">
                                     Slot bloqueado na Doctoralia
                                 </div>
                             )}
                         </div>
 
+                        {bookingPendingNotice(selectedBooking) && (
+                            <div role="status" className="mb-5 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-900">
+                                <p className="text-sm font-bold">{bookingPendingNotice(selectedBooking)!.title}</p>
+                                <p className="mt-1 text-xs leading-relaxed">{bookingPendingNotice(selectedBooking)!.detail}</p>
+                            </div>
+                        )}
                         <div className="space-y-4 bg-slate-50 rounded-2xl p-5">
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
