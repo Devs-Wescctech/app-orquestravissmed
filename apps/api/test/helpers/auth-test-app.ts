@@ -10,6 +10,8 @@ import { RolesGuard } from '../../src/auth/roles.guard';
 import { UsersController } from '../../src/users/users.controller';
 import { UsersService } from '../../src/users/users.service';
 import { PrismaService } from '../../src/prisma/prisma.service';
+import { ClinicsController } from '../../src/clinics/clinics.controller';
+import { ClinicsService } from '../../src/clinics/clinics.service';
 
 export async function createAuthTestApp() {
   const secret = 'synthetic-local-tests-only-not-a-real-secret';
@@ -23,17 +25,24 @@ export async function createAuthTestApp() {
     findMany: jest.fn().mockResolvedValue([user]),
     update: jest.fn().mockImplementation(async ({ data }) => ({ ...user, ...data })),
     create: jest.fn().mockImplementation(async ({ data }) => ({ id: 'synthetic-new', ...data })),
-    delete: jest.fn().mockResolvedValue({ id: 'synthetic-other' }),
+    delete: jest.fn().mockResolvedValue({ id: 'synthetic-other', password: 'synthetic-hash' }),
   } };
+  const clinics = {
+    findAll: jest.fn().mockResolvedValue([]), findOne: jest.fn().mockResolvedValue({ id: 'synthetic-clinic' }),
+    findByUser: jest.fn().mockResolvedValue([]), create: jest.fn().mockResolvedValue({ id: 'synthetic-clinic' }),
+    update: jest.fn().mockResolvedValue({ id: 'synthetic-clinic' }), remove: jest.fn().mockResolvedValue({ id: 'synthetic-clinic' }),
+    addUser: jest.fn().mockResolvedValue({ role: 'OPERATOR' }), removeUser: jest.fn().mockResolvedValue({ id: 'synthetic-role' }),
+    testIntegration: jest.fn().mockResolvedValue({ success: true }), testVismedIntegration: jest.fn().mockResolvedValue({ success: true }),
+  };
   const previousSecret = process.env.JWT_SECRET;
   process.env.JWT_SECRET = secret;
   let moduleRef;
   try {
     moduleRef = await Test.createTestingModule({
       imports: [PassportModule, JwtModule.register({ secret, signOptions: { expiresIn: '5m' } })],
-      controllers: [AuthController, UsersController],
+      controllers: [AuthController, UsersController, ClinicsController],
       providers: [AuthService, UsersService, JwtStrategy, JwtAuthGuard, RolesGuard,
-        { provide: PrismaService, useValue: prisma }],
+        { provide: PrismaService, useValue: prisma }, { provide: ClinicsService, useValue: clinics }],
     }).compile();
   } finally {
     if (previousSecret === undefined) delete process.env.JWT_SECRET;
@@ -42,6 +51,6 @@ export async function createAuthTestApp() {
   const app = moduleRef.createNestApplication();
   app.setGlobalPrefix('api');
   await app.init();
-  return { app, prisma, user, password, jwt: moduleRef.get(JwtService) as JwtService,
+  return { app, prisma, clinics, user, password, jwt: moduleRef.get(JwtService) as JwtService,
     auth: moduleRef.get(AuthService) as AuthService };
 }

@@ -1,5 +1,7 @@
 # Testes de autenticação e usuários — 14/09/2026
 
+Registro histórico da etapa anterior à correção. As duas falhas aqui descritas foram tratadas no lote documentado em [Permissões de usuários](permissoes-usuarios-2026-09-14.md); os testes de restrição agora passam.
+
 ## Escopo e resultado
 
 Base: `183ec82ac74dcea13068a7467373ea0f3c7cb73d` (main remota conferida). Branch independente `codex/auth-users-behavior-tests`; não incorpora branches suspensas nem o ajuste ainda não publicado de compensação de agendamentos.

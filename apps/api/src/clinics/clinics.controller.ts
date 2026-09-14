@@ -1,18 +1,22 @@
-import { Controller, Get, Post, Body, Param, Put, Delete, UseGuards, Req } from '@nestjs/common';
+import { Controller, Get, Post, Body, Param, Put, Delete, UseGuards, Req, BadRequestException } from '@nestjs/common';
 import { ClinicsService } from './clinics.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
+import { Roles } from '../auth/roles.decorator';
+import { Role } from '@prisma/client';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 
 @ApiTags('clinics')
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard, RolesGuard)
+@Roles(Role.SUPER_ADMIN)
 @Controller('clinics')
 export class ClinicsController {
     constructor(private readonly clinicsService: ClinicsService) { }
 
     @ApiOperation({ summary: 'Get clinics for the logged-in user' })
     @Get('my')
+    @Roles()
     async findMyClinics(@Req() req: any) {
         return this.clinicsService.findByUser(req.user.id, req.user.roles);
     }
@@ -55,13 +59,18 @@ export class ClinicsController {
 
     @ApiOperation({ summary: 'Link a user to a clinic' })
     @Post(':id/users')
-    async addUser(@Param('id') id: string, @Body() data: { userId: string; role?: string }) {
+    async addUser(@Param('id') id: string, @Body() data: { userId: string; role?: string }, @Req() req: any) {
+        if (!data || typeof data.userId !== 'string' || !data.userId.trim() || (data.role !== undefined && !Object.values(Role).includes(data.role as Role))) {
+            throw new BadRequestException('Usuário ou perfil inválido');
+        }
+        if (data.userId === req.user.id && data.role !== Role.SUPER_ADMIN) throw new BadRequestException('Você não pode remover o próprio perfil administrativo');
         return this.clinicsService.addUser(id, data.userId, data.role);
     }
 
     @ApiOperation({ summary: 'Remove a user from a clinic' })
     @Delete(':id/users/:userId')
-    async removeUser(@Param('id') id: string, @Param('userId') userId: string) {
+    async removeUser(@Param('id') id: string, @Param('userId') userId: string, @Req() req: any) {
+        if (userId === req.user.id) throw new BadRequestException('Você não pode remover o próprio vínculo administrativo');
         return this.clinicsService.removeUser(id, userId);
     }
 

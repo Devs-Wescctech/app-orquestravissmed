@@ -2,6 +2,9 @@
 import { useState, useEffect } from 'react';
 import { Settings, Plus, Globe, Building2, KeyRound, CheckCircle2, Loader2, Activity, ArrowRight, ShieldCheck, AlertCircle } from 'lucide-react';
 import { api } from '@/lib/api';
+import { useAuthStore } from '@/lib/store';
+import { canManageAccounts } from '@/lib/admin-access';
+import { AdminAccessNotice } from '@/components/layout/AdminAccessNotice';
 
 interface Clinic {
     id: string;
@@ -14,6 +17,8 @@ interface Clinic {
 }
 
 export default function ClinicsManagement() {
+    const currentUser = useAuthStore(state => state.user);
+    const canManage = canManageAccounts(currentUser);
     const [activeTab, setActiveTab] = useState('Visão Geral');
     const [clinics, setClinics] = useState<Clinic[]>([]);
     const [selectedClinic, setSelectedClinic] = useState<Clinic | null>(null);
@@ -24,6 +29,7 @@ export default function ClinicsManagement() {
     const [notification, setNotification] = useState<{ show: boolean; title: string; message: string; type: 'success' | 'error' } | null>(null);
 
     useEffect(() => {
+        if (!canManage) { setClinics([]); setSelectedClinic(null); setIsLoading(false); return; }
         const fetchClinics = async () => {
             try {
                 const response = await api.get('/clinics');
@@ -50,7 +56,7 @@ export default function ClinicsManagement() {
         };
 
         fetchClinics();
-    }, [refreshTrigger, selectedClinic?.id]);
+    }, [refreshTrigger, selectedClinic?.id, canManage]);
 
     const handleTestIntegration = async (clinicId: string) => {
         setTestingId(clinicId);
@@ -169,6 +175,8 @@ export default function ClinicsManagement() {
             setIsLoading(false);
         }
     };
+
+    if (!canManage) return <AdminAccessNotice />;
 
     return (
         <div className="max-w-7xl mx-auto space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
