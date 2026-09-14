@@ -4,15 +4,27 @@ export type BookingSyncStateInput = {
     syncedToVismed?: boolean; syncedToDoctoralia?: boolean;
 };
 
-export function bookingSyncState(record: BookingSyncStateInput) {
+export function hasConfirmedDoctoraliaBreak(record: BookingSyncStateInput): boolean {
+    return record.origin === 'VISMED'
+        && record.status !== 'CANCELLED' && record.status !== 'FAILED'
+        && !!record.doctoraliaBreakId && record.syncedToDoctoralia === true && !record.syncError;
+}
+
+export function getBookingSyncState(record: BookingSyncStateInput) {
+    const doctoraliaBreakConfirmed = hasConfirmedDoctoraliaBreak(record);
     let syncedToVismed = record.syncedToVismed ?? !!record.vismedAppointmentId;
-    let syncedToDoctoralia = record.syncedToDoctoralia ?? !!(record.doctoraliaBookingId || record.doctoraliaBreakId);
+    // A booking identifier never overrides an explicitly pending operation.
+    // A break identifier requires confirmation of its current state.
+    let syncedToDoctoralia = record.doctoraliaBookingId
+        ? (record.syncedToDoctoralia ?? true) : doctoraliaBreakConfirmed;
     if (record.syncError) {
         if (record.origin === 'VISMED' || /BREAK_OWNERSHIP_PENDING|BREAK_CONFLICT|VISMED_REFUSAL_CANCEL_PENDING/.test(record.syncError)) syncedToDoctoralia = false;
         if (record.origin === 'DOCTORALIA') syncedToVismed = false;
     }
-    return { syncedToVismed, syncedToDoctoralia };
+    return { syncedToVismed, syncedToDoctoralia, doctoraliaBreakConfirmed };
 }
+
+export const bookingSyncState = getBookingSyncState;
 
 export function bookingPendingNotice(record: BookingSyncStateInput): { title: string; detail: string } | null {
     const error = record.syncError || '';

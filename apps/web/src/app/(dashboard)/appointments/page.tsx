@@ -10,6 +10,7 @@ import { bookingPendingNotice, bookingSyncState } from '@/lib/booking-sync-state
 import { useClinic } from '@/lib/clinic-store';
 import { useAuthStore } from '@/lib/store';
 import { toast } from 'sonner';
+import { getBookingSyncState } from '@/lib/booking-sync-state';
 
 interface Doctor {
     externalId: string;
@@ -22,6 +23,9 @@ interface Doctor {
 interface BookingRecord {
     id?: string;
     doctoraliaBookingId?: string;
+    doctoraliaBreakId?: string;
+    doctoraliaBreakConfirmed?: boolean;
+    syncError?: string | null;
     vismedAppointmentId?: string;
     origin: 'VISMED' | 'DOCTORALIA';
     status: string;
@@ -701,7 +705,7 @@ export default function AppointmentsPage() {
                                                     <div className={`text-[10px] font-bold truncate ${textColor}`}>
                                                         {b.patientName}{b.patientSurname ? ` ${b.patientSurname}` : ''}
                                                     </div>
-                                                    {isVismed && (
+                                                    {b.doctoraliaBreakConfirmed && (
                                                         <div className="text-[8px] font-bold text-violet-500 mt-0.5">
                                                             Slot bloqueado na Doctoralia
                                                         </div>
@@ -851,7 +855,7 @@ export default function AppointmentsPage() {
                                 <Globe className="h-3.5 w-3.5" />
                                 Doctoralia {selectedBooking.syncedToDoctoralia ? '✓' : '✗'}
                             </div>
-                            {selectedBooking.origin === 'VISMED' && selectedBooking.syncedToDoctoralia && selectedBooking.status !== 'CANCELLED' && (
+                            {selectedBooking.doctoraliaBreakConfirmed && (
                                 <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-wider border bg-violet-50 border-violet-200 text-violet-600">
                                     Slot bloqueado na Doctoralia
                                 </div>
