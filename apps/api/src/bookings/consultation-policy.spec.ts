@@ -48,6 +48,11 @@ describe('consultation-only flow', () => {
         expect(service.prisma.bookingSync.update).not.toHaveBeenCalled();
         expect(record.doctoraliaBreakId).toBe('shared');
     });
+    it.each(['Exame', 'Procedimento', undefined])('does not confirm a created VissMed %p as a consultation', async tipo_servico => {
+        const { service } = harness();
+        service.vismedService = { getAgendamentoById: jest.fn().mockResolvedValue([{ idpacienteagendamento: 'appt', tipo_servico }]) };
+        expect(await service.verifyVismedAppointmentByOfficialIdContract('clinic', 'appt')).toBe('unverified');
+    });
 });
 
 describe('verified Doctoralia catalog policy', () => {
