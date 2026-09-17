@@ -1,4 +1,5 @@
 import { CalendarBreakOwnership } from './calendar-break-ownership';
+import { vismedAppointmentMetadata } from './vismed-appointment-metadata';
 import { reconciliationAddresses } from './reconciliation-addresses';
 import { isDefinitiveSlotRefusal, REFUSAL_PENDING, VismedRefusalCancellation } from './vismed-refusal-cancellation';
 import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
@@ -2200,7 +2201,8 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         } else {
             clinicDoctor = await this.resolveClinicDoctorForVismedAppointment(clinicId, doctor.id);
         }
-        const hasClinicDoctorAuthority = clinicDoctor !== null;
+        const hasClinicDoctorAuthority = clinicDoctor !== null
+            && vismedAppointmentMetadata(a).professionalDoctoraliaEnabled !== false;
         const doctoraliaDoctorId = clinicDoctor?.doctoraliaDoctorId ?? null;
         const doctoraliaFacilityId = clinicDoctor?.doctoraliaFacilityId ?? null;
 
@@ -3169,6 +3171,10 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
     private async syncDoctoraliaBreak(bookingSyncId: string): Promise<void> {
         const rec = await this.prisma.bookingSync.findUnique({ where: { id: bookingSyncId } });
         if (!rec || rec.origin !== 'VISMED' || !rec.vismedDoctorId) return;
+
+        // Disabling a professional is not a cancellation. Preserve existing breaks
+        // for separate review, and stop this record from creating/moving/deleting one.
+        if (vismedAppointmentMetadata(rec.rawPayload).professionalDoctoraliaEnabled === false) return;
 
         if (rec.syncedToDoctoralia && rec.doctoraliaBreakId && rec.status !== 'CANCELLED') return;
 
@@ -5035,10 +5041,14 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             if (filters.endDate) where.startAt.lte = new Date(filters.endDate + 'T23:59:59Z');
         }
 
-        return this.prisma.bookingSync.findMany({
+        const records = await this.prisma.bookingSync.findMany({
             where,
             orderBy: { startAt: 'asc' },
         });
+        return records.map(record => ({
+            ...record,
+            ...vismedAppointmentMetadata(record.rawPayload),
+        }));
     }
 
     async getSyncStats(clinicId: string) {

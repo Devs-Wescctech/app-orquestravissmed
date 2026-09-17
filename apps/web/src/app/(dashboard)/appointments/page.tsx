@@ -39,6 +39,8 @@ interface BookingRecord {
     endAt: string;
     duration?: number;
     serviceName?: string;
+    appointmentType?: string | null;
+    professionalDoctoraliaEnabled?: boolean | null;
     doctoraliaDoctorId?: string;
     vismedDoctorId?: string;
     doctorName?: string;
@@ -641,6 +643,7 @@ export default function AppointmentsPage() {
                                                     <div className={`h-1.5 w-1.5 rounded-full shrink-0 ${dotColor}`}></div>
                                                     <span className="font-black text-slate-500">{formatTime(b.startAt)}</span>
                                                     <span className="truncate">{b.patientName}</span>
+                                                    <span className="shrink-0">{b.appointmentType || 'Tipo não informado'}</span>
                                                 </button>
                                             );
                                         })}
@@ -710,6 +713,7 @@ export default function AppointmentsPage() {
                                                     <div className={`text-[10px] font-bold truncate ${textColor}`}>
                                                         {b.patientName}{b.patientSurname ? ` ${b.patientSurname}` : ''}
                                                     </div>
+                                                    <div className="text-[9px] mt-0.5">{b.appointmentType || 'Tipo não informado'}</div>
                                                     {b.doctoraliaBreakConfirmed && (
                                                         <div className="text-[8px] font-bold text-violet-500 mt-0.5">
                                                             Slot bloqueado na Doctoralia
@@ -774,6 +778,7 @@ export default function AppointmentsPage() {
                                                             <div className={`h-2.5 w-2.5 rounded-full ${dotColor}`}></div>
                                                             <span className="font-black">{formatTime(b.startAt)}</span>
                                                             <span className="max-w-[200px] truncate">{b.patientName}{b.patientSurname ? ` ${b.patientSurname}` : ''}</span>
+                                                            <span>{b.appointmentType || 'Tipo não informado'}</span>
                                                             <span className={`text-[7px] font-black uppercase px-1 py-0.5 rounded ${b.syncedToVismed ? 'bg-emerald-100 text-emerald-600' : 'bg-slate-100 text-slate-400'}`}>V</span>
                                                             <span className={`text-[7px] font-black uppercase px-1 py-0.5 rounded ${b.syncedToDoctoralia ? 'bg-blue-100 text-blue-600' : 'bg-slate-100 text-slate-400'}`}>D</span>
                                                         </button>
@@ -921,6 +926,12 @@ export default function AppointmentsPage() {
                                     </div>
                                 </div>
                             )}
+                            <div className="mt-4 text-sm text-slate-600">
+                                <p>Tipo de atendimento: {selectedBooking.appointmentType || 'Tipo não informado'}</p>
+                                {selectedBooking.professionalDoctoraliaEnabled === false && (
+                                    <p className="mt-2 text-amber-700">Profissional desabilitado para integração na VissMed. Bloqueios existentes precisam de conferência.</p>
+                                )}
+                            </div>
                             {selectedBooking.serviceName && (
                                 <div>
                                     <div className="text-[9px] font-black text-slate-400 uppercase tracking-wider mb-1">Serviço</div>

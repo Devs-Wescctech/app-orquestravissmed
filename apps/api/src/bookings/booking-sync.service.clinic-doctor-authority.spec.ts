@@ -398,6 +398,22 @@ describe('BookingSyncService — fronteira de persistência da autoridade clíni
         expect(service.propagateVismedRescheduleToDoctoralia).not.toHaveBeenCalled();
     });
 
+    it.each(['Consulta', 'Exame', 'Procedimento'])('persiste %s sem converter em consulta', async tipo_servico => {
+        const { service, prisma } = buildIngestion();
+        await service.upsertVismedAppointment('clinic-a', { ...appointment, tipo_servico });
+        expect(prisma.bookingSync.upsert.mock.calls[0][0].update.rawPayload.tipo_servico).toBe(tipo_servico);
+        expect(service.syncDoctoraliaBreak).toHaveBeenCalled();
+    });
+
+    it.each(['0', 0, false])('preserva registro e impede envio quando profissional está desabilitado (%p)', async mostrarnadoctoralia => {
+        const { service, prisma } = buildIngestion();
+        await service.upsertVismedAppointment('clinic-a', { ...appointment, tipo_servico: 'Exame', mostrarnadoctoralia });
+        expect(prisma.bookingSync.upsert.mock.calls[0][0].update).toMatchObject({ status: 'BOOKED', rawPayload: { tipo_servico: 'Exame', mostrarnadoctoralia } });
+        expect(service.syncDoctoraliaBreak).not.toHaveBeenCalled();
+        expect(service.propagateVismedCancellationToDoctoralia).not.toHaveBeenCalled();
+        expect(service.propagateVismedRescheduleToDoctoralia).not.toHaveBeenCalled();
+    });
+
     it('não corrige automaticamente registro histórico contaminado', async () => {
         const contaminated = {
             id: 'booking-contaminated',
