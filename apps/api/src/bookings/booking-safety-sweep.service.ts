@@ -381,6 +381,9 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
                 if (!Array.isArray(bookings)) continue;
 
                 for (const booking of bookings) {
+                    if (!await isConsultationRecord(this.prisma, {
+                        clinicId: conn.clinicId, rawPayload: { data: { visit_booking: booking } },
+                    })) continue;
                     const bid = booking?.id ? String(booking.id) : '';
                     if (!bid || seenInSweep.has(bid)) continue;
 
@@ -565,3 +568,4 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
         return pairs;
     }
 }
+import { isConsultationRecord } from './consultation-policy';

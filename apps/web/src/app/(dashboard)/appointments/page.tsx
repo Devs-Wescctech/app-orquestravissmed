@@ -206,6 +206,7 @@ export default function AppointmentsPage() {
         const seenDoctoraliaIds = new Set<string>();
 
         for (const rec of syncRecords) {
+            if (rec.appointmentType !== 'Consulta') continue;
             if (rec.doctoraliaBookingId) seenDoctoraliaIds.add(rec.doctoraliaBookingId);
             // Existing identifiers do not override a recorded pending operation.
             merged.push({
@@ -215,6 +216,7 @@ export default function AppointmentsPage() {
         }
 
         for (const b of doctoraliaBookings) {
+            if (b.appointmentType !== 'Consulta') continue;
             const bid = String(b.id || b.visit_booking_id || '');
             if (bid && seenDoctoraliaIds.has(bid)) continue;
             const rawStatus = String(b.status || 'booked').toUpperCase();
@@ -231,6 +233,7 @@ export default function AppointmentsPage() {
                 endAt: b.end_at,
                 duration: parseInt(b.duration) || 30,
                 serviceName: b.address_service?.name || '',
+                appointmentType: 'Consulta',
                 doctoraliaDoctorId: selectedDoctorId,
                 doctorName: b.doctorName,
                 booked_by: b.booked_by,
