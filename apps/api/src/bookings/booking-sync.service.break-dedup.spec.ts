@@ -41,6 +41,7 @@ function buildService(overrides: {
     legacy?: boolean;
 }) {
     const rec = {
+        rawPayload: { tipo_servico: 'Consulta' },
         id: 'bs-1',
         clinicId: 'clinic-1',
         origin: 'VISMED',
@@ -244,7 +245,7 @@ describe('syncDoctoraliaBreak — ownership', () => {
     });
     it('dashboard cancellation keeps the existing legacy lifecycle', async () => {
         const {service,client} = buildService({legacy:true});
-        await (service as any).cancelSyncRecord('clinic-1', {id:'bs-1',doctoraliaBreakId:'legacy',doctoraliaFacilityId:'fac-1',doctoraliaDoctorId:'doc-ext-1',doctoraliaAddressId:'addr-1'});
+        await (service as any).cancelSyncRecord('clinic-1', {rawPayload:{tipo_servico:'Consulta'},id:'bs-1',doctoraliaBreakId:'legacy',doctoraliaFacilityId:'fac-1',doctoraliaDoctorId:'doc-ext-1',doctoraliaAddressId:'addr-1'});
         expect(client.deleteCalendarBreak).toHaveBeenCalledWith('fac-1','doc-ext-1','addr-1','legacy');
     });
     it('404 on cancellation clears the confirmed association safely', async () => {

@@ -34,7 +34,8 @@ describe('BookingSafetySweepService', () => {
         new DoctoraliaMetricsService();
         client = { getBookings: jest.fn() };
         prisma = {
-            integrationConnection: { findMany: jest.fn().mockResolvedValue([conn]) },
+            integrationConnection: { findMany: jest.fn().mockResolvedValue([conn]), findFirst: jest.fn().mockResolvedValue(conn) },
+            doctoraliaAddressService: { findUnique: jest.fn().mockResolvedValue({ service: { doctoraliaServiceId: '291' } }) },
             mapping: { findMany: jest.fn().mockResolvedValue([mapping]) },
             doctoraliaDoctor: { findMany: jest.fn().mockResolvedValue([]) },
             bookingSync: { findMany: jest.fn() },
@@ -49,6 +50,7 @@ describe('BookingSafetySweepService', () => {
     });
 
     const newBooking = (id: string, extra: any = {}) => ({
+        address_service: { id: 'consultation-address' },
         id,
         start_at: '2026-08-11T08:00:00-03:00',
         end_at: '2026-08-11T08:30:00-03:00',

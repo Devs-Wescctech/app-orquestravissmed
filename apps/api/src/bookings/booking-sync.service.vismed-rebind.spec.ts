@@ -4,6 +4,7 @@ const START = new Date('2026-08-20T12:00:00.000Z');
 const END = new Date('2026-08-20T12:30:00.000Z');
 
 const originalRecord = (extra: any = {}) => ({
+    rawPayload: { tipo_servico: 'Consulta' },
     id: 'original-sync',
     clinicId: 'clinic-1',
     vismedDoctorId: 'doctor-1',
@@ -43,12 +44,13 @@ const replacementRecord = (id = 'replacement-sync', vismedAppointmentId = '40733
     startAt: START,
     endAt: END,
     duration: 30,
-    rawPayload: { idpacienteagendamento: vismedAppointmentId, idprofissional: '123' },
+    rawPayload: { tipo_servico: 'Consulta', idpacienteagendamento: vismedAppointmentId, idprofissional: '123' },
     createdAt: new Date(),
     ...extra,
 });
 
 const confirmedAppointment = (id = '4073305', extra: any = {}) => ({
+    tipo_servico: 'Consulta',
     idpacienteagendamento: id,
     idprofissional: '123',
     dataagendamento: '2026-08-20',
@@ -119,6 +121,7 @@ function buildService(options: {
             : jest.fn((callback: any) => callback(tx)),
     } as any;
     const vismedService = {
+        getAgendamentoById: jest.fn().mockResolvedValue([confirmedAppointment(original.vismedAppointmentId, { cancelado: '1', mostrarnadoctoralia: '1' })]),
         getAgendamentos: options.confirmationError
             ? jest.fn().mockRejectedValue(options.confirmationError)
             : jest.fn().mockResolvedValue(confirmation),
@@ -138,7 +141,7 @@ function buildService(options: {
     const syncBreak = jest.spyOn(service as any, 'syncDoctoraliaBreak')
         .mockResolvedValue(undefined);
 
-    return { service, prisma, bookingSync, tx, propagate, syncBreak };
+    return { service, prisma, bookingSync, tx, propagate, syncBreak, vismedService };
 }
 
 const reconcile = (service: BookingSyncService) =>
@@ -188,7 +191,23 @@ describe('BookingSyncService — rebind seguro de ID VisMed desaparecido', () =>
         expect(syncBreak).not.toHaveBeenCalled();
     });
 
-    it('mantém o cancelamento atual quando não existe replacement', async () => {
+    it.each([
+        [],
+        [confirmedAppointment('4073225', { cancelado: '0' })],
+        [confirmedAppointment('4073225', { cancelado: '1', tipo_servico: 'Exame' })],
+        [confirmedAppointment('4073225', { cancelado: '1', mostrarnadoctoralia: '0' })],
+        [confirmedAppointment('different', { cancelado: '1' })],
+        [confirmedAppointment('4073225', { cancelado: '1' }), confirmedAppointment('4073225')],
+    ].map(response => ({ response })))('ausência da listagem sem prova individual não cancela (%p)', async ({ response }) => {
+        const { service, bookingSync, propagate, syncBreak, vismedService } = buildService();
+        vismedService.getAgendamentoById.mockResolvedValue(response);
+        await reconcile(service);
+        expect(cancellationCalls(bookingSync)).toHaveLength(0);
+        expect(propagate).not.toHaveBeenCalled();
+        expect(syncBreak).not.toHaveBeenCalled();
+    });
+
+    it('mantém o cancelamento explícito confirmado por ID quando não existe replacement', async () => {
         const { service, bookingSync, propagate, syncBreak } = buildService();
 
         await reconcile(service);

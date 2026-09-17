@@ -63,7 +63,9 @@ describe('AppointmentsService bookings hardening', () => {
         ]);
         const getBookings = jest.fn()
             .mockRejectedValueOnce(new Error('Doctoralia 500'))
-            .mockResolvedValueOnce({ _items: [{ id: 'b1' }] });
+            .mockResolvedValueOnce({ _items: [{ id: 'b1', address_service: { id: 'consultation-address' } }] });
+        prisma.doctoraliaAddressService = { findUnique: jest.fn().mockResolvedValue({ service: { doctoraliaServiceId: '291' } }) };
+        prisma.bookingSync = { findMany: jest.fn().mockResolvedValue([]) };
         docplanner.createClient.mockReturnValue({ getBookings });
         const errorSpy = jest.spyOn((service as any).logger, 'error').mockImplementation(() => undefined);
 

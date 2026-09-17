@@ -1,4 +1,5 @@
 import { managedSlotState, managedClearPayload, ManagedSlotState } from './managed-slot-ranges';
+import { consultationSlotServices } from '../bookings/consultation-policy';
 import { AddressInsuranceProvider } from './insurance-plan-selection';
 import { Injectable, Logger } from '@nestjs/common';
 import * as crypto from 'crypto';
@@ -373,6 +374,11 @@ export class SlotSyncService {
             }
 
             const seenServiceIds = new Set<string>();
+            addressServices = consultationSlotServices(addressServices, client.getCacheIdentity().split('|')[0]);
+            if (addressServices.length === 0) {
+                if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'mapping_pending', 'Nenhum serviço confirmado como consulta; disponibilidade preservada sem envio.');
+                continue;
+            }
             const deduplicatedServices = addressServices.filter((s: any) => {
                 const key = String(s.service_id || s.id);
                 if (seenServiceIds.has(key)) return false;

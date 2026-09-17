@@ -1,27 +1,36 @@
-# Classificação de atendimentos VissMed
+# Integração somente de consultas
 
-Contrato confirmado em 17/09/2026 por leituras HTTP 200, sem consumir o feed:
+Regra aprovada: somente consultas participam do fluxo operacional VissMed ↔ Orquestrador ↔ Doctoralia. Exames, procedimentos e tipos desconhecidos não são novas entradas de agenda, não geram bloqueios, não são reenviados e não entram nos contadores operacionais.
 
-- GET /api/v1.0/get-agendamento-by-id?idagendamento=<id>: retorna tipo_servico e mostrarnadoctoralia, inclusive profissional desabilitado.
-- GET /api/v1.0/get-agendamento-filtros?unidade=<id>&dataini=DD/MM/AAAA&datafim=DD/MM/AAAA: retorna tipo_servico. A habilitação não veio nos itens observados; segundo o fornecedor, a listagem filtra profissionais habilitados. Não adicionar sincronizar=1 em diagnósticos: esse parâmetro consome o feed.
+## Contratos de origem
 
-O payload original já é persistido em BookingSync.rawPayload na importação. Não há migration ou backfill neste pacote. Consulta, Exame e Procedimento são normalizados; ausência/valor desconhecido permanece null. Não inferir nome ou código de exame a partir da categoria.
+VissMed, confirmado em 17/09/2026 por leituras HTTP 200:
 
-GET /api/booking-sync/records mantém autenticação e autorização por clínica, filtros e formato de lista existentes. Acrescenta appointmentType (Consulta | Exame | Procedimento | null) e professionalDoctoraliaEnabled (boolean | null), derivados do payload persistido. Não consulta integrações nem altera registros durante a leitura. Estados antigos continuam Tipo não informado até receberem novo payload; não há atualização retroativa automática.
+- GET /api/v1.0/get-agendamento-by-id?idagendamento=<id>: retorna tipo_servico e mostrarnadoctoralia, inclusive para profissional desabilitado.
+- GET /api/v1.0/get-agendamento-filtros?unidade=<id>&dataini=DD/MM/AAAA&datafim=DD/MM/AAAA: retorna tipo_servico. A flag não veio nos itens observados; o fornecedor informa que a listagem filtra profissionais habilitados.
+- Não usar sincronizar=1 em diagnóstico: esse parâmetro consome o feed.
+- tipo_servico normalizado precisa ser Consulta. Campo ausente/desconhecido não autoriza sincronização. Flag explicitamente desabilitada impede mutações; ausência da flag não equivale a desabilitação.
 
-Exemplo aditivo: { "appointmentType": "Exame", "professionalDoctoraliaEnabled": false }.
+Doctoralia: GET /api/v3/integration/services, consultado com OAuth configurado em 17/09/2026, respondeu HTTP 200 com id e name, sem categoria equivalente a tipo_servico. A classificação local é uma inferência revisada dos nomes canônicos, não um campo oferecido pelo fornecedor.
 
-Na ingestão, flag explícita 0, "0" ou false impede propagação automática para Doctoralia. A rotina de bloqueios também verifica o payload persistido antes de operar. A ausência do campo não equivale à desabilitação, preservando o contrato da listagem e das outras instâncias. Esta proteção não descobre desabilitações que a origem deixou de enviar: não é um monitor ativo de profissionais.
+A lista explícita de 57 IDs do dicionário brasileiro está em apps/api/src/bookings/consultation-policy.ts. O vínculo usa DoctoraliaAddressService.service.doctoraliaServiceId, nunca o ID do serviço de endereço como ID do dicionário. Aplica-se somente ao domínio brasileiro configurado. Serviços novos, desconhecidos ou mistos ficam excluídos até revisão. Exemplos excluídos: Consulta + Exame de prevenção (5284), Consulta e prevenção (4821), Retorno sem cobrança (9978), Telemedicina II (5189). Não há classificação por substring em execução.
 
-Não cancela agendamentos por desabilitação, não remove bloqueios históricos e não agrupa IDs por coincidência de paciente/horário. Qualquer saneamento histórico exige investigação própria. A flag de habilitação não é filtro de exame: exames de profissionais autorizados continuam ocupando a agenda.
+Referências: [objetos da API](https://integrations.docplanner.com/guide/api-objects/resources.html) e [documentação](https://integrations.docplanner.com/docs/). Ausência no escopo de diagnósticos não prova que um serviço é consulta.
 
-Compatibilidade: sem mudanças em schema, dependências, boot ou configuração. A versão anterior lê o mesmo rawPayload; retornar o código não desfaz operações das integrações. Publicação exige identificar e preservar a imagem efetivamente em execução e procedimento limitado ao serviço vismed conforme PUBLICACAO.md.
+## Aplicação e respostas
 
-## Verificação local — 17/09/2026
+Ingestão, webhooks, criação manual, cancelamentos, remarcações, retries, varredura de segurança e reconciliação verificam a classificação antes de mutações. Slots usam somente serviços classificados como consulta; sem serviço elegível, não limpam a disponibilidade histórica. Leituras diretas, calendário e contadores aplicam a mesma política. O tipo VissMed prevalece sobre um serviço antigo da Doctoralia. Cache de classificação dura apenas o lote atual.
 
-Base remota conferida: 37222186b7fd41f59278cb4918e4129c7ae53ae4. Ambiente isolado instalado com npm ci e cliente Prisma gerado a partir do schema existente.
+GET /api/booking-sync/records preserva autenticação, autorização por clínica, filtros e formato de lista. Retorna somente consultas, com appointmentType: "Consulta" e professionalDoctoraliaEnabled: boolean | null. Estatísticas usam a mesma classificação. Leituras de agenda Doctoralia acrescentam appointmentType: "Consulta" aos itens elegíveis. Exemplo parcial: { "appointmentType": "Consulta", "professionalDoctoraliaEnabled": true }. A mudança intencional é excluir itens não elegíveis, sem novos parâmetros, permissões ou formatos de erro/paginação.
 
-- API: 144 testes aprovados em cinco suites (metadados, autoridade por clínica, deduplicação de bloqueios e feed).
-- Frontend: 22 testes de regressão existentes aprovados; tsc --noEmit aprovado.
-- Builds da API e web concluídos. O Next informou falha ao tentar corrigir dependências SWC no lockfile, mas compilou e gerou as 19 páginas com saída zero. Lockfile não alterado; atualização de dependências fora deste pacote.
-- Sem teste visual autenticado ou validação pós-deploy nesta etapa. A publicação está pendente de acesso autenticado ao Portainer e conferência atual dos controles de implantação. Não houve push, deploy, backfill ou alteração de agendamentos reais.
+Verificação pós-criação exige resposta VissMed explicitamente Consulta. Tipo diferente permanece não verificado, sem cancelamento automático. Desaparecimento da listagem não significa cancelamento: após tentar reconciliar substituição, exige consulta individual com ID correspondente, Consulta, profissional não explicitamente desabilitado e cancelado explícito.
+
+## Histórico e limites
+
+Não há exclusão de registros nem limpeza automática de bloqueios antigos. Quando registro existente recebe tipo excluído, apenas rawPayload é atualizado: status, IDs e vínculos são preservados. Nenhuma linha nova é criada para exame. Bloqueios reais permanecem no diagnóstico de conflito, mesmo com atendimento fora da agenda operacional.
+
+Não agrupar IDs distintos por coincidência de paciente/horário. Bloqueios compartilhados exigem saneamento separado e autorizado. Este pacote não os libera na Doctoralia. Sem backfill ou monitoramento de todos os profissionais para descobrir desabilitações não entregues pela origem.
+
+Sem mudanças em schema, dependências, timers, backoff ou rate limits. Verificações locais e consultas individuais podem acrescentar trabalho; não foi medida latência ponta a ponta. Todas as instâncias VissMed precisam entregar tipo_servico para seus registros serem elegíveis.
+
+Nada publicado. Retornar o código não desfaz operações externas. Antes de publicar, verificar imagem em execução, rollback e PUBLICACAO.md. Evidências: [relatório de testes](testing/consultation-only.tdd.md).

@@ -6,6 +6,7 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import request from 'supertest';
 
 const record = { id: 'target', clinicId: 'clinic-a', patientName: 'Paciente teste', patientSurname: null,
+    rawPayload: { tipo_servico: 'Consulta' },
     startAt: new Date('2026-09-15T10:30:00Z'), endAt: new Date('2026-09-15T10:40:00Z'),
     vismedAppointmentId: 'source-a', doctoraliaFacilityId: 'facility', doctoraliaAddressId: 'address', doctoraliaDoctorId: 'doctor' };
 const related = { ...record, id: 'related', doctoraliaBreakId: 'break', vismedAppointmentId: 'source-b',

@@ -1,4 +1,5 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { isConsultationRecord } from './consultation-policy';
 import { PrismaService } from '../prisma/prisma.service';
 import { DocplannerClient, DocplannerService } from '../integrations/docplanner.service';
 import { QueueService } from './queue.service';
@@ -352,9 +353,10 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
         // que enfileiravam sem os dados do paciente) para completar retroativamente.
         const knownRecords = await this.prisma.bookingSync.findMany({
             where: { clinicId: conn.clinicId, doctoraliaBookingId: { not: null } },
-            select: { id: true, doctoraliaBookingId: true, origin: true, patientName: true },
+            select: { id: true, doctoraliaBookingId: true, origin: true, patientName: true, rawPayload: true, clinicId: true, addressServiceId: true },
         });
         const known = new Set(knownRecords.map(r => r.doctoraliaBookingId!));
+        const knownById = new Map(knownRecords.map(r => [r.doctoraliaBookingId!, r]));
         const nameless = new Map(
             knownRecords
                 .filter(r => r.origin === 'DOCTORALIA' && !(r.patientName || '').trim())
@@ -381,6 +383,8 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
                 if (!Array.isArray(bookings)) continue;
 
                 for (const booking of bookings) {
+                    const existing = knownById.get(String(booking?.id || ''));
+                    if (existing && !await isConsultationRecord(this.prisma, existing)) continue;
                     if (!await isConsultationRecord(this.prisma, {
                         clinicId: conn.clinicId, rawPayload: { data: { visit_booking: booking } },
                     })) continue;
@@ -568,4 +572,3 @@ export class BookingSafetySweepService implements OnModuleInit, OnModuleDestroy 
         return pairs;
     }
 }
-import { isConsultationRecord } from './consultation-policy';

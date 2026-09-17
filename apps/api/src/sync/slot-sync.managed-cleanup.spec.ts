@@ -19,8 +19,8 @@ function fixture() {
         syncEvent: { create: jest.fn(async ({ data }) => { events.push(data); return data; }) },
         slotPushState: { findUnique: jest.fn(async () => state), upsert: jest.fn(async ({ update }) => { state = update; return state; }) },
     };
-    const client: any = { getCacheIdentity: () => 'fixture', getAddresses: jest.fn(async () => ({ _items: [{ id: 'a' }] })),
-        getServices: jest.fn(async () => ({ _items: [{ id: '5', service_id: '50' }] })), replaceSlots: jest.fn(async () => ({ _status: 201 })),
+    const client: any = { getCacheIdentity: () => 'www.doctoralia.com.br|fixture', getAddresses: jest.fn(async () => ({ _items: [{ id: 'a' }] })),
+        getServices: jest.fn(async () => ({ _items: [{ id: '5', service_id: '291' }] })), replaceSlots: jest.fn(async () => ({ _status: 201 })),
         enableCalendar: jest.fn(), getAddressInsuranceProviders: jest.fn(async () => ({ _items: [] })) };
     const cache: any = { getOrFetch: async (_key, _ttl, fetch) => fetch() };
     const service = new SlotSyncService(prisma, {} as any, cache);

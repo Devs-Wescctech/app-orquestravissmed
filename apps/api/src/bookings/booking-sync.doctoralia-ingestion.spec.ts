@@ -22,6 +22,7 @@ const notification = (id = 'booking-anon-1') => ({
     name: 'slot-booked',
     data: {
         visit_booking: {
+            address_service: { id: 'consultation-address' },
             id,
             start_at: '2026-08-20T09:00:00-03:00',
             end_at: '2026-08-20T09:30:00-03:00',
@@ -44,6 +45,7 @@ function buildService() {
         getBookings: jest.fn().mockResolvedValue({ _items: [] }),
     };
     const prisma = {
+        doctoraliaAddressService: { findUnique: jest.fn().mockResolvedValue({ service: { doctoraliaServiceId: '291' } }) },
         integrationConnection: {
             findFirst: jest.fn().mockResolvedValue(conn),
             update: jest.fn(),
@@ -171,6 +173,7 @@ describe('BookingSyncService — reconciliação Doctoralia com vínculos atuais
     const clinicId = conn.clinicId;
     const startAt = new Date('2026-08-20T12:00:00.000Z');
     const unlinked = (doctorId: string, id = `sync-${doctorId}`) => ({
+        rawPayload: { tipo_servico: 'Consulta' },
         id,
         clinicId,
         vismedDoctorId: `vismed-${doctorId}`,
@@ -361,6 +364,7 @@ describe('BookingSyncService — reconciliação Doctoralia com vínculos atuais
             _items: facilityId === lastFacilityId
                 ? [{
                     id: 'booking-late-facility',
+                    address_service: { id: 'consultation-address' },
                     start_at: records[0].startAt.toISOString(),
                     status: 'booked',
                 }]
@@ -474,6 +478,7 @@ describe('BookingSyncService — reconciliação Doctoralia com vínculos atuais
         client.getBookings.mockResolvedValue({
             _items: [{
                 id: 'booking-early-page',
+                address_service: { id: 'consultation-address' },
                 start_at: records[0].startAt.toISOString(),
                 status: 'booked',
             }],
@@ -935,6 +940,7 @@ describe('BookingSyncService — reconciliação Doctoralia com vínculos atuais
                     doctorId === 'doctor-a' && facilityId === lastFacilityId
                         ? [{
                             id: 'booking-after-address-retry',
+                            address_service: { id: 'consultation-address' },
                             start_at: records[0].startAt.toISOString(),
                             status: 'booked',
                         }]
@@ -988,7 +994,7 @@ describe('BookingSyncService — reconciliação Doctoralia com vínculos atuais
             .mockRejectedValueOnce(new Error('temporary addresses failure'))
             .mockResolvedValue({ _items: [{ id: 'address-1' }] });
         client.getBookings.mockResolvedValue({
-            _items: [{ id: 'booking-retried', start_at: startAt.toISOString() }],
+            _items: [{ id: 'booking-retried', address_service: { id: 'consultation-address' }, start_at: startAt.toISOString() }],
         });
 
         await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
@@ -1020,7 +1026,7 @@ describe('BookingSyncService — reconciliação Doctoralia com vínculos atuais
         client.getBookings
             .mockRejectedValueOnce(new Error('temporary bookings failure'))
             .mockResolvedValue({
-                _items: [{ id: 'booking-after-retry', start_at: startAt.toISOString() }],
+                _items: [{ id: 'booking-after-retry', address_service: { id: 'consultation-address' }, start_at: startAt.toISOString() }],
             });
 
         await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
@@ -1377,7 +1383,7 @@ describe('BookingSyncService — reconciliação Doctoralia com vínculos atuais
         prisma.bookingSync.updateMany.mockResolvedValue({ count: 0 });
         client.getAddresses.mockResolvedValue({ _items: [{ id: 'address-1' }] });
         client.getBookings.mockResolvedValue({
-            _items: [{ id: 'booking-1', start_at: startAt.toISOString() }],
+            _items: [{ id: 'booking-1', address_service: { id: 'consultation-address' }, start_at: startAt.toISOString() }],
         });
 
         await (service as any).reconcileUnlinkedWithDoctoralia(clinicId);
@@ -1408,6 +1414,7 @@ describe('BookingSyncService — reconciliação Doctoralia com vínculos atuais
 describe('BookingSyncService — autoridade clínica na reconciliação de cancelamentos Doctoralia', () => {
     const clinicId = conn.clinicId;
     const linkedRecord = {
+        rawPayload: { tipo_servico: 'Consulta' },
         id: 'sync-cancelled-authority',
         clinicId,
         vismedDoctorId: 'vismed-doctor-1',
@@ -1962,12 +1969,11 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
                 id: 'map-incremental',
                 vismedId: 'vdoc-incremental',
             });
-            prisma.integrationConnection.findFirst.mockResolvedValue({
-                clinicId: conn.clinicId,
-                provider: 'vismed',
-                domain: INCREMENTAL_VISMED_BASE_URL,
-                vismedAppointmentFeedMode: 'INCREMENTAL',
-            });
+            prisma.integrationConnection.findFirst.mockImplementation(({ where }: any) => Promise.resolve(
+                where.provider === 'doctoralia' ? conn : {
+                    clinicId: conn.clinicId, provider: 'vismed', domain: INCREMENTAL_VISMED_BASE_URL,
+                    vismedAppointmentFeedMode: 'INCREMENTAL',
+                }));
             prisma.vismedDoctor = {
                 findUnique: jest.fn().mockResolvedValue({ vismedId: 123 }),
             };
@@ -2360,7 +2366,7 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
         it('retorna found para uma presença inequívoca', async () => {
             const { service } = setupActualPreflight([[
                 {
-                    idpacienteagendamento: 456,
+                    tipo_servico: 'Consulta', idpacienteagendamento: 456,
                     idprofissional: 123,
                     dataagendamento: '2026-08-20',
                     horarioagendamento: '09:00',
@@ -2407,7 +2413,7 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
 
         it('retorna unknown quando há mais de um match conservador', async () => {
             const match = (id: number) => ({
-                idpacienteagendamento: id,
+                tipo_servico: 'Consulta', idpacienteagendamento: id,
                 idprofissional: 123,
                 dataagendamento: '2026-08-20',
                 horarioagendamento: '09:00',
@@ -2456,7 +2462,7 @@ describe('BookingSyncService — ingestão Doctoralia confiável', () => {
         it('no INCREMENTAL retorna found para um único match sem consumir a pendência', async () => {
             const { service, prisma, getAgendamentos } = setupActualPreflight([[
                 {
-                    idpacienteagendamento: 456,
+                    tipo_servico: 'Consulta', idpacienteagendamento: 456,
                     idprofissional: 123,
                     dataagendamento: '2026-08-20',
                     horarioagendamento: '09:00',

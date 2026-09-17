@@ -7,6 +7,7 @@ const LEGACY_BASE_URL = 'https://app.vissmed.com.br/api-vissmed-4';
 const INCREMENTAL_BASE_URL = 'https://app.vissmed.com.br/api-docctor-3';
 
 const appointment = (id = 'vismed-appointment-1') => ({
+    tipo_servico: 'Consulta',
     idpacienteagendamento: id,
     idprofissional: '123',
     dataagendamento: '2026-08-20',
@@ -102,6 +103,14 @@ function buildService(options: {
 }
 
 describe('normalizeVismedAppointmentRecoveryIds', () => {
+    it.each(['Exame', 'Procedimento', undefined])('exclusão intencional de %p não pede reentrega nem cria bloqueio', async tipo_servico => {
+        const f = buildService({ feedMode: 'INCREMENTAL', response: [{ ...appointment(), tipo_servico }] });
+        f.prisma.bookingSync = { updateMany: jest.fn().mockResolvedValue({ count: 0 }) };
+        await f.service.pollVismedClinic(f.conn);
+        expect(f.upsert).not.toHaveBeenCalled();
+        expect(f.vismedService.requestRedelivery).not.toHaveBeenCalled();
+        expect(f.syncBreak).not.toHaveBeenCalled();
+    });
     it('aceita apenas IDs identificáveis e deduplica o lote da futura reentrega', () => {
         expect(normalizeVismedAppointmentRecoveryIds([
             ' appt-1 ',

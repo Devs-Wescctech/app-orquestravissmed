@@ -1,6 +1,6 @@
 import { Injectable, Logger, HttpException, BadRequestException, NotFoundException, InternalServerErrorException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { consultationRecords, isConsultationRecord } from '../bookings/consultation-policy';
+import { filterDoctoraliaBookings, isConsultationRecord } from '../bookings/consultation-policy';
 import { DocplannerService, DocplannerClient } from '../integrations/docplanner.service';
 
 @Injectable()
@@ -277,10 +277,7 @@ export class AppointmentsService {
 
             await this.logRequest({ clinicId, action: 'FETCH_BOOKINGS', doctorId: doctorExternalId, start, end, durationMs: Date.now() - startTime, status: 'success' });
             const list = Array.isArray(bookingsRes) ? bookingsRes : (bookingsRes?._items || []);
-            const eligible = await consultationRecords(this.prisma, list.map((b: any) => ({
-                ...b, clinicId, rawPayload: { data: { visit_booking: b } },
-            })));
-            return { bookings: eligible.map(({ rawPayload, clinicId: _clinic, ...b }: any) => ({ ...b, appointmentType: 'Consulta' })), calendarStatus: cd.calendarStatus };
+            return { bookings: await filterDoctoraliaBookings(this.prisma, clinicId, list), calendarStatus: cd.calendarStatus };
         } catch (e: any) {
             const isHttp = e instanceof HttpException;
             const resp = isHttp ? e.getResponse() : null;
@@ -547,10 +544,7 @@ export class AppointmentsService {
 
         await this.logRequest({ clinicId, action: 'FETCH_ALL_BOOKINGS', start, end, durationMs: Date.now() - startTime, status: errors.length ? 'error' : 'success', error: errors.length ? errors.join('; ') : undefined });
 
-        const eligible = await consultationRecords(this.prisma, allBookings.map((b: any) => ({
-            ...b, clinicId, rawPayload: { data: { visit_booking: b } },
-        })));
-        return { bookings: eligible.map(({ rawPayload, clinicId: _clinic, ...b }: any) => ({ ...b, appointmentType: 'Consulta' })), calendarEnabled, errors: errors.length ? errors : undefined };
+        return { bookings: await filterDoctoraliaBookings(this.prisma, clinicId, allBookings), calendarEnabled, errors: errors.length ? errors : undefined };
     }
 
     // ────────────────────── Dashboard Stats ──────────────────────

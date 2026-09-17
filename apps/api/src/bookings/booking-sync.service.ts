@@ -1,6 +1,6 @@
 import { CalendarBreakOwnership } from './calendar-break-ownership';
 import { vismedAppointmentMetadata } from './vismed-appointment-metadata';
-import { consultationRecords, isConsultationRecord, isVismedConsultation } from './consultation-policy';
+import { consultationRecords, isConsultationRecord, isVismedConsultation, canSynchronizeConsultation, preserveAppointmentMetadata } from './consultation-policy';
 import { reconciliationAddresses } from './reconciliation-addresses';
 import { isDefinitiveSlotRefusal, REFUSAL_PENDING, VismedRefusalCancellation } from './vismed-refusal-cancellation';
 import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
@@ -514,8 +514,12 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                         const vid = a?.idpacienteagendamento ? String(a.idpacienteagendamento) : null;
                         if (feedMode === 'LEGACY' && vid) seenVismedIds.add(vid);
                         // Keep seen IDs BEFORE exclusion: omission is not cancellation.
-                        if (!isVismedConsultation(a)) continue;
                         try {
+                            if (!isVismedConsultation(a)) {
+                                await this.preserveExcludedAppointment(conn.clinicId, a);
+                                this.logger.debug(`[VISMED-POLL] clinicId=${conn.clinicId} appointmentId=${vid} skipped=not_confirmed_consultation`);
+                                continue;
+                            }
                             // Ponto de extensão da futura recuperação/reentrega: itens
                             // recuperados devem entrar aqui e reutilizar este mesmo upsert
                             // idempotente. A Fase 1 não cria ACK, retry ou replay local.
@@ -778,17 +782,6 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         for (const rec of confirmedGone) {
             try {
                 if (!await isConsultationRecord(this.prisma, rec)) continue;
-                // A filtered list no longer proves cancellation: professionals can
-                // disappear merely because their Doctoralia flag was disabled.
-                // Preserve existing records/breaks; only explicit cancellation may propagate.
-                const currentResponse = await this.vismedService.getAgendamentoById(rec.vismedAppointmentId, baseUrl);
-                const current = Array.isArray(currentResponse)
-                    ? currentResponse.find(a => String(a?.idpacienteagendamento) === String(rec.vismedAppointmentId))
-                    : currentResponse;
-                if (String(current?.idpacienteagendamento) !== String(rec.vismedAppointmentId)
-                    || !isVismedConsultation(current)
-                    || vismedAppointmentMetadata(current).professionalDoctoraliaEnabled === false
-                    || ![true, 1, '1'].includes(current?.cancelado)) continue;
                 if (!await this.snapshotFenceAllows(rec, 'before_rebind')) continue;
                 // A VisMed pode trocar o ID internamente sem que um move tenha sido
                 // iniciado pelo orquestrador. Antes de cancelar, tentamos rebindar
@@ -806,6 +799,15 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                     );
                     continue;
                 }
+
+                // Absence in a filtered list is not cancellation. Rebind remains
+                // possible above; destructive cancellation requires individual proof.
+                const currentResponse = await this.vismedService.getAgendamentoById(rec.vismedAppointmentId, baseUrl);
+                const current = Array.isArray(currentResponse) && currentResponse.length === 1 ? currentResponse[0] : null;
+                if (String(current?.idpacienteagendamento) !== String(rec.vismedAppointmentId)
+                    || !isVismedConsultation(current)
+                    || vismedAppointmentMetadata(current).professionalDoctoraliaEnabled === false
+                    || ![true, 1, '1'].includes(current?.cancelado)) continue;
 
                 // Anti-race: se acabamos de mover este appt na VisMed (lastMoveBy=VISMED),
                 // a VisMed às vezes faz cancel+create internamente — o vismedAppointmentId
@@ -994,6 +996,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             if (
                 !confirmed ||
                 !isVismedConsultation(confirmed) ||
+                !isVismedConsultation(candidate.rawPayload) ||
                 !confirmedDoctorId ||
                 !candidateDoctorId ||
                 confirmedDoctorId !== candidateDoctorId ||
@@ -1237,6 +1240,10 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         liveActive: any[],
     ): Promise<boolean> {
         if (!rec.doctoraliaBookingId || !rec.lastMoveTargetStartAt || !rec.lastMoveAt) return false;
+        const eligibleActive: any[] = [];
+        for (const booking of liveActive) {
+            if (await isConsultationRecord(this.prisma, { clinicId: rec.clinicId, rawPayload: { data: { visit_booking: booking } } })) eligibleActive.push(booking);
+        }
         const tolMs = 2 * 60 * 1000;
         const targetMs = rec.lastMoveTargetStartAt.getTime();
         const oldDocId = rec.doctoraliaBookingId;
@@ -1270,7 +1277,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             return false;
         }
 
-        const candidate = liveActive.find((b: any) => {
+        const candidate = eligibleActive.find((b: any) => {
             const bid = b?.id ? String(b.id) : null;
             if (!bid || bid === oldDocId) return false;
             const startStr = b?.start_at || b?.startAt;
@@ -1740,6 +1747,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                             );
 
                             if (match) {
+                                if (!await isConsultationRecord(this.prisma, { clinicId, rawPayload: { data: { visit_booking: booking } } })) continue;
                                 const adopted = await this.prisma.bookingSync.updateMany({
                                     where: {
                                         id: match.id,
@@ -2186,13 +2194,26 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         };
     }
 
+    private async preserveExcludedAppointment(clinicId: string, a: any): Promise<void> {
+        if (!a?.idpacienteagendamento) return;
+        // No new exam row. Retain the latest authoritative payload on existing
+        // rows so a consultation reclassified as an exam cannot be replayed later.
+        await this.prisma.bookingSync.updateMany({
+            where: { clinicId, vismedAppointmentId: String(a.idpacienteagendamento) },
+            data: { rawPayload: a },
+        });
+    }
+
     private async upsertVismedAppointment(
         clinicId: string,
         a: any,
         opts?: { idEmpresaGestora?: number; baseUrl?: string },
     ): Promise<boolean> {
         const vismedAppointmentId = a?.idpacienteagendamento ? String(a.idpacienteagendamento) : null;
-        if (!isVismedConsultation(a)) return false;
+        if (!isVismedConsultation(a)) {
+            await this.preserveExcludedAppointment(clinicId, a);
+            return false;
+        }
         const dataAg = a?.dataagendamento;
         const horaIni = a?.horarioagendamento;
         const horaFim = a?.horarioagendamentofinal;
@@ -2520,7 +2541,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
     private async propagateVismedCancellationToDoctoralia(syncId: string): Promise<void> {
         const rec = await this.prisma.bookingSync.findUnique({ where: { id: syncId } });
         if (!rec) return;
-        if (!await isConsultationRecord(this.prisma, rec)) return;
+        if (!await canSynchronizeConsultation(this.prisma, rec)) return;
         if (rec.status !== 'CANCELLED') return;
         // Anti-loop: se o cancelamento original veio da Doctoralia ou de nós cancelando lá,
         // não devemos chamar cancelBooking de novo na Doctoralia.
@@ -2611,7 +2632,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
     private async propagateDoctoraliaCancellationToVismed(syncId: string): Promise<void> {
         const rec = await this.prisma.bookingSync.findUnique({ where: { id: syncId } });
         if (!rec) return;
-        if (!await isConsultationRecord(this.prisma, rec)) return;
+        if (!await canSynchronizeConsultation(this.prisma, rec)) return;
         if (rec.status !== 'CANCELLED') return;
         // Anti-loop: se o cancelamento original veio da VisMed ou de nós cancelando lá,
         // não devemos chamar delete-agendamento de novo na VisMed.
@@ -2703,7 +2724,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
     private async propagateVismedRescheduleToDoctoralia(syncId: string, previousStartAt: Date): Promise<void> {
         const rec = await this.prisma.bookingSync.findUnique({ where: { id: syncId } });
         if (!rec) return;
-        if (!await isConsultationRecord(this.prisma, rec)) return;
+        if (!await canSynchronizeConsultation(this.prisma, rec)) return;
         if (rec.status === 'CANCELLED') return;
         if (!rec.doctoraliaBookingId || !rec.doctoraliaFacilityId || !rec.doctoraliaDoctorId || !rec.doctoraliaAddressId) {
             this.logger.debug(`[RESCHEDULE-SYNC] booking ${syncId} sem vínculo Doctoralia, nada a propagar`);
@@ -2820,7 +2841,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
     private async propagateDoctoraliaRescheduleToVismed(syncId: string, previousVismedAppointmentId: string | null): Promise<void> {
         const rec = await this.prisma.bookingSync.findUnique({ where: { id: syncId } });
         if (!rec) return;
-        if (!await isConsultationRecord(this.prisma, rec)) return;
+        if (!await canSynchronizeConsultation(this.prisma, rec)) return;
         if (rec.status === 'CANCELLED') return;
         if (!rec.vismedDoctorId) {
             this.logger.debug(`[RESCHEDULE-SYNC] booking ${syncId} sem vismedDoctorId, nada a propagar`);
@@ -2850,7 +2871,8 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         // Reusa o construtor de payload do createVismedAppointment, simulando o objeto booking.
         const fakeBooking: any = {
             id: rec.doctoraliaBookingId || `local-${rec.id}`,
-            address_service: { id: rec.addressServiceId },
+            address_service: { id: (rec.rawPayload as any)?.data?.new_visit_booking?.address_service?.id
+                || (rec.rawPayload as any)?.data?.visit_booking?.address_service?.id || rec.addressServiceId },
             start_at: rec.startAt.toISOString(),
             patient: {
                 name: rec.patientName,
@@ -3018,10 +3040,16 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
      * Auto-resolve alertas de médicos que já ganharam vínculo LINKED desde a última verificação.
      */
     async getSkippedBookingAlerts(clinicId: string) {
-        const pending = await this.prisma.skippedBookingAlert.findMany({
+        const allPending = await this.prisma.skippedBookingAlert.findMany({
             where: { clinicId, resolved: false, startAt: { gte: new Date() } },
             orderBy: { startAt: 'desc' },
         });
+        const pendingRecords = allPending.length ? await consultationRecords(this.prisma, await this.prisma.bookingSync.findMany({
+            where: { clinicId, id: { in: allPending.map(a => a.bookingSyncId) } },
+            select: { id: true, clinicId: true, rawPayload: true, addressServiceId: true },
+        })) : [];
+        const pendingIds = new Set(pendingRecords.map(r => r.id));
+        const pending = allPending.filter(a => pendingIds.has(a.bookingSyncId));
 
         // Auto-resolução lazy: médico já vinculado → resolver os alertas DOCTOR_NOT_LINKED dele.
         // Alertas VISMED_CREATE_FAILED não são auto-resolvidos por vínculo (a falha é outra).
@@ -3196,7 +3224,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
     private async syncDoctoraliaBreak(bookingSyncId: string): Promise<void> {
         const rec = await this.prisma.bookingSync.findUnique({ where: { id: bookingSyncId } });
         if (!rec || rec.origin !== 'VISMED' || !rec.vismedDoctorId) return;
-        if (!await isConsultationRecord(this.prisma, rec)) return;
+        if (!await canSynchronizeConsultation(this.prisma, rec)) return;
 
         // Disabling a professional is not a cancellation. Preserve existing breaks
         // for separate review, and stop this record from creating/moving/deleting one.
@@ -3729,6 +3757,9 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                     if (['BOOKED', 'CONFIRMED', 'CANCELLED'].includes(reserved.status)) {
                         return { processed: false, reason: 'already_synced' };
                     }
+                    if (reserved.rawPayload && !await canSynchronizeConsultation(this.prisma, reserved)) {
+                        return { processed: false, reason: 'not_confirmed_consultation' };
+                    }
                     const needsFailClosedPreflight =
                         reserved.status === 'PROCESSING' || !!reserved.vismedAttemptAt;
 
@@ -4252,7 +4283,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 where: { id: existing.id },
                 data: {
                     status: 'CANCELLED',
-                    rawPayload: rawNotification,
+                    rawPayload: preserveAppointmentMetadata(rawNotification, existing),
                     processedAt: new Date(),
                 },
             });
@@ -4296,6 +4327,9 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         // Doctoralia booking-moved payload uses new_visit_booking (after) + old_visit_booking (before)
         const booking = data?.new_visit_booking || data?.visit_booking || data?.booking || data;
         const oldBooking = data?.old_visit_booking;
+        if (booking?.address_service?.id && !await isConsultationRecord(this.prisma, {
+            clinicId, rawPayload: { data: { visit_booking: booking } },
+        })) return { processed: false, reason: 'not_confirmed_consultation' };
         const policyRecord = await this.prisma.bookingSync.findUnique({
             where: { doctoraliaBookingId: String(oldBooking?.id || booking?.id || '') },
         });
@@ -4341,7 +4375,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 },
                 orderBy: { processedAt: 'desc' },
             });
-            if (candidate) {
+            if (candidate && await canSynchronizeConsultation(this.prisma, candidate)) {
                 this.logger.log(
                     `[BOOKING-MOVED] reconciliou registro órfão ${candidate.id} (doctoraliaBookingId=${candidate.doctoraliaBookingId}) → adotando novo id ${booking.id}`,
                 );
@@ -4378,7 +4412,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
         if (existing.startAt.getTime() === newStartAt.getTime()) {
             await this.prisma.bookingSync.update({
                 where: { id: existing.id },
-                data: { rawPayload: rawNotification, processedAt: new Date() },
+                data: { rawPayload: preserveAppointmentMetadata(rawNotification, existing), processedAt: new Date() },
             });
             this.logger.debug(`[BOOKING-MOVED] booking ${booking.id} sem mudança de horário (${booking.start_at}), no-op`);
             return { processed: true, action: 'booking_moved', noop: true };
@@ -4392,7 +4426,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 endAt: newEndAt,
                 doctoraliaDoctorId: String(data.doctor?.id || existing.doctoraliaDoctorId),
                 doctoraliaAddressId: String(data.address?.id || existing.doctoraliaAddressId),
-                rawPayload: rawNotification,
+                rawPayload: preserveAppointmentMetadata(rawNotification, existing),
                 processedAt: new Date(),
             },
         });
@@ -4659,7 +4693,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
                 }
                 for (const a of agendamentos) {
                     if (a?.idpacienteagendamento && String(a.idpacienteagendamento) === String(vismedAppointmentId)) {
-                        return 'confirmed';
+                        return isVismedConsultation(a) ? 'confirmed' : 'unverified';
                     }
                 }
             }
@@ -4700,7 +4734,7 @@ export class BookingSyncService implements OnModuleInit, OnModuleDestroy {
             const validMatchingResponse = response.every(item => {
                 if (!item || typeof item !== 'object') return false;
                 const returnedId = String((item as any).idpacienteagendamento || '').trim();
-                return returnedId === expectedId;
+                return returnedId === expectedId && isVismedConsultation(item);
             });
             return validMatchingResponse ? 'confirmed' : 'unverified';
         } catch (err: any) {

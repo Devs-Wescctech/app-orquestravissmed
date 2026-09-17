@@ -211,6 +211,7 @@ describe('BookingSyncService — autoridade clínica do médico na ingestão Vis
 
 describe('BookingSyncService — fronteira de persistência da autoridade clínica', () => {
     const appointment = {
+        tipo_servico: 'Consulta',
         idpacienteagendamento: 'appointment-1',
         idprofissional: '123',
         dataagendamento: '2026-08-20',
@@ -398,7 +399,7 @@ describe('BookingSyncService — fronteira de persistência da autoridade clíni
         expect(service.propagateVismedRescheduleToDoctoralia).not.toHaveBeenCalled();
     });
 
-    it.each(['Consulta', 'Exame', 'Procedimento'])('persiste %s sem converter em consulta', async tipo_servico => {
+    it.each(['Consulta'])('persiste %s sem converter em consulta', async tipo_servico => {
         const { service, prisma } = buildIngestion();
         await service.upsertVismedAppointment('clinic-a', { ...appointment, tipo_servico });
         expect(prisma.bookingSync.upsert.mock.calls[0][0].update.rawPayload.tipo_servico).toBe(tipo_servico);
@@ -407,8 +408,8 @@ describe('BookingSyncService — fronteira de persistência da autoridade clíni
 
     it.each(['0', 0, false])('preserva registro e impede envio quando profissional está desabilitado (%p)', async mostrarnadoctoralia => {
         const { service, prisma } = buildIngestion();
-        await service.upsertVismedAppointment('clinic-a', { ...appointment, tipo_servico: 'Exame', mostrarnadoctoralia });
-        expect(prisma.bookingSync.upsert.mock.calls[0][0].update).toMatchObject({ status: 'BOOKED', rawPayload: { tipo_servico: 'Exame', mostrarnadoctoralia } });
+        await service.upsertVismedAppointment('clinic-a', { ...appointment, tipo_servico: 'Consulta', mostrarnadoctoralia });
+        expect(prisma.bookingSync.upsert.mock.calls[0][0].update).toMatchObject({ status: 'BOOKED', rawPayload: { tipo_servico: 'Consulta', mostrarnadoctoralia } });
         expect(service.syncDoctoraliaBreak).not.toHaveBeenCalled();
         expect(service.propagateVismedCancellationToDoctoralia).not.toHaveBeenCalled();
         expect(service.propagateVismedRescheduleToDoctoralia).not.toHaveBeenCalled();

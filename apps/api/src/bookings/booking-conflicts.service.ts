@@ -2,12 +2,14 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { DocplannerService } from '../integrations/docplanner.service';
 import { RateLimiterService } from './rate-limiter.service';
+import { consultationRecords } from './consultation-policy';
 
 const fields = {
     id: true, clinicId: true, patientName: true, patientSurname: true, status: true,
     startAt: true, endAt: true, vismedAppointmentId: true, doctoraliaBookingId: true,
     doctoraliaBreakId: true, doctoraliaDoctorId: true, doctoraliaAddressId: true,
     doctoraliaFacilityId: true, syncedToDoctoralia: true, syncError: true,
+    rawPayload: true, addressServiceId: true,
 } as const;
 const displayRecord = (r: any) => ({
     id: r.id, patientName: [r.patientName, r.patientSurname].filter(Boolean).join(' '),
@@ -34,7 +36,7 @@ export class BookingConflictsService {
                 patientSurname: record.patientSurname,
                 vismedAppointmentId: { not: record.vismedAppointmentId },
             }, select: fields });
-            base.sameNameBookings = similar.filter(r => r.vismedAppointmentId).map(displayRecord);
+            base.sameNameBookings = (await consultationRecords(this.prisma, similar)).filter(r => r.vismedAppointmentId).map(displayRecord);
         }
 
         let facilityId = record.doctoraliaFacilityId;

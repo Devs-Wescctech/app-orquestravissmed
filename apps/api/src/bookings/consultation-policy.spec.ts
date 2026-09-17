@@ -53,6 +53,22 @@ describe('consultation-only flow', () => {
         service.vismedService = { getAgendamentoById: jest.fn().mockResolvedValue([{ idpacienteagendamento: 'appt', tipo_servico }]) };
         expect(await service.verifyVismedAppointmentByOfficialIdContract('clinic', 'appt')).toBe('unverified');
     });
+    it.each(['Exame', 'Procedimento', undefined])('webhook/retry handlers ignore historic %p without writes', async tipo_servico => {
+        const { service } = harness();
+        service.prisma.bookingSync.findUnique.mockResolvedValue({ id: 'historic', rawPayload: { tipo_servico } });
+        const data = { visit_booking: { id: 'remote' } };
+        for (const method of ['handleSlotBooked', 'handleBookingCanceled', 'handleBookingMoved']) {
+            expect(await service[method]('clinic', data, { data })).toMatchObject({ processed: false, reason: 'not_confirmed_consultation' });
+        }
+        expect(service.prisma.bookingSync.update).not.toHaveBeenCalled();
+        expect(service.prisma.bookingSync.upsert).not.toHaveBeenCalled();
+    });
+    it.each(['Exame', 'Procedimento', undefined])('manual cancellation cannot remove historical %p break', async tipo_servico => {
+        const { service } = harness();
+        await expect(service.cancelSyncRecord('clinic', { rawPayload: { tipo_servico }, doctoraliaBreakId: 'shared' }))
+            .rejects.toThrow('não confirmado como consulta');
+        expect(service.prisma.bookingSync.update).not.toHaveBeenCalled();
+    });
 });
 
 describe('verified Doctoralia catalog policy', () => {
@@ -122,6 +138,14 @@ describe('verified Doctoralia catalog policy', () => {
         ]);
         expect(result.map((b: any) => b.id)).toEqual(['consultation']);
         expect(db.bookingSync.findMany.mock.calls[0][0].where.clinicId).toBe('clinic');
+    });
+    it('reuses local catalog reads within a batch without remote calls or global stale cache', async () => {
+        const db = catalog();
+        expect(await consultationRecords(db, Array(1000).fill(record))).toHaveLength(1000);
+        expect(db.integrationConnection.findFirst).toHaveBeenCalledTimes(1);
+        expect(db.doctoraliaAddressService.findUnique).toHaveBeenCalledTimes(1);
+        db.doctoraliaAddressService.findUnique.mockResolvedValue({ service: { doctoraliaServiceId: '7580' } });
+        expect(await consultationRecords(db, [record])).toEqual([]);
     });
     it('publishes only consultation services on slots; IDs are dictionary IDs', () => {
         const services = [{ id: 'a', service_id: '291' }, { id: 'b', service_id: '7580' },

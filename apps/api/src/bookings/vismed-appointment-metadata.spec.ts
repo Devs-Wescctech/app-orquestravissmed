@@ -20,13 +20,13 @@ describe('VissMed appointment metadata', () => {
     it('returns persisted metadata without remote calls or writes and keeps clinic scoping', async () => {
         const service: any = Object.create(BookingSyncService.prototype);
         service.prisma = { bookingSync: { findMany: jest.fn().mockResolvedValue([
-            { id: 'exam-1', rawPayload: { tipo_servico: 'Exame', mostrarnadoctoralia: '0' } },
+            { id: 'consultation-1', rawPayload: { tipo_servico: 'Consulta', mostrarnadoctoralia: '0' } },
             { id: 'legacy-1', rawPayload: null },
         ]) } };
         const result = await service.getBookingSyncRecords('clinic-a');
         expect(service.prisma.bookingSync.findMany).toHaveBeenCalledWith({ where: { clinicId: 'clinic-a' }, orderBy: { startAt: 'asc' } });
-        expect(result[0]).toMatchObject({ appointmentType: 'Exame', professionalDoctoraliaEnabled: false });
-        expect(result[1]).toMatchObject({ appointmentType: null, professionalDoctoraliaEnabled: null });
+        expect(result[0]).toMatchObject({ appointmentType: 'Consulta', professionalDoctoraliaEnabled: false });
+        expect(result).toHaveLength(1);
     });
     it.each(['BOOKED', 'CONFIRMED', 'CANCELLED'])('does not mutate Doctoralia for disabled professional (%s)', async status => {
         const service: any = Object.create(BookingSyncService.prototype);
