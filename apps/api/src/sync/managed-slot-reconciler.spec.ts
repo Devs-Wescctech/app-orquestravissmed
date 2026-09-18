@@ -18,6 +18,16 @@ function fixture() {
     return { client, authorized, persist, run, getRemote: () => remote };
 }
 describe('verified replacement', () => {
+    it('does not remove anything when a published second service is absent from remote read-back', async () => {
+        const f = fixture();
+        const full = [first, { ...second, address_services: [...second.address_services, { address_service_id: '6', duration: 30 }] }];
+        const digest = periodsHash(full);
+        expect(await reconcileManagedRemoval({ state: { ...state, hash: digest, periodsHash: digest, periods: full },
+            hash: digest, scope, targets: [first], client: f.client, authorized: f.authorized, persist: f.persist,
+            now: new Date('2029-01-01'), verifyAttempts: 1 })).toBe(false);
+        expect(f.client.replaceSlots).not.toHaveBeenCalled();
+        expect(f.persist).not.toHaveBeenCalled();
+    });
     it('removes first, preserves control and saves evidence only after read-back', async () => {
         const f = fixture(); expect(await f.run()).toBe(true);
         expect(f.getRemote()).toEqual([second]); expect(f.persist).toHaveBeenCalledWith([second]);

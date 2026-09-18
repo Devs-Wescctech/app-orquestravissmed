@@ -93,3 +93,36 @@ test('pending details identify the execution and do not fetch until requested',(
  const html=renderToStaticMarkup(React.createElement(SyncPendingDetails,{startedAt:'2026-09-12T10:00:00Z',source:'Doctoralia',loadEvents:async()=>{calls++;return [];}}));
  assert.equal(calls,0);assert.match(html,/12\/09\/2026/);assert.match(html,/07:00:00/);assert.match(html,/Ver motivos e próximos passos/);
 });
+
+// Controlled hook harness exercises callback/state transitions, not a browser/DOM.
+function pendingHarness(loadEvents) {
+ const states=[];let cursor=0;
+ const hooks={...React,useState(initial){const i=cursor++;if(!(i in states))states[i]=initial;return [states[i],value=>{states[i]=value;}];}};
+ const {SyncPendingDetails:Component}=load('SyncPendingDetails.tsx',{react:hooks,'./pending-reasons':load('pending-reasons.ts')});
+ const tree=()=>{cursor=0;return Component({startedAt:'2026-09-18T12:00:00Z',source:'Homologação',loadEvents});};
+ const find=(node,type)=>{if(!node||typeof node!=='object')return null;if(node.type===type)return node;for(const child of React.Children.toArray(node.props?.children)){const found=find(child,type);if(found)return found;}return null;};
+ return {html:()=>renderToStaticMarkup(tree()),button:()=>find(tree(),'button')};
+}
+test('pending details load protected causes only after request and render the associated events',async()=>{
+ let finish,calls=0;
+ const h=pendingHarness(()=>{calls++;return new Promise(resolve=>{finish=resolve;});});
+ assert.equal(calls,0);
+ const loading=h.button().props.onClick();
+ assert.equal(h.button().props.disabled,true);assert.match(h.html(),/Consultando motivos/);
+ finish([{action:'professional_cleanup_pending',message:'Histórico sintético incompleto; limpeza pendente.'}]);
+ await loading;
+ const html=h.html();
+ assert.equal(calls,1);assert.match(html,/Remoção de horários aguardando conferência/);
+ assert.match(html,/Histórico sintético incompleto/);assert.match(html,/Eventos relacionados \(1 avisos/);
+ assert.equal(h.button(),null);
+});
+test('pending details show a recoverable error and allow retry without exposing the raw error',async()=>{
+ let calls=0;
+ const h=pendingHarness(async()=>{if(++calls===1)throw new Error('PRIVATE_SERVER_DETAIL');return [];});
+ await h.button().props.onClick();
+ assert.match(h.html(),/role="alert"/);assert.match(h.html(),/Tentar novamente/);
+ assert.doesNotMatch(h.html(),/PRIVATE_SERVER_DETAIL/);
+ await h.button().props.onClick();
+ assert.equal(calls,2);assert.match(h.html(),/não permitem explicar o motivo com segurança/);
+ assert.doesNotMatch(h.html(),/role="alert"/);
+});
