@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { VismedService } from '../integrations/vismed/vismed.service';
+import { ProfessionalEligibility } from '../integrations/vismed/professional-eligibility';
 
 export interface AvailRange {
     start: string; // "HH:MM"
@@ -86,6 +87,10 @@ export class VismedAvailabilityService {
         private prisma: PrismaService,
         private vismed: VismedService,
     ) {}
+
+    async getProfessionalEligibility(clinicId: string, professionalId: number) {
+        return new ProfessionalEligibility(this.prisma, this.vismed).check(clinicId, professionalId);
+    }
 
     private toMinutes(hhmm: string): number | null {
         const m = hhmm?.trim().match(/^(\d{1,2}):(\d{2})$/);

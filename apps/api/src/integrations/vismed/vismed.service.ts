@@ -284,6 +284,12 @@ export class VismedService {
         }
     }
 
+    /** Preserve raw shape and require HTTP 200: falsy/error responses are not an empty eligible roster. */
+    async getProfissionaisForEligibility(idEmpresaGestora: number, baseUrl: string): Promise<unknown> {
+        return this.requestJson(`profissionais-by-idempresagestora?idempresagestora=${idEmpresaGestora}`,
+            baseUrl, undefined, true, true);
+    }
+
     async getEspecialidades(idEmpresaGestora: number, baseUrl?: string): Promise<any[]> {
         try {
             this.logger.log(`Buscando especialidades para empresa gestora: ${idEmpresaGestora} na Base URL: ${baseUrl || 'padrão'}`);

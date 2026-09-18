@@ -1,7 +1,7 @@
 import { AppointmentsService } from './appointments.service';
 
 describe('manual slot publication eligibility', () => {
-    it.each([[], null])('does not bypass the gate for excluded or uncertain professionals (%j)', async body => {
+    it.each([[], null].map(body => [body]))('does not bypass the gate for excluded or uncertain professionals (%j)', async body => {
         const prisma: any = {
             integrationConnection: { findFirst: jest.fn(async ({ where }) => where.provider === 'vismed'
                 ? { clientId: '52', domain: 'https://app.vissmed.com.br/api-docctor-3' }

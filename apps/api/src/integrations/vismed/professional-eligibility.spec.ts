@@ -12,10 +12,10 @@ describe('fresh professional eligibility (not scheduleDay)', () => {
         const s = setup(); expect((await s.gate.check('clinic', 6983)).state).toBe('enabled');
         expect(s.vismed.getProfissionaisForEligibility).toHaveBeenCalledWith(52, 'https://app.vissmed.com.br/api-docctor-3');
     });
-    it.each([[], [{ id: 7, ativo: '1' }], [{ id: 6983, mostrarnadoctoralia: '0' }], [{ id: 6983, ativo: '0' }]])('excludes a professional outside the eligible roster: %j', async body => {
+    it.each([[], [{ id: 7, ativo: '1' }], [{ id: 6983, mostrarnadoctoralia: '0' }], [{ id: 6983, ativo: '0' }]].map(body => [body]))('excludes a professional outside the eligible roster: %j', async body => {
         expect((await setup(body).gate.check('clinic', 6983)).state).toBe('excluded');
     });
-    it.each([null, {}, { data: [] }, [{ nome: 'invalid' }], [{ id: 1, idprofissional: 2 }], [{ id: 1 }, { id: 1 }], [{ id: 6983, mostrarnadoctoralia: null }]])('fails closed without destructive cleanup on invalid data: %j', async body => {
+    it.each([null, {}, { data: [] }, [{ nome: 'invalid' }], [{ id: 1, idprofissional: 2 }], [{ id: 1 }, { id: 1 }], [{ id: 6983, mostrarnadoctoralia: null }]].map(body => [body]))('fails closed without destructive cleanup on invalid data: %j', async body => {
         expect((await setup(body).gate.check('clinic', 6983)).state).toBe('unknown');
     });
     it('does not treat network failure as a disabled professional', async () => {

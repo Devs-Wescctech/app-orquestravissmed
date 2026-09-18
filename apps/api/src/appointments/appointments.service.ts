@@ -2,6 +2,8 @@ import { Injectable, Logger, HttpException, BadRequestException, NotFoundExcepti
 import { PrismaService } from '../prisma/prisma.service';
 import { filterDoctoraliaBookings, isConsultationRecord } from '../bookings/consultation-policy';
 import { DocplannerService, DocplannerClient } from '../integrations/docplanner.service';
+import { VismedService } from '../integrations/vismed/vismed.service';
+import { ProfessionalEligibility } from '../integrations/vismed/professional-eligibility';
 
 @Injectable()
 export class AppointmentsService {
@@ -10,6 +12,7 @@ export class AppointmentsService {
     constructor(
         private prisma: PrismaService,
         private docplanner: DocplannerService,
+        private vismed: VismedService,
     ) { }
 
     // ────────────────────── Audit Logging ──────────────────────
@@ -370,6 +373,14 @@ export class AppointmentsService {
             where: { clinicId_entityType_externalId: { clinicId, entityType: 'DOCTOR', externalId: doctorExternalId } },
         });
         if (!mapping) throw new Error('Médico não encontrado');
+
+        const doctor = mapping.vismedId ? await this.prisma.vismedDoctor.findUnique({ where: { id: mapping.vismedId } }) : null;
+        const eligibility = await new ProfessionalEligibility(this.prisma, this.vismed).check(clinicId, Number(doctor?.vismedId));
+        if (mapping.status !== 'LINKED' || eligibility.state !== 'enabled') {
+            await this.logRequest({ clinicId, action: 'REPLACE_SLOTS', doctorId: doctorExternalId,
+                durationMs: Date.now() - startTime, status: 'blocked', error: `professional_eligibility_${eligibility.state}` });
+            throw new BadRequestException('Profissional sem habilitação confirmada na VISSMED; horários não enviados.');
+        }
 
         const cd = mapping.conflictData as any || {};
         if (!cd.facilityId || !cd.address?.id) throw new Error('Dados de endereço incompletos.');

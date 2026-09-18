@@ -10,6 +10,7 @@ import { VismedAvailabilityService, ClinicAvailability, AvailRange } from './vis
 import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 import { getDoctoraliaMetricsService } from '../metrics/doctoralia-metrics.service';
 import { SyncCycleContext } from './sync-cycle-context';
+import { DisabledProfessionalSlots } from './disabled-professional-slots';
 
 interface TurnoSlot {
     start: string;
@@ -217,6 +218,29 @@ export class SlotSyncService {
             }
         }
 
+        const eligibility = await this.availabilityService.getProfessionalEligibility(clinicId || '', Number(doctor.vismedId));
+        if (eligibility.state === 'unknown') {
+            const message = 'Habilitação do profissional na VISSMED não confirmada; nenhum horário enviado ou removido.';
+            if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'professional_eligibility_unknown', message);
+            return { success: false, message, slotsCreated: 0 };
+        }
+        const authorizedMapping = clinicMapping?.status === 'LINKED' && doctor.unifiedMappings.find(
+            um => String(um.doctoraliaDoctor.doctoraliaDoctorId) === String(clinicMapping.externalId));
+        if (!authorizedMapping) {
+            const message = 'Vínculo atual da clínica não autoriza publicação ou remoção de horários.';
+            if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'managed_scope_pending', message);
+            return { success: false, message, slotsCreated: 0 };
+        }
+        if (eligibility.state === 'excluded') {
+            const remote = authorizedMapping.doctoraliaDoctor;
+            const result = await new DisabledProfessionalSlots(this.prisma).clear(clinicId!, doctor.id,
+                String(remote.doctoraliaFacilityId), String(remote.doctoraliaDoctorId), client,
+                async () => (await this.availabilityService.getProfessionalEligibility(clinicId!, Number(doctor.vismedId))).state === 'excluded');
+            const message = `Profissional não habilitado: ${result.cleared} endereço(s) com horários gerenciados retirados; ${result.pending} pendência(s). Consultas existentes preservadas.`;
+            if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', result.pending ? 'professional_cleanup_pending' : 'professional_excluded', message);
+            return { success: result.pending === 0, message, slotsCreated: 0 };
+        }
+
         // No modo legado (template) os turnos são obrigatórios. No modo availability a fonte
         // é o scheduleDay (não depende de turno_m/t/n preenchido).
         if (source === 'template' && !doctor.turnoM && !doctor.turnoT && !doctor.turnoN) {
@@ -227,16 +251,7 @@ export class SlotSyncService {
             return { success: false, message: `Médico ${doctor.name} não está vinculado à Doctoralia.`, slotsCreated: 0 };
         }
 
-        let selectedMapping = doctor.unifiedMappings[0];
-        if (clinicId && doctor.unifiedMappings.length > 1) {
-            const clinicDoctorMappings = await this.prisma.mapping.findMany({
-                where: { clinicId, entityType: 'DOCTOR' },
-                select: { vismedId: true },
-            });
-            const clinicVismedIds = new Set(clinicDoctorMappings.map(m => m.vismedId).filter(Boolean));
-            const clinicScoped = doctor.unifiedMappings.find(um => clinicVismedIds.has(um.vismedDoctorId));
-            if (clinicScoped) selectedMapping = clinicScoped;
-        }
+        const selectedMapping = authorizedMapping;
 
         let totalSlots = 0;
         let addressesAttempted = 0;
@@ -578,6 +593,11 @@ export class SlotSyncService {
                 this.logger.log(`Doctor ${doctor.name}: sending ${allSlots.length} work periods to address ${addrId} for ${dates.length} days. Sample: ${sampleSlot}`);
                 if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'payload_sent', `Doctor ${doctor.name} addr ${addrId}: enviando ${allSlots.length} slots. Amostra: ${sampleSlot.substring(0, 400)}`);
 
+                if ((await this.availabilityService.getProfessionalEligibility(clinicId!, Number(doctor.vismedId))).state !== 'enabled') {
+                    addressesFailed++;
+                    if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'professional_eligibility_changed', 'Habilitação mudou durante o ciclo; horários não enviados.');
+                    continue;
+                }
                 const putResponse = await client.replaceSlots(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, { slots: allSlots });
                 const respStr = JSON.stringify(putResponse);
                 this.logger.log(`Doctor ${doctor.name}: PUT slots response: ${respStr}`);
