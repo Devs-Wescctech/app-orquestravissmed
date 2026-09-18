@@ -9,6 +9,7 @@ export type ManagedSlotState = SlotScope & {
   hash: string;
   ranges: Array<{ start: string; end: string }>;
   periods?: Period[];
+  periodsHash?: string;
 };
 
 export function managedSlotState(
@@ -20,7 +21,9 @@ export function managedSlotState(
     ...scope,
     version: 1,
     hash,
-    ...(validPeriods(slots) ? { periods: structuredClone(slots) } : {}),
+    ...(validPeriods(slots)
+      ? { periods: structuredClone(slots), periodsHash: periodsHash(slots) }
+      : {}),
     ranges: slots.map((slot) => {
       if (
         !slot ||
@@ -87,4 +90,8 @@ export function managedClearPayload(
   }
   return slots.length ? { slots } : null;
 }
-import { Period, validPeriods } from './managed-period-replacement';
+import {
+  Period,
+  validPeriods,
+  periodsHash,
+} from './managed-period-replacement';

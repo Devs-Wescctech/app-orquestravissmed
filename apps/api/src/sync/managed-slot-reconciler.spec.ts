@@ -4,7 +4,7 @@ const scope = { clinicId: 'c', facilityId: 'f', doctorId: 'd', addressId: 'a' };
 const first = { start: '2030-01-02T08:10:00-03:00', end: '2030-01-02T08:40:00-03:00', address_services: [{ address_service_id: '5', duration: 30 }] };
 const second = { ...first, start: '2030-01-02T09:10:00-03:00', end: '2030-01-02T09:40:00-03:00' };
 const periods = [first, second], hash = periodsHash(periods);
-const state = { ...scope, version: 1, hash, periods, ranges: periods.map(({ start, end }) => ({ start, end })) };
+const state = { ...scope, version: 1, hash, periodsHash: periodsHash(periods), periods, ranges: periods.map(({ start, end }) => ({ start, end })) };
 const snapshot = ps => ({ _items: ps.map(p => ({ start: p.start, address_services: { _items: [{ id: '5' }] } })) });
 function fixture() {
     let remote = periods;

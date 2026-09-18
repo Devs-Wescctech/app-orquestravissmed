@@ -1,5 +1,5 @@
 import { createHash } from 'crypto';
-import { planManagedRemoval, snapshotMatches } from './managed-period-replacement';
+import { planManagedRemoval, snapshotMatches, periodsHash } from './managed-period-replacement';
 
 const scope = { clinicId: 'c', facilityId: 'f', doctorId: 'd', addressId: 'a' };
 const service = [{ address_service_id: '5', duration: 30 }];
@@ -7,7 +7,7 @@ const first = { start: '2030-01-02T08:10:00-03:00', end: '2030-01-02T08:40:00-03
 const second = { start: '2030-01-02T09:10:00-03:00', end: '2030-01-02T09:40:00-03:00', address_services: service, insurance_accepted: 'with-insurance-only', insurance_providers: [7], insurance_plans: [72] };
 const periods = [first, second];
 const hash = createHash('sha256').update(JSON.stringify(periods)).digest('hex');
-const state = { ...scope, version: 1, hash, periods, ranges: periods.map(({ start, end }) => ({ start, end })) };
+const state = { ...scope, version: 1, hash, periodsHash: periodsHash(periods), periods, ranges: periods.map(({ start, end }) => ({ start, end })) };
 const now = new Date('2029-01-01T00:00:00Z');
 describe('complete known-day replacement', () => {
     it('removes only 08:10 by resending the entire retained 09:10 configuration', () => {

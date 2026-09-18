@@ -244,9 +244,10 @@ export class SlotSyncService {
         }
         if (eligibility.state === 'excluded') {
             const remote = authorizedMapping.doctoraliaDoctor;
-            const result = await new DisabledProfessionalSlots(this.prisma).assess(clinicId!,
-                String(remote.doctoraliaFacilityId), String(remote.doctoraliaDoctorId));
-            const message = `Profissional não habilitado: nenhum horário enviado ou removido; ${result.pending} pendência(s). ${result.pending ? UNSAFE_SLOT_CLEANUP_MESSAGE : 'Consultas existentes preservadas.'}`;
+            const result = await new DisabledProfessionalSlots(this.prisma).reconcile(clinicId!, doctor.id,
+                String(remote.doctoraliaFacilityId), String(remote.doctoraliaDoctorId), client,
+                async () => (await this.availabilityService.getProfessionalEligibility(clinicId!, Number(doctor.vismedId))).state === 'excluded');
+            const message = `Profissional não habilitado: ${result.cleared} dia(s) reconciliado(s); ${result.pending} pendência(s). ${result.pending ? UNSAFE_SLOT_CLEANUP_MESSAGE : 'Consultas existentes preservadas.'}`;
             if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', result.pending ? 'professional_cleanup_pending' : 'professional_excluded', message);
             return { success: result.pending === 0, message, slotsCreated: 0 };
         }
@@ -533,6 +534,17 @@ export class SlotSyncService {
                         if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'managed_scope_pending',
                             `Endereço ${addrId}: limpeza pendente de conferência dos intervalos gerenciados. Estado antigo ou fora da janela; nenhuma remoção enviada.`);
                         continue;
+                    }
+                    // Legacy range-only evidence cannot reconstruct the settings to retain.
+                    if (Array.isArray((prevState.managedState as any)?.periods)) {
+                        const result = await new DisabledProfessionalSlots(this.prisma).reconcile(clinicId!, doctor.id,
+                            String(dDoc.doctoraliaFacilityId), String(dDoc.doctoraliaDoctorId), client,
+                            async () => (await this.availabilityService.getProfessionalEligibility(clinicId!, Number(doctor.vismedId))).state === 'enabled', dates, new Date(), addrId);
+                        if (!result.pending && result.cleared) {
+                            addressesCleared++;
+                            if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'cleared', `Disponibilidade reconciliada e confirmada por leitura: ${result.cleared} dia(s).`);
+                            continue;
+                        }
                     }
                     addressesFailed++;
                     if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'managed_scope_pending',

@@ -70,6 +70,10 @@ npm run build:api
 
 Instalação isolada via npm ci offline/ignore-scripts, Prisma Client gerado. Dependência nativa de teste extraída de pacote em cache. Nenhum manifest/lockfile alterado; nenhum .env de produção copiado.
 
+## Atualização posterior
+
+O fluxo de limpeza e suas verificações posteriores estão em [Remoção gerenciada com preservação](managed-slot-replacement-2026-09-18.md). As limitações e números abaixo retratam a etapa inicial, não a validação mais recente.
+
 ## Limitações e publicação
 
 - Não executados E2E com provedores, UI/browser ou suítes que exigem banco dedicado. Testes usam doubles; não comprovam comportamento real do PUT de limpeza na Doctoralia.
