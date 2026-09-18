@@ -39,6 +39,13 @@ describe('slot cleanup integration', () => {
         expect(f.client.getServices).not.toHaveBeenCalled();
         expect(f.events.some(e => e.action === 'professional_eligibility_unknown')).toBe(true);
     });
+    it('does not activate or publish when eligibility changes during schedule calculation', async () => {
+        const f = fixture(); f.eligibility.mockResolvedValueOnce({ state: 'enabled' }).mockResolvedValue({ state: 'excluded' });
+        f.availability.getRanges.mockReturnValue([{ start: '08:00', end: '12:00' }]);
+        await f.service.syncSlotsForDoctor('v', f.client, 'run', 30, 'clinic-a', f.availability);
+        expect(f.client.enableCalendar).not.toHaveBeenCalled();
+        expect(f.client.replaceSlots).not.toHaveBeenCalled();
+    });
     it('exclusion removes owned future availability even if scheduleDay still returns it', async () => {
         const f = fixture(); f.eligibility.mockResolvedValue({ state: 'excluded' });
         const future = [{ start: '2030-01-02T08:00:00-03:00', end: '2030-01-02T12:00:00-03:00' }];
