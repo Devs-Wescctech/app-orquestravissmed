@@ -571,6 +571,11 @@ export class SlotSyncService {
                 continue;
             }
 
+            if ((await this.availabilityService.getProfessionalEligibility(clinicId!, Number(doctor.vismedId))).state !== 'enabled') {
+                addressesFailed++;
+                if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'professional_eligibility_changed', 'Habilitação mudou durante o ciclo; calendário não ativado e horários não enviados.');
+                continue;
+            }
             try {
                 await client.enableCalendar(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId);
                 this.logger.log(`Doctor ${doctor.name} address ${addrId}: calendar enabled`);
@@ -705,11 +710,7 @@ export class SlotSyncService {
         let errors = 0;
 
         for (const m of mappedDoctors) {
-            // No modo legado (template) pulamos médicos sem turnos. No modo availability a
-            // fonte é o scheduleDay, então não filtramos por turno aqui.
-            if (source === 'template' && !m.vismedDoctor.turnoM && !m.vismedDoctor.turnoT && !m.vismedDoctor.turnoN) {
-                continue;
-            }
+            // Let the per-doctor gate run before template/shift checks, including cleanup for excluded doctors.
 
             try {
                 const result = await this.syncSlotsForDoctor(m.vismedDoctorId, client, syncRunId, daysAhead, clinicId, availability);

@@ -19,7 +19,7 @@ describe('AppointmentsService bookings hardening', () => {
             auditLog: { create: jest.fn().mockResolvedValue({}) },
         };
         docplanner = { createClient: jest.fn() };
-        service = new AppointmentsService(prisma, docplanner);
+        service = new AppointmentsService(prisma, docplanner, {} as any);
         jest.spyOn(DocplannerClient, 'runWithPriority').mockImplementation((fn: any) => fn());
     });
 

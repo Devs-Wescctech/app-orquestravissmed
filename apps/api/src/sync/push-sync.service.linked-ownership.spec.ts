@@ -59,6 +59,7 @@ describe('PushSyncService — ownership por mapping DOCTOR LINKED', () => {
             generateDateRange: jest.fn(() => []),
         };
         const availabilityService: any = {
+            getProfessionalEligibility: jest.fn(async () => ({ state: 'enabled' })),
             buildForClinic: jest.fn(async () => null),
         };
         const stableCache: any = {

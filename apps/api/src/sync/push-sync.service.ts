@@ -91,16 +91,28 @@ export class PushSyncService {
         // os médicos. Reflete bloqueios de agenda da VisMed. Pulada no modo legado (template).
         const slotSourceTemplate = (process.env.SLOT_SOURCE || 'availability').toLowerCase() === 'template';
         let availability: ClinicAvailability | null = null;
-        if (!slotSourceTemplate) {
-            const startDate = new Date();
-            startDate.setDate(startDate.getDate() + 1);
-            const dates = this.slotSync.generateDateRange(startDate, 30);
-            availability = await this.availabilityService.buildForClinic(clinicId, dates);
-        }
+        let availabilityBuilt = false;
 
         for (const mapping of mappings) {
             const vDoc = mapping.vismedDoctor;
             const dDoc = mapping.doctoraliaDoctor;
+            const eligibility = await this.availabilityService.getProfessionalEligibility(clinicId, Number(vDoc.vismedId));
+            if (eligibility.state !== 'enabled') {
+                if (eligibility.state === 'excluded') {
+                    // Cleanup is independent of shifts, specialties and current scheduleDay availability.
+                    try { await this.slotSync.syncSlotsForDoctor(vDoc.id, client, syncRunId, 30, clinicId); }
+                    catch { await this.logEvent(syncRunId, 'SLOT_SYNC', 'professional_cleanup_pending', 'Falha ao retirar horários gerenciados do profissional não habilitado.'); }
+                } else {
+                    await this.logEvent(syncRunId, 'SLOT_SYNC', 'professional_eligibility_unknown', 'Habilitação não confirmada; atualizações do profissional não enviadas.');
+                }
+                continue;
+            }
+            if (!slotSourceTemplate && !availabilityBuilt) {
+                const startDate = new Date();
+                startDate.setDate(startDate.getDate() + 1);
+                availability = await this.availabilityService.buildForClinic(clinicId, this.slotSync.generateDateRange(startDate, 30));
+                availabilityBuilt = true;
+            }
             const scopedSpecialties = (vDoc.specialties || []).filter(
                 (vs: any) => clinicEmpresa == null || vs?.specialty?.idEmpresaGestora === clinicEmpresa,
             );
