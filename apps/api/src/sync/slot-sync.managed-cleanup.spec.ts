@@ -52,7 +52,7 @@ describe('slot cleanup integration', () => {
         expect(f.client.enableCalendar).not.toHaveBeenCalled();
         expect(f.client.replaceSlots).not.toHaveBeenCalled();
     });
-    it('exclusion removes owned future availability even if scheduleDay still returns it', async () => {
+    it('exclusion reports pending without destructive PUT even if scheduleDay still returns ranges', async () => {
         const f = fixture(); f.eligibility.mockResolvedValue({ state: 'excluded' });
         const future = [{ start: '2030-01-02T08:00:00-03:00', end: '2030-01-02T12:00:00-03:00' }];
         f.setState({ addressId: 'a', availabilityHash: 'prior-hash', managedState: managedSlotState(scope, 'prior-hash', future) });
@@ -60,7 +60,9 @@ describe('slot cleanup integration', () => {
         f.prisma.mapping.findMany.mockResolvedValue([]);
         f.availability.getRanges.mockReturnValue([{ start: '08:00', end: '12:00' }]);
         await f.service.syncSlotsForDoctor('v', f.client, 'run', 30, 'clinic-a', f.availability);
-        expect(f.client.replaceSlots).toHaveBeenCalledWith('f', 'd', 'a', { slots: [{ ...future[0], address_services: [] }] });
+        expect(f.client.replaceSlots).not.toHaveBeenCalled();
+        expect(f.events.some(e => e.action === 'professional_cleanup_pending')).toBe(true);
+        expect(f.getState().managedState.ranges).toEqual(future);
         expect(f.client.enableCalendar).not.toHaveBeenCalled();
         expect(f.client.getServices).not.toHaveBeenCalled();
     });
@@ -75,13 +77,13 @@ describe('slot cleanup integration', () => {
         expect(event.message).toContain('não apareceu');
         expect(event.message).toContain('Nenhum horário enviado ou removido');
     });
-    it('clears exact managed periods only after a complete source snapshot and persists after success', async () => {
+    it('preserves managed intervals and records pending even after a complete empty source snapshot', async () => {
         const f = fixture();
         const result = await f.service.syncSlotsForDoctor('v', f.client, 'run', 30, 'clinic-a', f.availability);
-        expect(result.success).toBe(true);
-        expect(f.client.replaceSlots).toHaveBeenCalledWith('f', 'd', 'a', { slots: [{ ...ranges[0], address_services: [] }] });
-        expect(f.getState().managedState.ranges).toEqual([]);
-        expect(f.events.some(e => e.action === 'cleared')).toBe(true);
+        expect(result.success).toBe(false);
+        expect(f.client.replaceSlots).not.toHaveBeenCalled();
+        expect(f.getState().managedState.ranges).toEqual(ranges);
+        expect(f.events.some(e => e.action === 'managed_scope_pending')).toBe(true);
     });
     it('does not advance hash after API rejection, so a later cycle can retry', async () => {
         const f = fixture(); f.client.replaceSlots.mockRejectedValue(new Error('API error'));
