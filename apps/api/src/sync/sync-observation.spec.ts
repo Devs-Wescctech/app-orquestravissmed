@@ -8,6 +8,10 @@ function fixture(events: any[] = []) {
 }
 
 describe('Sync report and differential writes', () => {
+    it('counts professional cleanup pending as an agenda warning', () => {
+        expect(classifySyncEvents([{ entityType: 'SLOT_SYNC', action: 'professional_cleanup_pending' }]))
+            .toEqual({ errors: 0, warnings: 1, agendas: { professional_cleanup_pending: 1 } });
+    });
     it('counts each doctor once and keeps earlier created/updated outcome', async () => {
         const { run, prisma } = fixture();
         await observeSync(prisma, 'run', async () => {

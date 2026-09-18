@@ -33,6 +33,9 @@ test('new report distinguishes unchanged records, stages and pending calendars',
 });
 
 const emptyReport = { version: 2, categories: {}, stages: [], agendas: { skipped_empty: 2 }, errors: 0, warnings: 0 };
+test('professional cleanup is included in the pending calendar total', () => {
+  assert.match(render({ ...emptyReport, agendas: { professional_cleanup_pending: 2, managed_scope_pending: 1 } }), /Agendas pendentes: 3/);
+});
 test('empty agendas show evidence without claiming the internal calendar is blocked', () => {
   const html = render(emptyReport, [{ entityType: 'SLOT_SYNC', action: 'skipped_empty', message: 'Profissional Teste, endereço 1, período 2026-09-13 a 2026-10-12: sem intervalos livres.' }]);
   assert.match(html, /sem disponibilidade identificada/);

@@ -59,6 +59,13 @@ test('a small sample shows its actual size and preserves totals', () => {
 });
 
 const { explainPendingReasons } = load('pending-reasons.ts');
+test('professional cleanup pending explains protected cleanup rather than hiding the reason', () => {
+ const reasons=explainPendingReasons([{action:'professional_cleanup_pending',message:'Limpeza pendente'}]);
+ assert.equal(reasons.length,1);
+ assert.match(reasons[0].title,/Remoção de horários/);
+ assert.match(reasons[0].meaning,/reserva|bloqueio/);
+ assert.doesNotMatch(reasons[0].meaning,/preservou os horários/);
+});
 test('help buttons have accessible names for all four concepts', () => {
  const html=render(runs(['completed']));
  for(const label of ['Sem pendências','Com pendências','Falhas','Em andamento']) assert.ok(html.includes('Entenda: '+label));
