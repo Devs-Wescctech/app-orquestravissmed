@@ -6,7 +6,8 @@ import { VismedRefusalCancellation } from './vismed-refusal-cancellation';
 const enabled = process.env.REFUSAL_DB_TEST === '1';
 if (enabled) {
     const url = new URL(process.env.DATABASE_URL || '');
-    if (url.hostname !== 'orq-refusal-test-db' || url.pathname !== '/refusal_test') throw new Error('Disposable test database required');
+    const disposableHost = url.hostname === 'orq-refusal-test-db' || (url.hostname === '127.0.0.1' && url.port === '55439');
+    if (!disposableHost || url.pathname !== '/refusal_test') throw new Error('Disposable test database required');
 }
 (enabled ? describe : describe.skip)('Refusal receipt persistence in PostgreSQL', () => {
     const prisma = new PrismaService();

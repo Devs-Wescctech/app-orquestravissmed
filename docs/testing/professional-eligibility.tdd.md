@@ -1,5 +1,7 @@
 # Habilitação de profissionais antes de publicar disponibilidade
 
+> Atualização de 18/09: **não publicar**. A verificação complementar real encontrou remoção de horário de controle fora do intervalo gerenciado. Consulte [resultado complementar](professional-eligibility-validation-2026-09-18.md). As aprovações locais abaixo são históricas e não comprovam segurança da limpeza remota.
+
 Data: 18/09/2026. Branch: `codex/professional-eligibility`.
 Base main: `943b93b070c65dac19a7beac67dac869957f6bd1`.
 Escopo local; sem push, deploy, migração ou chamadas mutantes aos provedores.

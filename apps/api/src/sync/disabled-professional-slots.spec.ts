@@ -2,6 +2,23 @@ import { DisabledProfessionalSlots } from './disabled-professional-slots';
 import { managedSlotState } from './managed-slot-ranges';
 
 describe('withdraw only future owned availability, never appointments', () => {
+    it('preserves unrelated availability under the replacement semantics observed in Doctoralia sandbox', async () => {
+        const owned = { start: '2030-01-02T08:10:00-03:00', end: '2030-01-02T08:40:00-03:00' };
+        const unrelated = { start: '2030-01-02T09:10:00-03:00', end: '2030-01-02T09:40:00-03:00' };
+        let remote = [owned, unrelated];
+        const scope = { clinicId: 'clinic', facilityId: 'f', doctorId: 'd', addressId: 'a' };
+        const prisma: any = {
+            slotPushState: { findMany: async () => [{ addressId: 'a', availabilityHash: 'proof', managedState: managedSlotState(scope, 'proof', [owned]) }], upsert: jest.fn() },
+            mapping: { findFirst: async () => ({ status: 'LINKED' }), findMany: async () => [] },
+        };
+        // On 2026-09-18, real PUT with only the owned range + empty services also removed
+        // the same-day control range. A mock that only records PUT cannot detect this.
+        const client = { replaceSlots: async (_f, _d, _a, payload) => {
+            remote = payload.slots.filter(s => s.address_services.length > 0).map(({ start, end }) => ({ start, end }));
+        } };
+        await new DisabledProfessionalSlots(prisma).clear('clinic', 'local', 'f', 'd', client, async () => true, new Date('2026-09-18T15:00:00Z'));
+        expect(remote).toContainEqual(unrelated);
+    });
     const scope = { clinicId: 'clinic', facilityId: 'f', doctorId: 'd', addressId: 'a' };
     const now = new Date('2026-09-18T15:00:00Z');
     const ranges = [
