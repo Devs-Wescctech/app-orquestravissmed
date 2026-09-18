@@ -31,6 +31,12 @@ function fixture() {
 }
 describe('slot cleanup integration', () => {
     beforeAll(() => Logger.overrideLogger(false));
+    it('preserves existing availability if eligibility becomes unknown before empty-source cleanup', async () => {
+        const f = fixture(); f.eligibility.mockResolvedValueOnce({ state: 'enabled' }).mockResolvedValue({ state: 'unknown' });
+        await f.service.syncSlotsForDoctor('v', f.client, 'run', 30, 'clinic-a', f.availability);
+        expect(f.client.replaceSlots).not.toHaveBeenCalled();
+        expect(f.prisma.slotPushState.upsert).not.toHaveBeenCalled();
+    });
     it('does not publish scheduleDay ranges when current eligibility is unknown', async () => {
         const f = fixture(); f.eligibility.mockResolvedValue({ state: 'unknown' });
         f.availability.getRanges.mockReturnValue([{ start: '08:00', end: '12:00' }]);
