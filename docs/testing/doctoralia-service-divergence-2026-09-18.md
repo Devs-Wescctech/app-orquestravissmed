@@ -58,3 +58,17 @@ Script terminou com exit 0 nas rodadas completas da matriz porque coleta diagnó
 ## Pergunta técnica para a Doctoralia (rascunho, não enviado)
 
 Na homologação facility 140548 / doctor 1396868 / address 1750984, criamos um address service via POST services, confirmado em GET com is_visible=true. Enviamos PUT slots usando o ID retornado na criação e duration=30; resposta 201. O serviço original 6018375 fica disponível normalmente. O serviço recém-criado não aparece nem quando enviado sozinho; GET services?start retorna 404 Slot not found nesse horário. Enviar original+novo ou novo+original retorna apenas o original. Reproduzido com os serviços de catálogo 286 e 4125. Existe habilitação adicional ou prazo de propagação para o novo address service participar da disponibilidade? Se não, podem verificar por que o PUT aceita o recurso mas ele não fica disponível? Os IDs temporários já foram retirados após a coleta; uma nova reprodução deve ser combinada em homologação.
+
+## Busca de agenda com dois serviços preexistentes
+
+Após o pedido de teste em agenda de homologação, executado inventário somente leitura na unidade autorizada Medical Center Bruno Mendes Test (140548), usando `--inventory-sandbox`. Foram encontrados cinco profissionais/endereços, todos com calendário enabled e exatamente um serviço cadastrado visível:
+
+| Profissional | Endereço | Único address service |
+|---|---|---|
+| 1396868 | 1750984 | 6018375 |
+| 1396869 | 1750985 | 6018373 |
+| 1396870 | 1750986 | 6018372 |
+| 1396871 | 1750987 | 6018371 |
+| 1396872 | 1750988 | 6018370 |
+
+Listagens completas, sem próxima página. Nenhuma agenda com dois serviços preexistentes disponível nessa unidade. Não foram criados serviços/horários nem repetidos testes de escrita nesta rodada. Para esse cenário específico, é necessário fornecer outra agenda de homologação já preparada ou habilitar um segundo serviço com disponibilidade confirmada; não substituir por uma agenda real. A validação anterior com um serviço continua válida e não foi repetida sem motivo.

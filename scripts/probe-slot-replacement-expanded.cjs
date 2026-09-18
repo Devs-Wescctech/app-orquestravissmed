@@ -22,8 +22,10 @@ global.fetch = async (input, options = {}) => {
   const write = method === 'PUT' && u.pathname === `${root}/slots`;
   const createService = method === 'POST' && u.pathname === `${root}/services` && process.argv.includes('--temporary-service');
   const removeService = method === 'DELETE' && temporaryId && u.pathname === `${root}/services/${temporaryId}`;
+  const inventory = process.argv.includes('--inventory-sandbox') && method === 'GET' &&
+    /^\/api\/v3\/integration\/facilities\/140548\/doctors(?:\/\d+\/addresses(?:\/\d+\/(?:services|calendar|slots))?)?$/.test(u.pathname);
   assert.ok((method === 'POST' && u.pathname === '/oauth/v2/token') ||
-    (method === 'GET' && (u.pathname === '/api/v3/integration/facilities' || u.pathname === '/api/v3/integration/services' || u.pathname.startsWith(`${root}/`))) || write || createService || removeService);
+    (method === 'GET' && (u.pathname === '/api/v3/integration/facilities' || u.pathname === '/api/v3/integration/services' || u.pathname.startsWith(`${root}/`))) || inventory || write || createService || removeService);
   if (createService) assert.deepEqual(JSON.parse(options.body), temporaryPayload);
   if (write) {
     const body = JSON.parse(options.body);
@@ -64,6 +66,25 @@ async function main() {
   assert.equal(facilities._items.length, 1);
   assert.equal(String(facilities._items[0].id), f);
   assert.equal(facilities._items[0].name, 'Medical Center Bruno Mendes Test');
+  if (process.argv.includes('--inventory-sandbox')) {
+    const doctors = await client.request('GET', `/api/v3/integration/facilities/${f}/doctors`);
+    assert.ok(Array.isArray(doctors._items) && !doctors._links?.next);
+    console.log('Sandbox doctors', doctors._items.length);
+    for (const doctor of doctors._items) {
+      const doctorId = String(doctor.id);
+      const addresses = await client.getAddresses(f, doctorId);
+      assert.ok(Array.isArray(addresses._items) && !addresses._links?.next);
+      for (const address of addresses._items) {
+        const addressId = String(address.id);
+        const catalog = await client.getServices(f, doctorId, addressId);
+        assert.ok(Array.isArray(catalog._items) && !catalog._links?.next);
+        const calendar = await client.getCalendarStatus(f, doctorId, addressId);
+        console.log('EXISTING SANDBOX', JSON.stringify({ doctorId, name: [doctor.name, doctor.surname].filter(Boolean).join(' '), addressId, calendar,
+          services: catalog._items.map(s => ({ id: s.id, service_id: s.service_id, name: s.name, visible: s.is_visible })) }));
+      }
+    }
+    return;
+  }
   const services = await client.getServices(f, d, a);
   assert.ok(Array.isArray(services._items)); assert.ok(!services._links?.next);
   const ids = services._items.map(s => String(s.id)).filter(x => /^[1-9]\d*$/.test(x));
