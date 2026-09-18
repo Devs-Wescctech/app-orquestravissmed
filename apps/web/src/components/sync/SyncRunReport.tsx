@@ -58,7 +58,7 @@ export function SyncRunReport({ report, events, loadEvents }: { report?: SyncRep
                 {(loadedEvents !== null || !loadEvents) && emptyEvents.length < (report.agendas.skipped_empty || 0) && <p className="mt-2">Os detalhes disponíveis não cobrem todas as agendas desta contagem.</p>}
             </details>
         </div>}
-        <p className="mt-2">Agendas pendentes: {(report.agendas.managed_scope_pending || 0) + (report.agendas.mapping_pending || 0) + (report.agendas.skipped_incomplete || 0)} por falta de vínculo, origem incompleta ou ausência de histórico seguro para limpeza.</p>
+        <p className="mt-2">Agendas pendentes: {(report.agendas.managed_scope_pending || 0) + (report.agendas.professional_cleanup_pending || 0) + (report.agendas.mapping_pending || 0) + (report.agendas.skipped_incomplete || 0)} por falta de vínculo, origem incompleta ou limpeza ainda não confirmada.</p>
         <p className="mt-2">Ocorrências: {report.errors} erros e {report.warnings} pendências/avisos. Os detalhes estão nos eventos da execução.</p>
         <ul className="mt-2">{report.stages.map((stage, i) => <li key={i}>{labels[stage.name] || stage.name}: {(stage.durationMs / 1000).toFixed(1)} s</li>)}</ul>
     </details>;

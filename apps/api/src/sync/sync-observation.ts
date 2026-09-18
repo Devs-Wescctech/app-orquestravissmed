@@ -155,6 +155,7 @@ export function classifySyncEvents(
             'error',
             'skipped_incomplete',
             'managed_scope_pending',
+            'professional_cleanup_pending',
             'mapping_pending',
           ].includes(e.action)
         ) {
