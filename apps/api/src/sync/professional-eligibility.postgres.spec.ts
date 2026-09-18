@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto';
 import { PrismaClient } from '@prisma/client';
 import { DisabledProfessionalSlots } from './disabled-professional-slots';
 import { managedSlotState } from './managed-slot-ranges';
+import { periodsHash } from './managed-period-replacement';
 import { ProfessionalEligibility } from '../integrations/vismed/professional-eligibility';
 
 const enabled = process.env.ELIGIBILITY_PG_TESTS === '1';
@@ -60,5 +61,32 @@ if (enabled) {
         await prisma.mapping.create({ data: { clinicId: foreignClinic, entityType: 'DOCTOR', externalId: scope.doctorId, vismedId: `foreign-${id}`, status: 'LINKED' } });
         expect(await run()).toEqual({ cleared: 0, pending: 1 });
         expect(client.replaceSlots).not.toHaveBeenCalled();
+    });
+    it('persists a verified full-journal removal and preserves another address', async () => {
+        const periods = [{ ...ranges[0], address_services: [{ address_service_id: '5', duration: 60 }] }];
+        const hash = periodsHash(periods);
+        await prisma.slotPushState.updateMany({ where: { doctoraliaDoctorId: scope.doctorId }, data: {
+            availabilityHash: hash, managedState: managedSlotState(scope, hash, periods) as any,
+        } });
+        const other = await prisma.slotPushState.create({ data: {
+            doctoraliaDoctorId: scope.doctorId, addressId: `${scope.addressId}-other`, availabilityHash: 'untouched',
+        } });
+        let remote = periods;
+        const provider = {
+            getSlotsForReconciliation: jest.fn(async () => ({ _items: remote.map(p => ({ start: p.start, address_services: { _items: [{ id: '5' }] } })) })),
+            getBookings: jest.fn(async () => ({ _items: [] })),
+            getCalendarBreaks: jest.fn(async () => ({ _items: [] })),
+            replaceSlots: jest.fn(async (_f, _d, _a, body) => { remote = body.slots.filter(p => p.address_services.length); }),
+        };
+        const service = new DisabledProfessionalSlots(prisma as any);
+        expect(await service.reconcile(scope.clinicId, localId, scope.facilityId, scope.doctorId, provider,
+            async () => true, ['2030-01-02'], new Date('2029-01-01'), scope.addressId)).toEqual({ cleared: 1, pending: 0 });
+        const stored = await prisma.slotPushState.findFirstOrThrow({ where: { doctoraliaDoctorId: scope.doctorId, addressId: scope.addressId } });
+        expect(stored.availabilityHash).toBe(periodsHash([]));
+        expect((stored.managedState as any).periods).toEqual([]);
+        expect((await prisma.slotPushState.findUniqueOrThrow({ where: { id: other.id } })).availabilityHash).toBe('untouched');
+        expect(await service.reconcile(scope.clinicId, localId, scope.facilityId, scope.doctorId, provider,
+            async () => true, ['2030-01-02'], new Date('2029-01-01'), scope.addressId)).toEqual({ cleared: 0, pending: 0 });
+        expect(provider.replaceSlots).toHaveBeenCalledTimes(1);
     });
 });
