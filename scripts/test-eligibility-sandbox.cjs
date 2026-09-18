@@ -82,19 +82,21 @@ async function main() {
     await client.replaceSlots(scope.facilityId, scope.doctorId, scope.addressId, { slots: [range, control].map(r => ({ ...r, address_services: [{ address_service_id: '6018375', duration: 30 }] })) });
     await waitSlots([range.start, control.start]);
     const cleaner = new DisabledProfessionalSlots(prisma);
-    const args = [scope.clinicId, 'synthetic-local', scope.facilityId, scope.doctorId, client];
+    const args = [scope.clinicId, scope.facilityId, scope.doctorId];
     const before = writes;
-    assert.deepEqual(await cleaner.clear(...args, async () => false), { cleared: 0, pending: 1 });
+    assert.deepEqual(await cleaner.assess(...args), { cleared: 0, pending: 1 });
     assert.equal(writes, before);
-    phase = 'scoped-clear';
-    assert.deepEqual(await cleaner.clear(...args, async () => true), { cleared: 1, pending: 0 });
-    await waitSlots([control.start]);
+    phase = 'preservation';
+    assert.deepEqual(await cleaner.assess(...args), { cleared: 0, pending: 1 });
+    await waitSlots([range.start, control.start]);
     const after = writes;
-    assert.deepEqual(await new DisabledProfessionalSlots(prisma).clear(...args, async () => true), { cleared: 0, pending: 0 });
+    assert.deepEqual(await new DisabledProfessionalSlots(prisma).assess(...args), { cleared: 0, pending: 1 });
     assert.equal(writes, after);
     for (const method of ['getBookings', 'getCalendarBreaks']) assert.equal((await items(method)).length, 0);
     assert.equal((await client.getCalendar(scope.facilityId, scope.doctorId, scope.addressId)).status, calendar.status);
-    console.log('PASS: real PUT, unknown-state preservation, scoped cleanup, unrelated interval preserved, durable idempotency, calendar unchanged.');
+    const state = await prisma.slotPushState.findFirstOrThrow({ where: { doctoraliaDoctorId: scope.doctorId, addressId: scope.addressId } });
+    assert.deepEqual(state.managedState.ranges, [range]);
+    console.log('PASS: real fixture PUT, pending instead of destructive cleanup, both intervals preserved, journal unchanged across retries, calendar unchanged. Selective removal remains unsupported.');
 }
 main().catch(error => { console.error(`Sandbox test failed (${error.name}); no credentials or patient data logged.`); process.exitCode = 1; }).finally(async () => {
     if (attempted) {

@@ -1,47 +1,65 @@
-import { createHash } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
-import { managedClearPayload, managedSlotState, SlotScope } from './managed-slot-ranges';
 
-/** Only owned availability is removed. No booking or calendar-break API is used. */
+export const UNSAFE_SLOT_CLEANUP_MESSAGE =
+  'Limpeza automática suspensa: o PUT da Doctoralia pode remover outros horários. Disponibilidade e evidência preservadas; remoção restrita pendente de solução validada.';
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+/** Read-only pending assessment. Deliberately has no Doctoralia client capability. */
 export class DisabledProfessionalSlots {
-    constructor(private readonly prisma: PrismaService) {}
+  constructor(private readonly prisma: PrismaService) {}
 
-    async clear(clinicId: string, localDoctorId: string, facilityId: string, doctorId: string,
-        client: any, stillExcluded: () => Promise<boolean>, now = new Date()) {
-        const states = await this.prisma.slotPushState.findMany({ where: { doctoraliaDoctorId: doctorId } });
-        let cleared = 0;
-        let pending = 0;
-        for (const state of states) {
-            const scope: SlotScope = { clinicId, facilityId, doctorId, addressId: state.addressId };
-            const raw: any = state.managedState;
-            if (raw?.ranges?.length === 0 && raw.clinicId === clinicId && raw.facilityId === facilityId
-                && raw.doctorId === doctorId && raw.addressId === state.addressId) continue;
-            const dates = Array.isArray(raw?.ranges) ? raw.ranges.flatMap(r => [r?.start?.slice?.(0, 10), r?.end?.slice?.(0, 10)]).filter(Boolean) : [];
-            const payload = managedClearPayload(raw, state.availabilityHash, scope, dates);
-            if (!payload) { pending++; continue; }
-            // Preserve all past time; trim today's ongoing interval without broadening its bounds.
-            const nowBrt = new Date(now.getTime() - 3 * 3600_000).toISOString().slice(0, 19) + '-03:00';
-            payload.slots = payload.slots.filter(s => Date.parse(s.end) > now.getTime()).map(s => ({
-                ...s, start: Date.parse(s.start) < now.getTime() ? nowBrt : s.start,
-            }));
-            if (!payload.slots.length) continue;
-            const current = await this.prisma.mapping.findFirst({ where: { clinicId, entityType: 'DOCTOR',
-                vismedId: localDoctorId, externalId: doctorId, status: 'LINKED' } });
-            const shared = await this.prisma.mapping.findMany({ where: { entityType: 'DOCTOR', externalId: doctorId,
-                status: 'LINKED', OR: [{ clinicId: { not: clinicId } }, { vismedId: { not: localDoctorId } }] }, select: { id: true } });
-            if (!current || shared.length || !await stillExcluded()) { pending++; continue; }
-            try {
-                await client.replaceSlots(facilityId, doctorId, state.addressId, payload);
-                const hash = createHash('sha256').update('[]').digest('hex');
-                // Keep the old evidence after any failed/uncertain HTTP call for the next cycle.
-                await this.prisma.slotPushState.upsert({
-                    where: { doctoraliaDoctorId_addressId: { doctoraliaDoctorId: doctorId, addressId: state.addressId } },
-                    create: { doctoraliaDoctorId: doctorId, addressId: state.addressId, availabilityHash: hash, managedState: managedSlotState(scope, hash, []) },
-                    update: { availabilityHash: hash, managedState: managedSlotState(scope, hash, []), lastSyncedAt: new Date() },
-                });
-                cleared++;
-            } catch { pending++; }
-        }
-        return { cleared, pending };
+  async assess(
+    clinicId: string,
+    facilityId: string,
+    doctorId: string,
+    now = new Date(),
+  ): Promise<{ cleared: number; pending: number }> {
+    const states = await this.prisma.slotPushState.findMany({
+      where: { doctoraliaDoctorId: doctorId },
+    });
+    let pending = 0;
+    for (const state of states) {
+      const raw = record(state.managedState);
+      if (
+        !clinicId ||
+        !Number.isFinite(now.getTime()) ||
+        !raw ||
+        raw.version !== 1 ||
+        raw.hash !== state.availabilityHash ||
+        raw.clinicId !== clinicId ||
+        raw.facilityId !== facilityId ||
+        raw.doctorId !== doctorId ||
+        raw.addressId !== state.addressId ||
+        !Array.isArray(raw.ranges)
+      ) {
+        pending++;
+        continue;
+      }
+      const ranges: unknown[] = raw.ranges;
+      const needsAttention = ranges.some((value) => {
+        const range = record(value);
+        if (
+          !range ||
+          typeof range.start !== 'string' ||
+          typeof range.end !== 'string'
+        )
+          return true;
+        const start = Date.parse(range.start);
+        const end = Date.parse(range.end);
+        return (
+          !Number.isFinite(start) ||
+          !Number.isFinite(end) ||
+          end <= start ||
+          end > now.getTime()
+        );
+      });
+      if (needsAttention) pending++;
     }
+    return { cleared: 0, pending };
+  }
 }

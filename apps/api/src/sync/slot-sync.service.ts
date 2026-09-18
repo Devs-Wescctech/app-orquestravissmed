@@ -10,7 +10,7 @@ import { VismedAvailabilityService, ClinicAvailability, AvailRange } from './vis
 import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 import { getDoctoraliaMetricsService } from '../metrics/doctoralia-metrics.service';
 import { SyncCycleContext } from './sync-cycle-context';
-import { DisabledProfessionalSlots } from './disabled-professional-slots';
+import { DisabledProfessionalSlots, UNSAFE_SLOT_CLEANUP_MESSAGE } from './disabled-professional-slots';
 
 interface TurnoSlot {
     start: string;
@@ -244,10 +244,9 @@ export class SlotSyncService {
         }
         if (eligibility.state === 'excluded') {
             const remote = authorizedMapping.doctoraliaDoctor;
-            const result = await new DisabledProfessionalSlots(this.prisma).clear(clinicId!, doctor.id,
-                String(remote.doctoraliaFacilityId), String(remote.doctoraliaDoctorId), client,
-                async () => (await this.availabilityService.getProfessionalEligibility(clinicId!, Number(doctor.vismedId))).state === 'excluded');
-            const message = `Profissional não habilitado: ${result.cleared} endereço(s) com horários gerenciados retirados; ${result.pending} pendência(s). Consultas existentes preservadas.`;
+            const result = await new DisabledProfessionalSlots(this.prisma).assess(clinicId!,
+                String(remote.doctoraliaFacilityId), String(remote.doctoraliaDoctorId));
+            const message = `Profissional não habilitado: nenhum horário enviado ou removido; ${result.pending} pendência(s). ${result.pending ? UNSAFE_SLOT_CLEANUP_MESSAGE : 'Consultas existentes preservadas.'}`;
             if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', result.pending ? 'professional_cleanup_pending' : 'professional_excluded', message);
             return { success: result.pending === 0, message, slotsCreated: 0 };
         }
@@ -516,9 +515,7 @@ export class SlotSyncService {
 
             if (allSlots.length === 0) {
                 // Médico TOTALMENTE bloqueado neste endereço (nenhuma faixa livre na janela).
-                // Só limpamos intervalos comprovadamente enviados se a foto está completa E havia algo
-                // empurrado antes (estado prévio não-vazio). Senão, pulamos com aviso — evita
-                // wipe acidental de um calendário que nunca gerenciamos.
+                // PUT vazio não é remoção restrita: preservamos o estado e registramos pendência.
                 const prevWasNonEmpty = prevState && prevState.availabilityHash !== this.EMPTY_SLOTS_HASH;
                 if (source === 'availability' && prevWasNonEmpty) {
                     if (prevState!.availabilityHash === availabilityHash) {
@@ -537,25 +534,9 @@ export class SlotSyncService {
                             `Endereço ${addrId}: limpeza pendente de conferência dos intervalos gerenciados. Estado antigo ou fora da janela; nenhuma remoção enviada.`);
                         continue;
                     }
-                    try {
-                        if ((await this.availabilityService.getProfessionalEligibility(clinicId!, Number(doctor.vismedId))).state !== 'enabled') {
-                            addressesFailed++;
-                            if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'professional_eligibility_changed', 'Habilitação mudou durante o ciclo; disponibilidade existente preservada.');
-                            continue;
-                        }
-                        await client.replaceSlots(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, clearPayload);
-                        await this.upsertSlotPushState(String(dDoc.doctoraliaDoctorId), addrId, availabilityHash, managedSlotState(
-                            { clinicId: clinicId || '', facilityId: String(dDoc.doctoraliaFacilityId), doctorId: String(dDoc.doctoraliaDoctorId), addressId: addrId }, availabilityHash, allSlots));
-                        addressesCleared++;
-                        const msg = `Doctor ${doctor.name} address ${addrId}: agenda bloqueada na VisMed; intervalos gerenciados na janela removidos da Doctoralia.`;
-                        this.logger.log(msg);
-                        if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'cleared', msg);
-                    } catch (error: any) {
-                        addressesFailed++;
-                        const msg = `Doctor ${doctor.name} address ${addrId}: falha ao limpar calendário: ${error.message}`;
-                        this.logger.error(msg);
-                        if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'error', msg);
-                    }
+                    addressesFailed++;
+                    if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'managed_scope_pending',
+                        `Endereço ${addrId}: ${UNSAFE_SLOT_CLEANUP_MESSAGE}`);
                 } else {
                     const reason = source === 'availability' && avail
                         ? avail.describeEmpty(Number(doctor.vismedId), dates)

@@ -17,7 +17,7 @@ if (enabled) {
     const localId = `local-${id}`;
     const ranges = [{ start: '2030-01-02T08:00:00-03:00', end: '2030-01-02T09:00:00-03:00' }];
     const client = { replaceSlots: jest.fn() };
-    const run = () => new DisabledProfessionalSlots(prisma as any).clear(scope.clinicId, localId, scope.facilityId, scope.doctorId, client, async () => true, new Date('2026-09-18T15:00:00Z'));
+    const run = () => new DisabledProfessionalSlots(prisma as any).assess(scope.clinicId, scope.facilityId, scope.doctorId, new Date('2026-09-18T15:00:00Z'));
     beforeAll(async () => {
         await prisma.clinic.createMany({ data: [{ id: scope.clinicId, name: 'Synthetic eligibility' }, { id: foreignClinic, name: 'Synthetic foreign clinic' }] });
         await prisma.mapping.create({ data: { clinicId: scope.clinicId, entityType: 'DOCTOR', vismedId: localId, externalId: scope.doctorId, status: 'LINKED' } });
@@ -42,18 +42,19 @@ if (enabled) {
         expect((await gate.check(scope.clinicId, 6983)).state).toBe('excluded');
         expect((await gate.check(foreignClinic, 6983)).state).toBe('unknown');
     });
-    it('persists removal and a new instance does not repeat the PUT', async () => {
-        expect(await run()).toEqual({ cleared: 1, pending: 0 });
-        expect(await run()).toEqual({ cleared: 0, pending: 0 });
-        expect(client.replaceSlots).toHaveBeenCalledTimes(1);
+    it('preserves evidence and pending across service instances without PUT', async () => {
+        expect(await run()).toEqual({ cleared: 0, pending: 1 });
+        expect(await run()).toEqual({ cleared: 0, pending: 1 });
+        expect(client.replaceSlots).not.toHaveBeenCalled();
         const state = await prisma.slotPushState.findFirstOrThrow({ where: { doctoraliaDoctorId: scope.doctorId } });
-        expect((state.managedState as any).ranges).toEqual([]);
+        expect((state.managedState as any).ranges).toEqual(ranges);
     });
-    it('preserves durable evidence after timeout and retries in another instance', async () => {
+    it('does not access a failing provider or advance durable evidence', async () => {
         client.replaceSlots.mockRejectedValueOnce(new Error('synthetic timeout'));
         expect(await run()).toEqual({ cleared: 0, pending: 1 });
         expect((await prisma.slotPushState.findFirstOrThrow({ where: { doctoraliaDoctorId: scope.doctorId } })).availabilityHash).toBe('evidence');
-        expect(await run()).toEqual({ cleared: 1, pending: 0 });
+        expect(await run()).toEqual({ cleared: 0, pending: 1 });
+        expect(client.replaceSlots).not.toHaveBeenCalled();
     });
     it('detects a shared mapping in another clinic and never removes its slots', async () => {
         await prisma.mapping.create({ data: { clinicId: foreignClinic, entityType: 'DOCTOR', externalId: scope.doctorId, vismedId: `foreign-${id}`, status: 'LINKED' } });
