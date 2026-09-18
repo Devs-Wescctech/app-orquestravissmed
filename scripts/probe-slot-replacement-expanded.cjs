@@ -34,9 +34,12 @@ global.fetch = async (input, options = {}) => {
       assert.ok(p.address_services.length === 0 || JSON.stringify(p.address_services) === JSON.stringify(known.address_services));
     }
     attempted = true;
+    if (process.argv.includes('--diagnose-services')) console.log('WIRE PUT', JSON.stringify(body));
   }
   const response = await originalFetch(input, options);
   if (write) console.log('Sandbox PUT status', response.status);
+  if (process.argv.includes('--diagnose-services') && method === 'GET' && !response.ok)
+    console.log('DIAGNOSTIC GET ERROR', u.pathname, response.status, (await response.clone().text()).slice(0, 600));
   return response;
 };
 const bounds = date => [`${date}T00:00:00-03:00`, `${date}T23:59:59-03:00`];
@@ -68,7 +71,7 @@ async function main() {
   console.log('Sandbox existing service IDs', JSON.stringify(ids));
   if (process.argv.includes('--catalog-only')) {
     const catalog = await client.getServicesDictionary();
-    console.log('Consultation candidates', JSON.stringify(catalog._items.filter(s => /consulta/i.test(s.name)).slice(0, 8).map(s => ({ id: s.id, name: s.name }))));
+    console.log('Cardiology candidates', JSON.stringify(catalog._items.filter(s => /cardiologia/i.test(s.name)).map(s => ({ id: s.id, name: s.name }))));
     return;
   }
   assert.ok(ids.includes('6018375'));
@@ -85,7 +88,8 @@ async function main() {
     const catalog = await client.getServicesDictionary();
     assert.ok(Array.isArray(catalog._items));
     const existing = new Set(services._items.map(s => String(s.service_id)));
-    const selected = catalog._items.find(s => String(s.id) === '286' && s.name === 'Consulta especializada' && !existing.has(String(s.id)));
+    const candidate = process.argv.includes('--cardiology-service') ? { id: '4125', name: 'Consulta Cardiologia' } : { id: '286', name: 'Consulta especializada' };
+    const selected = catalog._items.find(s => String(s.id) === candidate.id && s.name === candidate.name && !existing.has(String(s.id)));
     assert.ok(selected, 'Existing consultation catalog service required');
     temporaryPayload = { service_id: String(selected.id), description: 'Synthetic selective-removal QA 2026-09-18', default_duration: 30, is_visible: true, price: 0 };
     const created = await client.request('POST', `${root}/services`, temporaryPayload);
@@ -97,6 +101,10 @@ async function main() {
     const entry = confirmed._items.find(s => String(s.id) === temporaryId);
     assert.ok(entry && entry.is_visible === true && String(entry.service_id) === temporaryPayload.service_id);
     console.log('Confirmed temporary service', JSON.stringify({ id: entry.id, service_id: entry.service_id, is_visible: entry.is_visible, default_duration: entry.default_duration }));
+    if (process.argv.includes('--diagnose-services')) {
+      const expanded = await client.request('GET', `${root}/services?with[]=address_service.allowed_patients&with[]=address_service.public_insurance_flow`);
+      console.log('Expanded sandbox service configuration', JSON.stringify(expanded._items));
+    }
   }
   assert.ok(secondId || process.argv.includes('--single-service'), 'Second service required');
   const period = (date, start, end, duration, serviceIds = ['6018375']) => ({
@@ -105,8 +113,28 @@ async function main() {
   });
   owned = [period(dates[0], '08:10', '08:30', 20), period(dates[0], '09:10', '09:30', 20),
     period(dates[0], '10:10', '10:40', 30, secondId ? ['6018375', secondId] : ['6018375']), period(dates[1], '11:10', '11:40', 30)];
+  if (process.argv.includes('--diagnose-services')) {
+    assert.ok(secondId);
+    owned = [period(dates[0], '08:10', '08:40', 30), period(dates[0], '09:10', '09:40', 30, [secondId]),
+      period(dates[0], '10:10', '10:40', 30, ['6018375', secondId]), period(dates[0], '11:10', '11:40', 30, [secondId, '6018375'])];
+  }
   await client.replaceSlots(f, d, a, { slots: owned });
   console.log('Submitted synthetic slot services', JSON.stringify(owned.map(p => ({ start: p.start, services: p.address_services }))));
+  if (process.argv.includes('--diagnose-services')) {
+    const summarize = result => result._items?.map(s => ({ start: s.start, id: s.id, service_id: s.service_id, ids: s.address_services?._items?.map(v => v.id) }));
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    for (let round = 0; round < 2; round++) {
+      if (round) await new Promise(resolve => setTimeout(resolve, 10000));
+      console.log('SLOT READ', round, JSON.stringify(summarize(await read(dates[0]))));
+      for (const p of owned) {
+        try {
+          const result = await client.request('GET', `${root}/services?start=${encodeURIComponent(p.start)}`);
+          console.log('SERVICES AT START', round, p.start, JSON.stringify(summarize(result)));
+        } catch { console.log('SERVICES AT START unavailable', round, p.start); }
+      }
+    }
+    return;
+  }
   for (const date of dates) await verify(date, owned.filter(p => p.start.startsWith(date)));
   const scope = { clinicId: 'synthetic-expanded', facilityId: f, doctorId: d, addressId: a };
   const hash = periodsHash(owned);
