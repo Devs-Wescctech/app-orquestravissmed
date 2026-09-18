@@ -1,7 +1,7 @@
 import { managedSlotState, managedClearPayload, ManagedSlotState } from './managed-slot-ranges';
 import { consultationSlotServices } from '../bookings/consultation-policy';
 import { AddressInsuranceProvider } from './insurance-plan-selection';
-import { Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { DocplannerClient } from '../integrations/docplanner.service';
@@ -28,6 +28,17 @@ export class SlotSyncService {
         private availabilityService: VismedAvailabilityService,
         private stableCache: StableDataCacheService,
     ) {}
+
+    async assertCalendarEligibility(clinicId: string, doctorExternalId: string): Promise<void> {
+        const mapping = await this.prisma.mapping.findFirst({
+            where: { clinicId, entityType: 'DOCTOR', externalId: doctorExternalId, status: 'LINKED' },
+        });
+        const doctor = mapping?.vismedId ? await this.prisma.vismedDoctor.findUnique({ where: { id: mapping.vismedId } }) : null;
+        const eligibility = doctor ? await this.availabilityService.getProfessionalEligibility(clinicId, Number(doctor.vismedId)) : null;
+        if (mapping?.status !== 'LINKED' || eligibility?.state !== 'enabled') {
+            throw new BadRequestException('Habilitação do profissional na VissMed não confirmada. Agenda não ativada.');
+        }
+    }
 
     private async upsertSlotPushState(doctoraliaDoctorId: string, addressId: string, availabilityHash: string, managedState?: ManagedSlotState): Promise<void> {
         try {

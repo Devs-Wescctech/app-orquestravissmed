@@ -17,7 +17,8 @@ export class ProfessionalEligibility {
             const conn = await this.prisma.integrationConnection.findFirst({ where: { clinicId, provider: 'vismed' } });
             if (!conn?.domain || !numericId(conn.clientId) || conn.status === 'disconnected') return unknown('invalid_connection');
             const url = new URL(conn.domain.includes('://') ? conn.domain : `https://${conn.domain}`);
-            // VISSMED confirmed this instance's professionals route is a filtered, unpaginated roster.
+            // VISSMED confirmed this instance's professionals route filters eligibility.
+            // Its current contract is a plain array; pagination/envelopes fail closed below.
             // Do not extrapolate that contract to other deployments.
             const filteredRoster = url.hostname === 'app.vissmed.com.br'
                 && /^\/api-docctor-3(?:\/api\/v1\.0)?\/?$/i.test(url.pathname);

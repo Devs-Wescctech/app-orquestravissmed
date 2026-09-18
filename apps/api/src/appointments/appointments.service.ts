@@ -588,6 +588,16 @@ export class AppointmentsService {
             throw new NotFoundException('Mapeamento do médico não encontrado');
         }
 
+        if (status === 'enabled') {
+            const doctor = mapping.vismedId ? await this.prisma.vismedDoctor.findUnique({ where: { id: mapping.vismedId } }) : null;
+            const eligibility = await new ProfessionalEligibility(this.prisma, this.vismed).check(clinicId, Number(doctor?.vismedId));
+            if (mapping.status !== 'LINKED' || eligibility.state !== 'enabled') {
+                await this.logRequest({ clinicId, action: 'ENABLE_CALENDAR', doctorId: doctorExternalId,
+                    durationMs: Date.now() - startTime, status: 'blocked', error: `professional_eligibility_${eligibility.state}` });
+                throw new BadRequestException('Habilitação do profissional na VissMed não confirmada. Agenda não ativada.');
+            }
+        }
+
         const cd = mapping.conflictData as any || {};
         if (!cd.facilityId || !cd.address?.id) {
             throw new BadRequestException('Dados de endereço ausentes para este médico. Realize uma sincronização primeiro.');

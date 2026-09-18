@@ -67,3 +67,4 @@ _agent/
 temp/
 tmp/
 apps/api/load-test/.runtime/
+apps/api/coverage/

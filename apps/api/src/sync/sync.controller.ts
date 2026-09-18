@@ -391,6 +391,7 @@ export class SyncController {
     ) {
         this.validateUserClinicAccess(req?.user, clinicId);
         const dDoc = await this.validateDoctoraliaDoctorBelongsToClinic(doctoraliaDoctorId, clinicId);
+        await this.slotSync.assertCalendarEligibility(clinicId, doctoraliaDoctorId);
         // WP-01: USER_INTERACTIVE context for direct Doctoralia calls in this handler
         return runWithDoctoraliaContext({ origin: 'USER_INTERACTIVE', clinicId, requestId: randomUUID() }, async () => {
         const client = await this.getDoctoraliaClient(clinicId);
