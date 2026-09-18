@@ -23,13 +23,34 @@ function fixture() {
         getServices: jest.fn(async () => ({ _items: [{ id: '5', service_id: '291' }] })), replaceSlots: jest.fn(async () => ({ _status: 201 })),
         enableCalendar: jest.fn(), getAddressInsuranceProviders: jest.fn(async () => ({ _items: [] })) };
     const cache: any = { getOrFetch: async (_key, _ttl, fetch) => fetch() };
-    const service = new SlotSyncService(prisma, {} as any, cache);
+    const eligibility = jest.fn().mockResolvedValue({ state: 'enabled' });
+    const service = new SlotSyncService(prisma, { getProfessionalEligibility: eligibility } as any, cache);
     jest.spyOn(service, 'generateDateRange').mockReturnValue([date]);
     const availability: any = { isComplete: jest.fn(() => true), getRanges: jest.fn(() => []), getInferredStep: () => 30 };
-    return { service, prisma, client, availability, events, getState: () => state, setState: (s: any) => { state = s; } };
+    return { service, prisma, client, availability, eligibility, events, getState: () => state, setState: (s: any) => { state = s; } };
 }
 describe('slot cleanup integration', () => {
     beforeAll(() => Logger.overrideLogger(false));
+    it('does not publish scheduleDay ranges when current eligibility is unknown', async () => {
+        const f = fixture(); f.eligibility.mockResolvedValue({ state: 'unknown' });
+        f.availability.getRanges.mockReturnValue([{ start: '08:00', end: '12:00' }]);
+        await f.service.syncSlotsForDoctor('v', f.client, 'run', 30, 'clinic-a', f.availability);
+        expect(f.client.replaceSlots).not.toHaveBeenCalled();
+        expect(f.client.getServices).not.toHaveBeenCalled();
+        expect(f.events.some(e => e.action === 'professional_eligibility_unknown')).toBe(true);
+    });
+    it('exclusion removes owned future availability even if scheduleDay still returns it', async () => {
+        const f = fixture(); f.eligibility.mockResolvedValue({ state: 'excluded' });
+        const future = [{ start: '2030-01-02T08:00:00-03:00', end: '2030-01-02T12:00:00-03:00' }];
+        f.setState({ addressId: 'a', availabilityHash: 'prior-hash', managedState: managedSlotState(scope, 'prior-hash', future) });
+        f.prisma.slotPushState.findMany = jest.fn(async () => [f.getState()]);
+        f.prisma.mapping.findMany.mockResolvedValue([]);
+        f.availability.getRanges.mockReturnValue([{ start: '08:00', end: '12:00' }]);
+        await f.service.syncSlotsForDoctor('v', f.client, 'run', 30, 'clinic-a', f.availability);
+        expect(f.client.replaceSlots).toHaveBeenCalledWith('f', 'd', 'a', { slots: [{ ...future[0], address_services: [] }] });
+        expect(f.client.enableCalendar).not.toHaveBeenCalled();
+        expect(f.client.getServices).not.toHaveBeenCalled();
+    });
     it('reports the empty source and period without writing or deleting an unmanaged calendar', async () => {
         const f = fixture(); f.setState(null);
         const availability = new ClinicAvailability();
