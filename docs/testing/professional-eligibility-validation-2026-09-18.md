@@ -1,5 +1,7 @@
 # Verificação complementar: publicação bloqueada
 
+> Histórico do defeito. A correção posterior suspende a limpeza destrutiva; consulte [evidência atual](professional-eligibility-fix-2026-09-18.md). A remoção seletiva permanece não implementada.
+
 Código de produção verificado: `34f1ab6333cc75ad5ec55f0fdddea4aff96a4457`.
 Esta rodada só acrescenta testes/evidências; não corrige a falha encontrada.
 
