@@ -538,6 +538,11 @@ export class SlotSyncService {
                         continue;
                     }
                     try {
+                        if ((await this.availabilityService.getProfessionalEligibility(clinicId!, Number(doctor.vismedId))).state !== 'enabled') {
+                            addressesFailed++;
+                            if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'professional_eligibility_changed', 'Habilitação mudou durante o ciclo; disponibilidade existente preservada.');
+                            continue;
+                        }
                         await client.replaceSlots(dDoc.doctoraliaFacilityId, dDoc.doctoraliaDoctorId, addrId, clearPayload);
                         await this.upsertSlotPushState(String(dDoc.doctoraliaDoctorId), addrId, availabilityHash, managedSlotState(
                             { clinicId: clinicId || '', facilityId: String(dDoc.doctoraliaFacilityId), doctorId: String(dDoc.doctoraliaDoctorId), addressId: addrId }, availabilityHash, allSlots));
