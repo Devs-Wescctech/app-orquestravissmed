@@ -1,7 +1,25 @@
 import { DisabledProfessionalSlots } from './disabled-professional-slots';
 import { managedSlotState } from './managed-slot-ranges';
+import { periodsHash } from './managed-period-replacement';
 
 describe('suspend unsafe replacement cleanup without losing evidence', () => {
+    it('automatically reconciles a complete persisted day after fresh authorization', async () => {
+        const periods = [{ ...owned, address_services: [{ address_service_id: '5', duration: 30 }] }];
+        const hash = periodsHash(periods);
+        let saved: any = { id: 'state', addressId: 'a', availabilityHash: hash, managedState: managedSlotState(scope, hash, periods) };
+        let remote = periods;
+        const prisma: any = {
+            slotPushState: { findMany: async () => [saved], findUnique: async () => saved, updateMany: jest.fn(async ({ data }) => { saved = { ...saved, ...data }; return { count: 1 }; }) },
+            mapping: { findFirst: async () => ({ status: 'LINKED' }), findMany: async () => [] },
+        };
+        const client: any = { getBookings: async () => ({ _items: [] }), getCalendarBreaks: async () => ({ _items: [] }),
+            getSlotsForReconciliation: async () => ({ _items: remote.map(p => ({ start: p.start, address_services: { _items: [{ id: '5' }] } })) }),
+            replaceSlots: jest.fn(async (_f, _d, _a, body) => { remote = body.slots.filter(p => p.address_services.length); }) };
+        const result = await new DisabledProfessionalSlots(prisma).reconcile('clinic', 'local', 'f', 'd', client, async () => true, undefined, now);
+        expect(result).toEqual({ cleared: 1, pending: 0 });
+        expect(saved.managedState.periods).toEqual([]);
+        expect(client.replaceSlots).toHaveBeenCalledTimes(1);
+    });
     const scope = { clinicId: 'clinic', facilityId: 'f', doctorId: 'd', addressId: 'a' };
     const now = new Date('2026-09-18T15:00:00Z');
     const owned = { start: '2030-01-02T08:10:00-03:00', end: '2030-01-02T08:40:00-03:00' };
