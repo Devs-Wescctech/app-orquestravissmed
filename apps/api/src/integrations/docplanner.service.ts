@@ -1547,6 +1547,10 @@ export class DocplannerClient implements OnModuleDestroy {
         return result;
     }
 
+    async getSlotsForReconciliation(facilityId: string, doctorId: string, addressId: string, start: string, end: string): Promise<unknown> {
+        return this.request('GET', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/slots?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&with[]=slot.services`);
+    }
+
     async bookSlot(facilityId: string, doctorId: string, addressId: string, slotStart: string, payload: any): Promise<any> {
         const encodedStart = encodeURIComponent(slotStart);
         return this.request('POST', `/api/v3/integration/facilities/${facilityId}/doctors/${doctorId}/addresses/${addressId}/slots/${encodedStart}/book`, payload);
