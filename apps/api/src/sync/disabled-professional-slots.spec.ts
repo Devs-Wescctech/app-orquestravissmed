@@ -3,6 +3,11 @@ import { managedSlotState } from './managed-slot-ranges';
 import { periodsHash } from './managed-period-replacement';
 
 describe('suspend unsafe replacement cleanup without losing evidence', () => {
+    it('limits an empty-source cleanup to the requested address', async () => {
+        const prisma: any = { slotPushState: { findMany: jest.fn().mockResolvedValue([]) } };
+        await (new DisabledProfessionalSlots(prisma).reconcile as any)('clinic', 'local', 'f', 'd', {}, async () => true, ['2030-01-02'], now, 'address-only');
+        expect(prisma.slotPushState.findMany).toHaveBeenCalledWith({ where: { doctoraliaDoctorId: 'd', addressId: 'address-only' } });
+    });
     it('automatically reconciles a complete persisted day after fresh authorization', async () => {
         const periods = [{ ...owned, address_services: [{ address_service_id: '5', duration: 30 }] }];
         const hash = periodsHash(periods);
