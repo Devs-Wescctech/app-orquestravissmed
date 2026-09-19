@@ -11,6 +11,7 @@ import { runWithDoctoraliaContext } from '../metrics/doctoralia-call-context';
 import { getDoctoraliaMetricsService } from '../metrics/doctoralia-metrics.service';
 import { SyncCycleContext } from './sync-cycle-context';
 import { DisabledProfessionalSlots, UNSAFE_SLOT_CLEANUP_MESSAGE } from './disabled-professional-slots';
+import { describeCleanupIssues } from './cleanup-diagnostics';
 
 interface TurnoSlot {
     start: string;
@@ -247,7 +248,7 @@ export class SlotSyncService {
             const result = await new DisabledProfessionalSlots(this.prisma).reconcile(clinicId!, doctor.id,
                 String(remote.doctoraliaFacilityId), String(remote.doctoraliaDoctorId), client,
                 async () => (await this.availabilityService.getProfessionalEligibility(clinicId!, Number(doctor.vismedId))).state === 'excluded');
-            const message = `Profissional não habilitado: ${result.cleared} dia(s) reconciliado(s); ${result.pending} pendência(s). ${result.pending ? UNSAFE_SLOT_CLEANUP_MESSAGE : 'Consultas existentes preservadas.'}`;
+            const message = `Profissional ${doctor.name} (VISSMED ${doctor.vismedId}; Doctoralia ${remote.doctoraliaDoctorId}; clínica ${clinicId}): não habilitado. ${result.cleared} dia(s) reconciliado(s); ${result.pending} pendência(s). ${result.pending ? describeCleanupIssues(result.issues) : 'Consultas existentes preservadas.'}`;
             if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', result.pending ? 'professional_cleanup_pending' : 'professional_excluded', message);
             return { success: result.pending === 0, message, slotsCreated: 0 };
         }
@@ -543,6 +544,12 @@ export class SlotSyncService {
                         if (!result.pending && result.cleared) {
                             addressesCleared++;
                             if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'cleared', `Disponibilidade reconciliada e confirmada por leitura: ${result.cleared} dia(s).`);
+                            continue;
+                        }
+                        if (result.pending) {
+                            addressesFailed++;
+                            if (syncRunId) await this.logEvent(syncRunId, 'SLOT_SYNC', 'managed_scope_pending',
+                                `Profissional ${doctor.name} (VISSMED ${doctor.vismedId}; Doctoralia ${dDoc.doctoraliaDoctorId}; clínica ${clinicId}): ${describeCleanupIssues(result.issues)}`);
                             continue;
                         }
                     }

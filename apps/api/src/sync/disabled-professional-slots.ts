@@ -5,6 +5,7 @@ import {
   validPeriods,
 } from './managed-period-replacement';
 import { managedSlotState } from './managed-slot-ranges';
+import { CleanupIssue, CleanupReason } from './cleanup-diagnostics';
 import {
   reconcileManagedRemoval,
   ReplacementClient,
@@ -42,14 +43,34 @@ export class DisabledProfessionalSlots {
     });
     let cleared = 0,
       pending = 0;
+    const issues: CleanupIssue[] = [];
+    const report = (addressId: string, code: CleanupReason, date?: string) => {
+      pending++;
+      issues.push({ addressId, code, writeState: 'not_sent', ...(date ? { date } : {}) });
+    };
     for (const initial of states) {
       let state = initial;
       const raw = object(state.managedState);
+      if (!Number.isFinite(now.getTime())) { report(state.addressId, 'invalid_clock'); continue; }
+      if (!raw) { report(state.addressId, 'journal_missing_periods'); continue; }
+      if (raw.version !== 1 || !clinicId || raw.clinicId !== clinicId || raw.facilityId !== facilityId || raw.doctorId !== doctorId || raw.addressId !== state.addressId) {
+        report(state.addressId, 'journal_scope_mismatch'); continue;
+      }
+      if (raw.hash !== state.availabilityHash) { report(state.addressId, 'journal_hash_mismatch'); continue; }
       if (!raw || !validPeriods(raw.periods)) {
         const ranges = raw?.ranges;
-        if (!Array.isArray(ranges) || ranges.length) pending++;
+        // Only well-formed, correctly scoped legacy evidence can be dismissed as past-only.
+        // Preserve the journal unchanged; never infer services/durations from these ranges.
+        const pastOnly = raw.periods === undefined && Array.isArray(ranges) && ranges.every(value => {
+          const r = object(value);
+          if (!r || typeof r.start !== 'string' || typeof r.end !== 'string') return false;
+          const start = Date.parse(r.start), end = Date.parse(r.end);
+          return Number.isFinite(start) && Number.isFinite(end) && end > start && end <= now.getTime();
+        });
+        if (!pastOnly) report(state.addressId, raw.periods === undefined ? 'journal_missing_periods' : 'journal_invalid');
         continue;
       }
+      if (raw.periodsHash !== periodsHash(raw.periods)) { report(state.addressId, 'journal_hash_mismatch'); continue; }
       const dates = [
         ...new Set(
           raw.periods
@@ -67,13 +88,13 @@ export class DisabledProfessionalSlots {
         };
         const currentPeriods = object(state.managedState)?.periods;
         if (!validPeriods(currentPeriods)) {
-          pending++;
+          report(state.addressId, 'journal_invalid', date);
           break;
         }
         const targets = currentPeriods.filter(
           (p) => p.start.slice(0, 10) === date,
         );
-        const authorized = async () => {
+        const authorized = async (): Promise<boolean | CleanupReason> => {
           const current = await this.prisma.mapping.findFirst({
             where: {
               clinicId,
@@ -98,12 +119,11 @@ export class DisabledProfessionalSlots {
           const saved = await this.prisma.slotPushState.findUnique({
             where: { id: state.id },
           });
-          return (
-            !!current &&
-            !shared.length &&
-            saved?.availabilityHash === state.availabilityHash &&
-            (await eligible())
-          );
+          if (!current) return 'mapping_missing';
+          if (shared.length) return 'mapping_shared';
+          if (saved?.availabilityHash !== state.availabilityHash) return 'journal_changed';
+          if (!(await eligible())) return 'eligibility_changed';
+          return true;
         };
         const ok = await reconcileManagedRemoval({
           state: state.managedState,
@@ -113,6 +133,7 @@ export class DisabledProfessionalSlots {
           client,
           authorized,
           now,
+          onPending: diagnostic => issues.push({ addressId: state.addressId, date, ...diagnostic }),
           persist: async (remaining) => {
             const availabilityHash = periodsHash(remaining);
             const managedState = managedSlotState(
@@ -143,9 +164,9 @@ export class DisabledProfessionalSlots {
             Date.parse(p.end) > now.getTime(),
         )
       )
-        pending++;
+        report(state.addressId, 'period_in_progress');
     }
-    return { cleared, pending };
+    return { cleared, pending, issues };
   }
 
   async assess(

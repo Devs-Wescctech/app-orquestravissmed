@@ -35,7 +35,7 @@ describe('suspend unsafe replacement cleanup without losing evidence', () => {
             getSlotsForReconciliation: async () => ({ _items: remote.map(p => ({ start: p.start, address_services: { _items: [{ id: '5' }] } })) }),
             replaceSlots: jest.fn(async (_f, _d, _a, body) => { remote = body.slots.filter(p => p.address_services.length); }) };
         const result = await new DisabledProfessionalSlots(prisma).reconcile('clinic', 'local', 'f', 'd', client, async () => true, undefined, now);
-        expect(result).toEqual({ cleared: 1, pending: 0 });
+        expect(result).toEqual({ cleared: 1, pending: 0, issues: [] });
         expect(saved.managedState.periods).toEqual([]);
         expect(client.replaceSlots).toHaveBeenCalledTimes(1);
     });
