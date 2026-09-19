@@ -3,6 +3,20 @@ import { managedSlotState } from './managed-slot-ranges';
 import { periodsHash } from './managed-period-replacement';
 
 describe('suspend unsafe replacement cleanup without losing evidence', () => {
+    it('identifies the address and missing full journal without remote calls', async () => {
+        const f = fixture(); const client: any = { replaceSlots: jest.fn() };
+        const result: any = await new DisabledProfessionalSlots(f.prisma).reconcile('clinic', 'local', 'f', 'd', client, async () => true, undefined, now);
+        expect(result.issues).toEqual([{ addressId: 'a', code: 'journal_missing_periods', writeState: 'not_sent' }]);
+        expect(client.replaceSlots).not.toHaveBeenCalled();
+    });
+    it('preserves past-only legacy history without repeating a future cleanup warning', async () => {
+        const f = fixture();
+        f.state.managedState.ranges = [{ start: '2026-09-17T08:00:00-03:00', end: '2026-09-17T09:00:00-03:00' }];
+        const before = structuredClone(f.state);
+        const result = await new DisabledProfessionalSlots(f.prisma).reconcile('clinic', 'local', 'f', 'd', {} as any, async () => true, undefined, now);
+        expect(result.pending).toBe(0);
+        expect(f.state).toEqual(before);
+    });
     it('limits an empty-source cleanup to the requested address', async () => {
         const prisma: any = { slotPushState: { findMany: jest.fn().mockResolvedValue([]) } };
         await (new DisabledProfessionalSlots(prisma).reconcile as any)('clinic', 'local', 'f', 'd', {}, async () => true, ['2030-01-02'], now, 'address-only');

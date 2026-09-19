@@ -62,6 +62,11 @@ describe('slot cleanup integration', () => {
         await f.service.syncSlotsForDoctor('v', f.client, 'run', 30, 'clinic-a', f.availability);
         expect(f.client.replaceSlots).not.toHaveBeenCalled();
         expect(f.events.some(e => e.action === 'professional_cleanup_pending')).toBe(true);
+        const cleanupMessage = f.events.find(e => e.action === 'professional_cleanup_pending').message;
+        expect(cleanupMessage).toContain('VISSMED');
+        expect(cleanupMessage).toContain('Doctoralia');
+        expect(cleanupMessage).toContain('Endereço a');
+        expect(cleanupMessage).toContain('journal_missing_periods');
         expect(f.getState().managedState.ranges).toEqual(future);
         expect(f.client.enableCalendar).not.toHaveBeenCalled();
         expect(f.client.getServices).not.toHaveBeenCalled();

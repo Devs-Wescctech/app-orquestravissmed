@@ -14,10 +14,35 @@ function fixture() {
         replaceSlots: jest.fn(async (_f, _d, _a, body) => { remote = body.slots.filter(p => p.address_services.length); }),
     };
     const authorized = jest.fn(async () => true), persist = jest.fn(async () => undefined);
-    const run = () => reconcileManagedRemoval({ state, hash, scope, targets: [first], client, authorized, persist, now: new Date('2029-01-01'), verifyAttempts: 1 });
-    return { client, authorized, persist, run, getRemote: () => remote };
+    const onPending = jest.fn();
+    const run = () => reconcileManagedRemoval({ state, hash, scope, targets: [first], client, authorized, persist, now: new Date('2029-01-01'), verifyAttempts: 1, onPending } as any);
+    return { client, authorized, persist, run, onPending, getRemote: () => remote };
 }
 describe('verified replacement', () => {
+    it.each([
+        ['booking', 'bookings_present', 'not_sent'],
+        ['break', 'breaks_present', 'not_sent'],
+        ['incomplete', 'bookings_incomplete', 'not_sent'],
+        ['mismatch', 'remote_mismatch', 'not_sent'],
+        ['read', 'remote_read_failed', 'not_sent'],
+        ['write', 'write_unconfirmed', 'unknown'],
+        ['verify', 'verification_mismatch', 'unknown'],
+        ['persist', 'journal_update_failed', 'confirmed'],
+    ])('reports a precise safe reason for %s', async (kind, code, writeState) => {
+        const f = fixture();
+        if (kind === 'booking') f.client.getBookings.mockResolvedValue({ _items: [{}] });
+        if (kind === 'break') f.client.getCalendarBreaks.mockResolvedValue({ _items: [{}] });
+        if (kind === 'incomplete') f.client.getBookings.mockResolvedValue({ _items: [], _links: { next: 'page2' } } as any);
+        if (kind === 'mismatch') f.client.getSlotsForReconciliation.mockResolvedValue(snapshot([]));
+        if (kind === 'read') f.client.getBookings.mockRejectedValue(new Error('secret raw error'));
+        if (kind === 'write') f.client.replaceSlots.mockRejectedValue(new Error('secret raw error'));
+        if (kind === 'verify') f.client.replaceSlots.mockImplementation(async () => undefined);
+        if (kind === 'persist') f.persist.mockRejectedValue(new Error('secret raw error'));
+        expect(await f.run()).toBe(false);
+        expect(f.onPending).toHaveBeenCalledWith({ code, writeState });
+        expect(JSON.stringify(f.onPending.mock.calls)).not.toContain('secret');
+        if (writeState === 'not_sent') expect(f.client.replaceSlots).not.toHaveBeenCalled();
+    });
     it('does not remove anything when a published second service is absent from remote read-back', async () => {
         const f = fixture();
         const full = [first, { ...second, address_services: [...second.address_services, { address_service_id: '6', duration: 30 }] }];
