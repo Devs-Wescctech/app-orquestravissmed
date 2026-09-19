@@ -46,31 +46,72 @@ export class DisabledProfessionalSlots {
     const issues: CleanupIssue[] = [];
     const report = (addressId: string, code: CleanupReason, date?: string) => {
       pending++;
-      issues.push({ addressId, code, writeState: 'not_sent', ...(date ? { date } : {}) });
+      issues.push({
+        addressId,
+        code,
+        writeState: 'not_sent',
+        ...(date ? { date } : {}),
+      });
     };
     for (const initial of states) {
       let state = initial;
       const raw = object(state.managedState);
-      if (!Number.isFinite(now.getTime())) { report(state.addressId, 'invalid_clock'); continue; }
-      if (!raw) { report(state.addressId, 'journal_missing_periods'); continue; }
-      if (raw.version !== 1 || !clinicId || raw.clinicId !== clinicId || raw.facilityId !== facilityId || raw.doctorId !== doctorId || raw.addressId !== state.addressId) {
-        report(state.addressId, 'journal_scope_mismatch'); continue;
+      if (!Number.isFinite(now.getTime())) {
+        report(state.addressId, 'invalid_clock');
+        continue;
       }
-      if (raw.hash !== state.availabilityHash) { report(state.addressId, 'journal_hash_mismatch'); continue; }
+      if (!raw) {
+        report(state.addressId, 'journal_missing_periods');
+        continue;
+      }
+      if (
+        raw.version !== 1 ||
+        !clinicId ||
+        raw.clinicId !== clinicId ||
+        raw.facilityId !== facilityId ||
+        raw.doctorId !== doctorId ||
+        raw.addressId !== state.addressId
+      ) {
+        report(state.addressId, 'journal_scope_mismatch');
+        continue;
+      }
+      if (raw.hash !== state.availabilityHash) {
+        report(state.addressId, 'journal_hash_mismatch');
+        continue;
+      }
       if (!raw || !validPeriods(raw.periods)) {
         const ranges = raw?.ranges;
         // Only well-formed, correctly scoped legacy evidence can be dismissed as past-only.
         // Preserve the journal unchanged; never infer services/durations from these ranges.
-        const pastOnly = raw.periods === undefined && Array.isArray(ranges) && ranges.every(value => {
-          const r = object(value);
-          if (!r || typeof r.start !== 'string' || typeof r.end !== 'string') return false;
-          const start = Date.parse(r.start), end = Date.parse(r.end);
-          return Number.isFinite(start) && Number.isFinite(end) && end > start && end <= now.getTime();
-        });
-        if (!pastOnly) report(state.addressId, raw.periods === undefined ? 'journal_missing_periods' : 'journal_invalid');
+        const pastOnly =
+          raw.periods === undefined &&
+          Array.isArray(ranges) &&
+          ranges.every((value) => {
+            const r = object(value);
+            if (!r || typeof r.start !== 'string' || typeof r.end !== 'string')
+              return false;
+            const start = Date.parse(r.start),
+              end = Date.parse(r.end);
+            return (
+              Number.isFinite(start) &&
+              Number.isFinite(end) &&
+              end > start &&
+              end <= now.getTime()
+            );
+          });
+        if (!pastOnly)
+          report(
+            state.addressId,
+            raw.periods === undefined
+              ? 'journal_missing_periods'
+              : 'journal_invalid',
+          );
         continue;
       }
-      if (raw.periodsHash !== periodsHash(raw.periods)) { report(state.addressId, 'journal_hash_mismatch'); continue; }
+      if (raw.periodsHash !== periodsHash(raw.periods)) {
+        report(state.addressId, 'journal_hash_mismatch');
+        continue;
+      }
       const dates = [
         ...new Set(
           raw.periods
@@ -121,7 +162,8 @@ export class DisabledProfessionalSlots {
           });
           if (!current) return 'mapping_missing';
           if (shared.length) return 'mapping_shared';
-          if (saved?.availabilityHash !== state.availabilityHash) return 'journal_changed';
+          if (saved?.availabilityHash !== state.availabilityHash)
+            return 'journal_changed';
           if (!(await eligible())) return 'eligibility_changed';
           return true;
         };
@@ -133,7 +175,8 @@ export class DisabledProfessionalSlots {
           client,
           authorized,
           now,
-          onPending: diagnostic => issues.push({ addressId: state.addressId, date, ...diagnostic }),
+          onPending: (diagnostic) =>
+            issues.push({ addressId: state.addressId, date, ...diagnostic }),
           persist: async (remaining) => {
             const availabilityHash = periodsHash(remaining);
             const managedState = managedSlotState(

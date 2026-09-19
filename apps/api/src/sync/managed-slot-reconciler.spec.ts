@@ -19,6 +19,18 @@ function fixture() {
     return { client, authorized, persist, run, onPending, getRemote: () => remote };
 }
 describe('verified replacement', () => {
+    it.each(['breaks_incomplete', 'remote_changed', 'authorization_failed', 'verification_failed', 'plan_invalid'])('reports %s without losing the journal', async code => {
+        const f = fixture();
+        if (code === 'breaks_incomplete') f.client.getCalendarBreaks.mockResolvedValue({ total: 1, _items: [] } as any);
+        if (code === 'remote_changed') f.client.getSlotsForReconciliation.mockResolvedValueOnce(snapshot(periods)).mockResolvedValue(snapshot([]));
+        if (code === 'authorization_failed') f.authorized.mockResolvedValueOnce(true).mockResolvedValue(false);
+        if (code === 'verification_failed') f.client.getSlotsForReconciliation.mockResolvedValueOnce(snapshot(periods)).mockResolvedValueOnce(snapshot(periods)).mockRejectedValue(new Error('private'));
+        if (code === 'plan_invalid') {
+            await reconcileManagedRemoval({state:null,hash,scope,targets:[first],client:f.client,authorized:f.authorized,persist:f.persist,onPending:f.onPending});
+        } else expect(await f.run()).toBe(false);
+        expect(f.onPending).toHaveBeenCalledWith({code,writeState:code==='verification_failed'?'unknown':'not_sent'});
+        expect(f.persist).not.toHaveBeenCalled();
+    });
     it.each([
         ['booking', 'bookings_present', 'not_sent'],
         ['break', 'breaks_present', 'not_sent'],

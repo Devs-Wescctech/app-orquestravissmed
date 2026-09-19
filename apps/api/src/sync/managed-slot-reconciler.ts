@@ -81,19 +81,39 @@ export async function reconcileManagedRemoval(input: {
     input.client.getSlotsForReconciliation(f, d, a, start, end);
   try {
     let permission = await input.authorized();
-    if (permission !== true) return pending(typeof permission === 'string' ? permission : 'authorization_failed');
+    if (permission !== true)
+      return pending(
+        typeof permission === 'string' ? permission : 'authorization_failed',
+      );
     failure = 'remote_read_failed';
     // Do not touch occupied days: free-slot enumeration cannot reconstruct hidden periods.
     const bookings = await input.client.getBookings(f, d, a, start, end);
-    if (!emptyComplete(bookings)) return pending(Array.isArray(object(bookings)?._items) && (object(bookings)!._items as unknown[]).length ? 'bookings_present' : 'bookings_incomplete');
+    if (!emptyComplete(bookings))
+      return pending(
+        Array.isArray(object(bookings)?._items) &&
+          (object(bookings)!._items as unknown[]).length
+          ? 'bookings_present'
+          : 'bookings_incomplete',
+      );
     const breaks = await input.client.getCalendarBreaks(f, d, a, start, end);
-    if (!emptyComplete(breaks)) return pending(Array.isArray(object(breaks)?._items) && (object(breaks)!._items as unknown[]).length ? 'breaks_present' : 'breaks_incomplete');
-    if (!snapshotMatches(await read(), plan.before)) return pending('remote_mismatch');
+    if (!emptyComplete(breaks))
+      return pending(
+        Array.isArray(object(breaks)?._items) &&
+          (object(breaks)!._items as unknown[]).length
+          ? 'breaks_present'
+          : 'breaks_incomplete',
+      );
+    if (!snapshotMatches(await read(), plan.before))
+      return pending('remote_mismatch');
     failure = 'authorization_failed';
     permission = await input.authorized();
-    if (permission !== true) return pending(typeof permission === 'string' ? permission : 'authorization_failed');
+    if (permission !== true)
+      return pending(
+        typeof permission === 'string' ? permission : 'authorization_failed',
+      );
     failure = 'remote_read_failed';
-    if (!snapshotMatches(await read(), plan.before)) return pending('remote_changed');
+    if (!snapshotMatches(await read(), plan.before))
+      return pending('remote_changed');
     writeState = 'unknown';
     failure = 'write_unconfirmed';
     await input.client.replaceSlots(f, d, a, { slots: plan.slots });
