@@ -40,7 +40,7 @@ if (enabled) {
         const gate = new ProfessionalEligibility(prisma as any, { getProfissionaisForEligibility: roster } as any);
         expect((await gate.check(scope.clinicId, 6983)).state).toBe('enabled');
         roster.mockResolvedValue([]);
-        expect((await gate.check(scope.clinicId, 6983)).state).toBe('excluded');
+        expect((await gate.check(scope.clinicId, 6983)).state).toBe('unknown');
         expect((await gate.check(foreignClinic, 6983)).state).toBe('unknown');
     });
     it('preserves evidence and pending across service instances without PUT', async () => {
