@@ -8,7 +8,7 @@ function assessLocal(record, receipt, associationCount, overlapCount, now, cutof
   if (!EXCLUDED_TYPES.has(typeOf(record.rawPayload))) return 'not_exam_or_procedure';
   if (!record.createdAt || record.createdAt >= cutoff) return 'not_proven_before_filter';
   if (!record.endAt || record.endAt <= now) return 'past_break';
-  if (!record.vismedAppointmentId || !record.doctoraliaBreakId || !record.clinicId
+  if (!record.vismedAppointmentId || !record.vismedDoctorId || !record.doctoraliaBreakId || !record.clinicId
     || !record.doctoraliaFacilityId || !record.doctoraliaDoctorId || !record.doctoraliaAddressId) return 'missing_scope';
   if (associationCount !== 1) return 'shared_break';
   if (overlapCount !== 0) return 'overlapping_record';
@@ -42,4 +42,15 @@ function assessRemote(record, remote) {
   return null;
 }
 
-module.exports = { assessLocal, assessSource, assessRemote };
+function assessSlots(record, response) {
+  if (!response || !Array.isArray(response._items) || response._links?.next) return 'invalid_slots_response';
+  for (const slot of response._items) {
+    const start = Date.parse(slot?.start);
+    const end = Date.parse(slot?.end);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end) return 'invalid_slot_time';
+    if (start < record.endAt.getTime() && end > record.startAt.getTime()) return 'overlapping_remote_slot';
+  }
+  return null;
+}
+
+module.exports = { assessLocal, assessSource, assessRemote, assessSlots };

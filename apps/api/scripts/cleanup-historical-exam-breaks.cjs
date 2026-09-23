@@ -5,7 +5,7 @@
 // No patient fields or credentials are printed.
 const { PrismaClient } = require('@prisma/client');
 const { VismedService } = require('../dist/integrations/vismed/vismed.service');
-const { assessLocal, assessSource, assessRemote } = require('./historical-break-cleanup-policy.cjs');
+const { assessLocal, assessSource, assessRemote, assessSlots } = require('./historical-break-cleanup-policy.cjs');
 
 const FILTER_CUTOFF = new Date('2026-09-18T00:00:00Z'); // conservative: excludes deployment day
 const prisma = new PrismaClient();
@@ -41,15 +41,19 @@ async function localSnapshot(id) {
   return { record, receipt, reason };
 }
 
-function doctoraliaUrl(record, domain) {
+function doctoraliaUrl(record, domain, resource = 'break') {
   const host = String(domain || 'doctoralia.com.br').replace(/^https?:\/\//, '').replace(/\/$/, '');
   if (!['doctoralia.com.br', 'www.doctoralia.com.br'].includes(host)) throw new Error('unsupported_doctoralia_domain');
   const parts = [record.doctoraliaFacilityId, record.doctoraliaDoctorId,
-    record.doctoraliaAddressId, record.doctoraliaBreakId].map(encodeURIComponent);
-  return `https://www.doctoralia.com.br/api/v3/integration/facilities/${parts[0]}/doctors/${parts[1]}/addresses/${parts[2]}/breaks/${parts[3]}`;
+    record.doctoraliaAddressId].map(encodeURIComponent);
+  const base = `https://www.doctoralia.com.br/api/v3/integration/facilities/${parts[0]}/doctors/${parts[1]}/addresses/${parts[2]}`;
+  if (resource === 'break') return `${base}/breaks/${encodeURIComponent(record.doctoraliaBreakId)}`;
+  const day = record.startAt.toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) throw new Error('invalid_local_date');
+  return `${base}/slots?start=${encodeURIComponent(`${day}T00:00:00-03:00`)}&end=${encodeURIComponent(`${day}T23:59:59-03:00`)}`;
 }
 
-async function remoteRequest(record, method) {
+async function remoteRequest(record, method, resource = 'break') {
   const conn = await prisma.integrationConnection.findFirst({
     where: { clinicId: record.clinicId, provider: 'doctoralia' },
     select: { domain: true, cachedToken: true, tokenExpiresAt: true },
@@ -57,7 +61,7 @@ async function remoteRequest(record, method) {
   if (!conn?.cachedToken || !conn.tokenExpiresAt || conn.tokenExpiresAt <= new Date()) {
     throw new Error('no_current_doctoralia_token');
   }
-  const response = await fetch(doctoraliaUrl(record, conn.domain), {
+  const response = await fetch(doctoraliaUrl(record, conn.domain, resource), {
     method,
     headers: { Authorization: `Bearer ${conn.cachedToken}`, 'User-Agent': 'Orquestrador/1.0 (VisMed integration)' },
     signal: AbortSignal.timeout(15_000),
@@ -80,7 +84,10 @@ async function assess(id) {
   const sourceReason = assessSource(record, source);
   if (sourceReason) return { ...snapshot, reason: sourceReason };
   const remote = await remoteRequest(record, 'GET');
-  return { ...snapshot, reason: assessRemote(record, remote) };
+  const remoteReason = assessRemote(record, remote);
+  if (remoteReason) return { ...snapshot, reason: remoteReason };
+  const slots = await remoteRequest(record, 'GET', 'slots');
+  return { ...snapshot, reason: assessSlots(record, slots) };
 }
 
 async function applyOne(id) {
