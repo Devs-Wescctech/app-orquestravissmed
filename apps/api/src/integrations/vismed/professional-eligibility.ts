@@ -25,6 +25,39 @@ export class ProfessionalEligibility {
     private readonly vismed: VismedService,
   ) {}
 
+  private async abnormalDrop(
+    clinicId: string,
+    currentIds: ReadonlyMap<number, Record<string, unknown>>,
+  ): Promise<boolean> {
+    // A completely empty filtered roster cannot safely authorize mass cleanup.
+    if (currentIds.size === 0) return true;
+
+    // Compare only doctors linked to this clinic, not the global VisMed catalog.
+    // This read is needed only when the requested professional is absent.
+    const links = await this.prisma.mapping.findMany({
+      where: {
+        clinicId,
+        entityType: 'DOCTOR',
+        status: 'LINKED',
+        vismedId: { not: null },
+      },
+      select: { vismedId: true },
+    });
+    const localIds = links.flatMap((link) =>
+      link.vismedId ? [link.vismedId] : [],
+    );
+    if (localIds.length < 3) return false;
+    const linkedDoctors = await this.prisma.vismedDoctor.findMany({
+      where: { id: { in: localIds }, isActive: true },
+      select: { vismedId: true },
+    });
+    if (linkedDoctors.length < 3) return false;
+    const present = linkedDoctors.filter((doctor) =>
+      currentIds.has(doctor.vismedId),
+    ).length;
+    return (linkedDoctors.length - present) * 2 >= linkedDoctors.length;
+  }
+
   async check(clinicId: string, professionalId: number): Promise<Eligibility> {
     const unknown = (reason: string): Eligibility => ({
       state: 'unknown',
@@ -73,10 +106,12 @@ export class ProfessionalEligibility {
         byId.set(id, row);
       }
       const row = byId.get(Number(professionalId));
-      if (!row)
-        return filteredRoster
-          ? { state: 'excluded', reason: 'absent_from_filtered_roster' }
-          : unknown('unconfirmed_roster_contract');
+      if (!row) {
+        if (!filteredRoster) return unknown('unconfirmed_roster_contract');
+        if (await this.abnormalDrop(clinicId, byId))
+          return unknown('abnormal_roster_drop');
+        return { state: 'excluded', reason: 'absent_from_filtered_roster' };
+      }
       if (flag(row.ativo) === false || flag(row.mostrarnadoctoralia) === false)
         return { state: 'excluded', reason: 'explicitly_disabled' };
       if (
